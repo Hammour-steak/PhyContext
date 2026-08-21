@@ -1,0 +1,7 @@
+PhyContext
+Copyright 2026 PhyContext contributors
+
+Third-party datasets and pretrained models are not covered by the PhyContext MIT
+license. Users must follow the licenses of Wan, its checkpoints, and every input
+dataset. Datasets, caches, and model checkpoints are excluded from this
+repository.

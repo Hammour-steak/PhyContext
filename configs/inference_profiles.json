@@ -1,0 +1,15 @@
+{
+  "schema": "phycontext.inference_profiles.v2",
+  "defaults": {
+    "adapter": "outputs/training/formal/final",
+    "cache_manifest": "cache/wan/physweep_training/dense_point_tracks_832x480x97/manifest.json",
+    "frames": 97,
+    "max_area": 399360,
+    "sampling_steps": 30,
+    "guide_scale": 5.0,
+    "flow_shift": 5.0,
+    "requires_explicit_seed": true,
+    "trajectory_protocol": "target"
+  },
+  "profiles": {}
+}

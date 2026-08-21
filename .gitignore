@@ -1,0 +1,46 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/.venv/
+/envs/
+/checkpoints/
+/cache/
+
+# Bundled applications and upstream staging
+/runtime/
+/external/
+
+# Generated datasets, renders, and logs
+/datasets/
+/outputs/
+/logs/
+/artifacts/
+/archive/run_history/
+*.log
+*.pid
+
+# Editor scratch files
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*_ssh
+id_rsa*
+id_ed25519*
+
+# Packaging and coverage output
+/build/
+/dist/
+*.egg-info/
+.coverage
+htmlcov/

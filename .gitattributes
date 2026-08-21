@@ -1,0 +1,11 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.mp4 binary
+*.glb binary
+*.npz binary
+*.pt binary
+*.pth binary
+*.safetensors binary

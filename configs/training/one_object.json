@@ -1,0 +1,29 @@
+{
+  "schema_version": "phycontext_training_run_v1",
+  "dataset_manifest": "datasets/physweep_training/manifest.jsonl",
+  "cache_manifest": "cache/wan/physweep_training/dense_point_tracks_832x480x97/manifest.json",
+  "wan_repo": "external/Wan2.2",
+  "checkpoint": "checkpoints/Wan2.2-TI2V-5B",
+  "output_root": "outputs/training/formal",
+  "gpus": 4,
+  "training": {
+    "training_stage": "joint",
+    "steps": 8000,
+    "scene_tokens": 128,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "modulation_rank": 32,
+    "modulation_alpha": 32.0,
+    "trajectory_condition_rank": 32,
+    "trajectory_input": true,
+    "trajectory_input_source": "target",
+    "trajectory_representation": "dense_point_tracks",
+    "reconstruction_loss_weight": 2.0,
+    "lpips_loss_weight": 0.1,
+    "lpips_frame_count": 2,
+    "validation_every": 512,
+    "validation_batches": 16,
+    "save_every": 512,
+    "seed": 20260820
+  }
+}
