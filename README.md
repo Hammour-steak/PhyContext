@@ -43,7 +43,7 @@ checkpoints, and inference results stay under this repository's `cache/` and
 conda create --override-channels --channel conda-forge \
   --prefix .venv python=3.10 pip -y
 conda activate "$PWD/.venv"
-pip install -r requirements-training.txt
+pip install -r requirements.txt
 
 export PHYCONTEXT_DATASET_ROOT=/path/to/PhysSweep
 export PHYCONTEXT_WAN_REPO=/path/to/Wan2.2
