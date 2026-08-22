@@ -34,8 +34,10 @@ Every quantity uses one documented camera coordinate frame. The same explicit
   128 context tokens.
 - A direct zero-initialized modulation branch injects compact physical controls
   into Wan transformer blocks.
-- A zero-initialized trajectory conditioner projects dense target point tracks
-  onto the Wan spatiotemporal latent grid.
+- A zero-initialized trajectory conditioner projects DaS-style fixed RGB point
+  identities plus visibility. It resolves dynamic/static occlusion at full
+  preprocessing resolution, retains all 97 condition frames, and learns the
+  causal 97-to-25 temporal projection used by Wan.
 - Rank-16 cross-attention LoRA learns how Wan uses the added context.
 
 The trajectory branch specifies gross motion. Structured scene and physical

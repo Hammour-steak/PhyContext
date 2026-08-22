@@ -35,7 +35,15 @@ separate ablations and must disable trajectory input explicitly.
 - Sampling steps: 30
 - Seed: explicit and recorded
 - Scene tokens: 128
-- Trajectory representation: `dense_point_tracks`
+- Trajectory representation: `das_3d_tracks`
+- Trajectory channels: three object slots × `(identity_r, identity_g,
+  identity_b, visibility)` = 12
+- Point identity: fixed first-frame camera `(x, y, 1/z)` RGB
+- Cached trajectory shape: `[12, 97, 30, 52]`
+- Visibility: full-resolution nearest-positive-depth z-buffer across dynamic
+  objects and static scene points, followed by spatial aggregation
+- Temporal alignment: frame zero plus learned causal four-frame windows,
+  matching Wan's 97-to-25 temporal layout
 - Trajectory source: `target`
 
 ## Adapter Identity

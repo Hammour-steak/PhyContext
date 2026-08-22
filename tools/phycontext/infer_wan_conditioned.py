@@ -20,7 +20,12 @@ from conditioning_model import (
     initial_state_from_record,
     load_scene_condition,
 )
-from cache_contract import resolve_cache_dataset_root
+from cache_contract import (
+    CURRENT_CACHE_SCHEMA,
+    resolve_cache_dataset_root,
+    validate_cache_artifact,
+    validate_cache_source_manifest,
+)
 from project_defaults import (
     CACHE_MANIFEST,
     INFERENCE_FLOW_SHIFT,
@@ -36,6 +41,7 @@ from wan_training import (
     set_trajectory_condition,
     select_trajectory_input_records,
     canonical_trajectory_representation,
+    validate_point_track_object_slots,
 )
 
 
@@ -136,6 +142,21 @@ def load_and_validate_input_contract(
     if not contract_path.is_file():
         return None
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if contract.get("schema") not in {
+        "phycontext.inference_input_contract.v2",
+        "phycontext.inference_input_contract.v3",
+    }:
+        raise ValueError("adapter input contract schema is unsupported")
+    contract_trajectory = contract.get("trajectory", {})
+    metadata_trajectory = adapter_metadata.get("trajectory_conditioning", {})
+    for key in ("enabled", "representation", "architecture"):
+        expected = contract_trajectory.get(key)
+        actual = metadata_trajectory.get(key)
+        if expected is not None and expected != actual:
+            raise ValueError(
+                f"adapter input contract trajectory {key} mismatch: "
+                f"expected {expected}, got {actual}"
+            )
     checks = {
         "adapter_sha256": sha256(adapter_root / "adapter.safetensors"),
         "base_model_index_sha256": adapter_metadata.get("base_model_index_sha256"),
@@ -302,6 +323,7 @@ def main() -> None:
             if args.trajectory_condition is not None
             else None
         )
+        trajectory_descriptor = None
         trajectory_sample_id = None
         prompt = args.text
         input_source = "external_scene"
@@ -316,6 +338,22 @@ def main() -> None:
                 f"expected {expected_cache_hash}, got {actual_cache_hash}"
             )
         cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        cache_representation = cache.get("point_track_preprocess", {}).get(
+            "representation", "dense_point_tracks"
+        )
+        if cache_representation != trajectory_representation:
+            raise ValueError(
+                "inference cache trajectory representation differs from the adapter"
+            )
+        if (
+            trajectory_representation == "das_3d_tracks"
+            and cache.get("schema") != CURRENT_CACHE_SCHEMA
+        ):
+            raise ValueError(
+                "das_3d_tracks inference requires the current Wan cache schema "
+                f"{CURRENT_CACHE_SCHEMA}"
+            )
+        validate_cache_source_manifest(root, cache)
         dataset_root = resolve_cache_dataset_root(root, cache)
         item = select_cache_record(cache, adapter_root, root, args.sample_id)
         record = item["record"]
@@ -324,6 +362,18 @@ def main() -> None:
             dataset_root / record["conditioning"]["first_frame"]
         ).resolve()
         scene_path = (dataset_root / record["conditioning"]["scene"]).resolve()
+        if cache.get("schema") == CURRENT_CACHE_SCHEMA:
+            source_files = (
+                (first_frame_path, item.get("source_first_frame_sha256"), "first frame"),
+                (scene_path, item.get("source_scene_sha256"), "scene condition"),
+            )
+            for source_path, expected_hash, label in source_files:
+                if (
+                    not expected_hash
+                    or not source_path.is_file()
+                    or sha256(source_path) != expected_hash
+                ):
+                    raise ValueError(f"{label} file no longer matches the Wan cache")
         trajectory_item = item
         if trajectory_enabled:
             trajectory_source = adapter_metadata.get(
@@ -334,13 +384,15 @@ def main() -> None:
                 index_nominal_trajectory_records(cache["records"]),
                 trajectory_source,
             )[0]
-        if trajectory_representation != "dense_point_tracks":
-            raise ValueError("formal inference requires dense point tracks")
         trajectory_descriptor = trajectory_item.get("point_track")
         if trajectory_enabled and trajectory_descriptor is None:
             raise ValueError("cache record has no point_track descriptor")
         trajectory_path = (
-            (root / trajectory_descriptor["path"]).resolve()
+            validate_cache_artifact(
+                root,
+                trajectory_descriptor,
+                f"point track for {trajectory_item['sample_id']}",
+            )
             if trajectory_enabled
             else None
         )
@@ -351,6 +403,11 @@ def main() -> None:
         prompt_descriptor = item.get("text_context", {})
         expected_prompt_hash = prompt_descriptor.get("prompt_sha256")
         actual_prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if (
+            cache.get("schema") == CURRENT_CACHE_SCHEMA
+            and not expected_prompt_hash
+        ):
+            raise ValueError("Wan cache is missing its prompt hash binding")
         if expected_prompt_hash and actual_prompt_hash != expected_prompt_hash:
             raise ValueError("record prompt does not match its cached text context")
         input_source = "training_manifest"
@@ -384,13 +441,6 @@ def main() -> None:
                     "external trajectory protocol does not match the adapter: "
                     f"expected --trajectory-protocol {expected_protocol}"
                 )
-        if not external:
-            expected_trajectory_hash = trajectory_descriptor.get("sha256")
-            if (
-                expected_trajectory_hash
-                and sha256(trajectory_path) != expected_trajectory_hash
-            ):
-                raise ValueError("trajectory condition hash does not match the cache")
     elif trajectory_path is not None and not trajectory_enabled:
         raise ValueError("adapter does not support trajectory conditioning")
     output = (
@@ -516,8 +566,30 @@ def main() -> None:
         if trajectory_enabled:
             point_track_maps = None
             if trajectory_requested:
+                point_track_map = load_file(
+                    str(trajectory_path), device="cpu"
+                )["point_track_map"]
+                if input_contract is not None:
+                    condition_shape = input_contract.get("trajectory", {}).get(
+                        "condition_shape"
+                    )
+                    if condition_shape is not None:
+                        expected_condition_shape = tuple(
+                            int(value) for value in condition_shape
+                        )
+                        if tuple(point_track_map.shape) != expected_condition_shape:
+                            raise ValueError(
+                                "trajectory condition shape violates the adapter "
+                                f"input contract: {tuple(point_track_map.shape)} != "
+                                f"{expected_condition_shape}"
+                            )
+                object_count = 1 if controls.ndim == 1 else int(controls.shape[0])
                 point_track_maps = [
-                    load_file(str(trajectory_path), device="cpu")["point_track_map"]
+                    validate_point_track_object_slots(
+                        point_track_map,
+                        trajectory_representation,
+                        object_count,
+                    )
                 ]
             set_trajectory_condition(
                 pipeline.model,

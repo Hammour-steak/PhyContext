@@ -21,7 +21,12 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 from torch.nn.parallel import DistributedDataParallel
 
-from cache_contract import resolve_cache_dataset_root, validate_cache_source_manifest
+from cache_contract import (
+    CURRENT_CACHE_SCHEMA,
+    resolve_cache_dataset_root,
+    validate_cache_artifact,
+    validate_cache_source_manifest,
+)
 from project_defaults import CACHE_MANIFEST, SCENE_TOKEN_COUNT
 from project_defaults import INFERENCE_GUIDANCE_SCALE, INFERENCE_SAMPLING_STEPS
 from conditioning_model import (
@@ -61,6 +66,8 @@ from wan_training import (
     shifted_uniform_sigmas,
     source_target_motion_envelope,
     canonical_trajectory_representation,
+    trajectory_channel_names,
+    validate_point_track_object_slots,
     trajectory_conditioner_parameters,
 )
 
@@ -106,6 +113,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--steps", type=int, default=8000)
+    parser.add_argument(
+        "--ordinary-only",
+        action="store_true",
+        help=(
+            "run exactly one ordinary update for a single-record integration "
+            "smoke test; paired responses and validation are disabled"
+        ),
+    )
     parser.add_argument("--base-scene-count", type=int)
     parser.add_argument("--scene-tokens", type=int, default=SCENE_TOKEN_COUNT)
     parser.add_argument("--lora-rank", type=int, default=16)
@@ -166,8 +181,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trajectory-condition-rank", type=int, default=32)
     parser.add_argument(
         "--trajectory-representation",
-        choices=("dense_point_tracks",),
-        default="dense_point_tracks",
+        choices=("das_3d_tracks", "dense_point_tracks"),
+        default="das_3d_tracks",
     )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--validation-every", type=int, default=512)
@@ -237,18 +252,28 @@ def max_dynamic_object_count(records: list[dict]) -> int:
 
 
 def require_complete_cache(
-    records: list[dict], split: str, trajectory_representation: str
+    root: Path,
+    records: list[dict],
+    split: str,
+    trajectory_representation: str,
 ) -> None:
     if not records:
         raise ValueError(f"cache has no {split} records")
-    if canonical_trajectory_representation(trajectory_representation) != "dense_point_tracks":
-        raise ValueError("formal training supports only dense point tracks")
+    canonical_trajectory_representation(trajectory_representation)
     missing = [item["sample_id"] for item in records if "point_track" not in item]
     if missing:
         raise ValueError(
             "point-track training requires cached point trajectories; "
             f"{len(missing)} missing in {split}"
         )
+    for item in records:
+        sample_id = item["sample_id"]
+        for key, label in (
+            ("latent", f"latent for {sample_id}"),
+            ("text_context", f"text context for {sample_id}"),
+            ("point_track", f"point track for {sample_id}"),
+        ):
+            validate_cache_artifact(root, item.get(key), label)
 
 
 def split_condition_parameters(module: torch.nn.Module):
@@ -402,19 +427,25 @@ def load_microbatch(
     batch: list[dict],
     device: torch.device,
     trajectory_batch: list[dict] | None = None,
-    trajectory_representation: str = "dense_point_tracks",
+    trajectory_representation: str = "das_3d_tracks",
 ) -> dict:
     records = [item["record"] for item in batch]
-    if canonical_trajectory_representation(trajectory_representation) != "dense_point_tracks":
-        raise ValueError("formal training supports only dense point tracks")
+    trajectory_representation = canonical_trajectory_representation(
+        trajectory_representation
+    )
 
     def load_point_map(item: dict) -> torch.Tensor:
         descriptor = item.get("point_track")
         if descriptor is None:
             raise ValueError(f"record has no point-track cache: {item['sample_id']}")
-        return load_file(str(root / descriptor["path"]), device="cpu")[
+        point_map = load_file(str(root / descriptor["path"]), device="cpu")[
             "point_track_map"
         ].to(device)
+        return validate_point_track_object_slots(
+            point_map,
+            trajectory_representation,
+            int(descriptor["object_count"]),
+        )
 
     target_point_maps = [load_point_map(item) for item in batch]
     target_motion_masks = [
@@ -830,7 +861,7 @@ def adapter_metadata(
     direct_object_slots: int,
 ) -> dict:
     return {
-        "schema": "phycontext.wan_condition_adapter.v2",
+        "schema": "phycontext.wan_condition_adapter.v3",
         "base_model": str(checkpoint),
         "base_model_index_sha256": sha256(
             checkpoint / "diffusion_pytorch_model.safetensors.index.json"
@@ -840,12 +871,16 @@ def adapter_metadata(
         "steps": completed_steps,
         "planned_steps": args.steps,
         "training_mode": (
-            "trajectory_warmup_scene_plus_target_trajectory"
-            if args.training_stage == "trajectory_warmup"
+            "ordinary_only_integration_smoke"
+            if args.ordinary_only
             else (
-                "formal_mixed_trajectory_plus_physics"
-                if args.trajectory_input
-                else "formal_mixed_no_trajectory_input"
+                "trajectory_warmup_scene_plus_target_trajectory"
+                if args.training_stage == "trajectory_warmup"
+                else (
+                    "formal_mixed_trajectory_plus_physics"
+                    if args.trajectory_input
+                    else "formal_mixed_no_trajectory_input"
+                )
             )
         ),
         "training_stage": args.training_stage,
@@ -919,18 +954,27 @@ def adapter_metadata(
             "max_grad_norm": args.max_grad_norm,
         },
         "sampling": {
-            "ordinary_share": 0.6,
-            "response_share": 0.4,
-            "response_axis_weights": {
-                "contact_friction": 0.4,
-                "contact_restitution": 0.4,
-                "mass_kg": 0.2,
-            },
-            "response_pair": "same_base_same_axis_low_high_common_noise_sigma",
+            "response_updates_enabled": not args.ordinary_only,
+            "ordinary_share": 1.0 if args.ordinary_only else 0.6,
+            "response_share": 0.0 if args.ordinary_only else 0.4,
+            "response_axis_weights": (
+                {}
+                if args.ordinary_only
+                else {
+                    "contact_friction": 0.4,
+                    "contact_restitution": 0.4,
+                    "mass_kg": 0.2,
+                }
+            ),
+            "response_pair": (
+                None
+                if args.ordinary_only
+                else "same_base_same_axis_low_high_common_noise_sigma"
+            ),
         },
         "motion_supervision": {
             "enabled": True,
-            "mask_source": "cached_exact_instance_masks",
+            "mask_source": "trajectory_visibility_derived_transport_envelope",
             "foreground_share": args.motion_foreground_share,
             "reconstruction_region": "source_plus_per_frame_target_transport_envelope",
             "pair_region": "low_high_source_target_transport_union",
@@ -965,34 +1009,43 @@ def adapter_metadata(
             "enabled": args.trajectory_input,
             "representation": args.trajectory_representation,
             "input_record": args.trajectory_input_source,
-            "source": "target_sample_bound_simulation_point_trajectory_projected_track_map",
-            "target_supervision_source": "current_target_video_instance_mask",
+            "source": "target_sample_bound_simulation_3d_point_trajectory",
+            "target_supervision_source": "cached_target_latent_with_trajectory_visibility_loss_mask",
             "future_appearance_or_silhouette": False,
-            "source_identity_mask": "frame_zero_instance_mask_only",
-            "future_target_geometry": (
-                "all_2048_point_tracks_per_object_with_depth_and_validity"
+            "source_identity_mask": (
+                "first_frame_point_visibility_occupancy"
+                if args.trajectory_representation == "das_3d_tracks"
+                else "first_frame_source_point_occupancy"
             ),
-            "channels": [
-                f"object_{slot}_{channel}"
-                for slot in range(3)
-                for channel in (
-                    "source_occupancy",
-                    "current_occupancy",
-                    "delta_x",
-                    "delta_y",
-                    "depth",
-                    "validity",
-                )
-            ],
+            "future_target_geometry": (
+                "first_frame_xyz_identity_rgb_with_full_resolution_dynamic_static_zbuffer_visibility"
+                if args.trajectory_representation == "das_3d_tracks"
+                else "all_2048_point_tracks_per_object_with_depth_and_validity"
+            ),
+            "channels": trajectory_channel_names(args.trajectory_representation),
             "input_channels": (
                 getattr(model, "phycontext_trajectory_conditioner").input_channels
                 if args.trajectory_input
                 else 0
             ),
             "rank": args.trajectory_condition_rank,
-            "architecture": "framewise_patch",
+            "architecture": (
+                getattr(model, "phycontext_trajectory_conditioner").architecture
+                if args.trajectory_input
+                else None
+            ),
             "patch_size": [int(value) for value in model.patch_size],
             "injection": "zero_initialized_additive_video_patch_residual",
+            "spatial_visibility_resolution": (
+                "full_preprocess_resolution_before_latent_reduction"
+                if args.trajectory_representation == "das_3d_tracks"
+                else "prealigned_latent_grid"
+            ),
+            "temporal_alignment": (
+                "all_4n_plus_1_frames_then_learned_causal_stride4"
+                if args.trajectory_representation == "das_3d_tracks"
+                else "prealigned_latent_frames"
+            ),
             "independently_switchable": True,
             "training_role": (
                 "target_matching_object_motion_warmup"
@@ -1048,7 +1101,7 @@ def write_input_contract(checkpoint_root: Path, metadata: dict) -> None:
     cache = json.loads(Path(metadata["cache_manifest"]).read_text(encoding="utf-8"))
     preprocess = cache["preprocess"]
     input_contract = {
-        "schema": "phycontext.inference_input_contract.v2",
+        "schema": "phycontext.inference_input_contract.v3",
         "adapter_sha256": sha256(checkpoint_root / "adapter.safetensors"),
         "base_model_index_sha256": metadata["base_model_index_sha256"],
         "cache_manifest_sha256": metadata["cache_manifest_sha256"],
@@ -1064,6 +1117,22 @@ def write_input_contract(checkpoint_root: Path, metadata: dict) -> None:
             "enabled": metadata["trajectory_conditioning"]["enabled"],
             "representation": metadata["trajectory_conditioning"]["representation"],
             "protocol": metadata["trajectory_conditioning"]["input_record"],
+            "architecture": metadata["trajectory_conditioning"].get("architecture"),
+            "condition_shape": (
+                [
+                    metadata["trajectory_conditioning"]["input_channels"],
+                    (
+                        int(preprocess["frames"])
+                        if metadata["trajectory_conditioning"]["representation"]
+                        == "das_3d_tracks"
+                        else (int(preprocess["frames"]) - 1) // 4 + 1
+                    ),
+                    int(preprocess["height"]) // 16,
+                    int(preprocess["width"]) // 16,
+                ]
+                if metadata["trajectory_conditioning"]["enabled"]
+                else None
+            ),
         },
     }
     (checkpoint_root / "input_contract.json").write_text(
@@ -1131,6 +1200,7 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "checkpoint",
     "training_stage",
     "steps",
+    "ordinary_only",
     "base_scene_count",
     "scene_tokens",
     "lora_rank",
@@ -1214,6 +1284,8 @@ def main() -> None:
         )
     if args.steps <= 0 or args.gradient_accumulation <= 0:
         raise ValueError("steps and gradient accumulation must be positive")
+    if args.ordinary_only and args.steps != 1:
+        raise ValueError("ordinary-only integration smoke requires exactly one step")
     if (
         args.validation_every <= 0
         or args.validation_batches <= 0
@@ -1259,6 +1331,21 @@ def main() -> None:
     checkpoint = args.checkpoint.resolve()
     try:
         cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        cache_representation = cache.get("point_track_preprocess", {}).get(
+            "representation", "dense_point_tracks"
+        )
+        if cache_representation != args.trajectory_representation:
+            raise ValueError(
+                "cache trajectory representation differs from the training request"
+            )
+        if (
+            args.trajectory_representation == "das_3d_tracks"
+            and cache.get("schema") != CURRENT_CACHE_SCHEMA
+        ):
+            raise ValueError(
+                "full-rate das_3d_tracks training requires the current Wan cache "
+                f"schema {CURRENT_CACHE_SCHEMA}"
+            )
         validate_cache_source_manifest(root, cache)
         dataset_root = resolve_cache_dataset_root(root, cache)
         train_records = filter_base_scenes(
@@ -1274,11 +1361,14 @@ def main() -> None:
             args.base_scene_count,
         )
         require_complete_cache(
-            train_records, "train", args.trajectory_representation
+            root, train_records, "train", args.trajectory_representation
         )
         if validation_records:
             require_complete_cache(
-                validation_records, "validation", args.trajectory_representation
+                root,
+                validation_records,
+                "validation",
+                args.trajectory_representation,
             )
         max_dynamic_object_count(train_records)
         max_dynamic_object_count(validation_records)
@@ -1286,11 +1376,15 @@ def main() -> None:
             validate_resume_contract(root, args.resume, cache_path, args)
         direct_object_slots = 3
         train_base_count = len({item["base_scene_id"] for item in train_records})
-        train_pairs = select_sweep_endpoint_pairs(train_records, train_base_count)
+        train_pairs = (
+            []
+            if args.ordinary_only
+            else select_sweep_endpoint_pairs(train_records, train_base_count)
+        )
         train_nominal_records = index_nominal_trajectory_records(train_records)
         validation_pairs = []
         validation_nominal_records = {}
-        if validation_records:
+        if validation_records and not args.ordinary_only:
             validation_pairs = select_sweep_endpoint_pairs(
                 validation_records,
                 len({item["base_scene_id"] for item in validation_records}),
@@ -1386,6 +1480,11 @@ def main() -> None:
                     "use --initialize-adapter for a new run"
                 )
         if args.trajectory_input:
+            expected_trajectory_architecture = (
+                "full_frame_causal_patch_v2"
+                if args.trajectory_representation == "das_3d_tracks"
+                else "framewise_patch"
+            )
             if existing_trajectory is None:
                 existing_trajectory = inject_trajectory_conditioning(
                     model,
@@ -1397,6 +1496,14 @@ def main() -> None:
             elif existing_trajectory.representation != args.trajectory_representation:
                 raise ValueError(
                     "trajectory conditioner representation differs from arguments"
+                )
+            elif (
+                existing_trajectory.architecture
+                != expected_trajectory_architecture
+            ):
+                raise ValueError(
+                    "trajectory conditioner architecture differs from the current "
+                    "cache protocol; start a new adapter"
                 )
         elif existing_trajectory is not None:
             raise ValueError("source adapter contains trajectory conditioning")
@@ -1498,6 +1605,7 @@ def main() -> None:
                     rank,
                     world_size,
                     args.seed,
+                    response_updates=not args.ordinary_only,
                 )
                 step_mode = mode
                 step_axis = axis

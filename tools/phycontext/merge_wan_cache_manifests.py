@@ -31,10 +31,12 @@ def main() -> None:
     payloads = [json.loads(path.read_text(encoding="utf-8")) for path in shards]
     if not payloads:
         raise ValueError("at least one cache shard is required")
-    required_schema = "phycontext.wan_ti2v_cache.v3"
+    required_schema = payloads[0].get("schema")
+    if required_schema not in SUPPORTED_CACHE_SCHEMAS:
+        raise ValueError("first cache shard uses an unsupported schema")
     for path, payload in zip(shards, payloads):
         if payload.get("schema") != required_schema:
-            raise ValueError(f"{path} is not a v3 cache")
+            raise ValueError(f"{path} does not use the same cache schema")
 
     invariant_keys = (
         "dataset_root",

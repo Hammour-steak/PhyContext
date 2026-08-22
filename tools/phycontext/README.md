@@ -7,7 +7,7 @@ entry point or environment variables:
 
 ```text
 dataset       datasets/physweep_training
-cache         cache/wan/physweep_training/dense_point_tracks_832x480x97
+cache         cache/wan/physweep_training/das_3d_tracks_fullres_v4_832x480x97
 resolution    832 x 480 x 97 frames
 scene tokens  128
 ```

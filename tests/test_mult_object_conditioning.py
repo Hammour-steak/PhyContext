@@ -12,6 +12,7 @@ from conditioning_model import PhyContextConditionEncoder  # noqa: E402
 from wan_training import (  # noqa: E402
     TrajectoryPatchConditioner,
     motion_mask_from_point_track_map,
+    validate_point_track_object_slots,
     structured_direct_condition,
 )
 
@@ -101,9 +102,9 @@ class MultiObjectConditioningTest(unittest.TestCase):
             hidden_dim=8,
             patch_size=(1, 2, 2),
             rank=4,
-            representation="dense_point_tracks",
+            representation="das_3d_tracks",
         )
-        conditioner.set_condition([torch.zeros(18, 4, 4, 4)])
+        conditioner.set_condition([torch.zeros(12, 13, 4, 4)])
         conditioner.begin_forward(1)
         video = torch.zeros(1, 3, 4, 4, 4)
         patch_features = torch.zeros(1, 8, 4, 2, 2)
@@ -116,12 +117,12 @@ class MultiObjectConditioningTest(unittest.TestCase):
             hidden_dim=8,
             patch_size=(1, 2, 2),
             rank=4,
-            representation="dense_point_tracks",
+            representation="das_3d_tracks",
         )
         with torch.no_grad():
             conditioner.patch_projection.weight.fill_(1.0)
             conditioner.output_projection.weight.fill_(1.0)
-        zero_map = torch.zeros(18, 2, 4, 4)
+        zero_map = torch.zeros(12, 5, 4, 4)
         one_map = torch.ones_like(zero_map)
         video = torch.zeros(1, 3, 2, 4, 4)
         patch_features = torch.zeros(1, 8, 2, 2, 2)
@@ -134,14 +135,37 @@ class MultiObjectConditioningTest(unittest.TestCase):
         self.assertGreater(float(second.abs().sum().detach()), 0.0)
 
     def test_point_tracks_can_supply_training_only_motion_envelope(self):
-        point_track_map = torch.zeros(18, 2, 3, 4)
-        point_track_map[0, 0, 1, 2] = 1.0
-        point_track_map[1, 1, 2, 3] = 1.0
+        point_track_map = torch.zeros(12, 5, 3, 4)
+        point_track_map[3, 0, 1, 2] = 1.0
+        point_track_map[3, 2, 2, 3] = 1.0
         mask = motion_mask_from_point_track_map(point_track_map)
         self.assertEqual(mask.shape, (1, 2, 3, 4))
         self.assertEqual(float(mask[0, 0, 1, 2]), 1.0)
+        self.assertEqual(float(mask[0, 1, 1, 2]), 1.0)
         self.assertEqual(float(mask[0, 1, 2, 3]), 1.0)
-        self.assertEqual(float(mask.sum()), 2.0)
+        self.assertEqual(float(mask.sum()), 3.0)
+
+    def test_das_condition_rejects_nonbinary_visibility_and_background_rgb(self):
+        nonbinary = torch.zeros(12, 5, 3, 4)
+        nonbinary[3, 0, 0, 0] = 0.5
+        with self.assertRaisesRegex(ValueError, "visibility must be binary"):
+            motion_mask_from_point_track_map(nonbinary, "das_3d_tracks")
+
+        background_rgb = torch.zeros(12, 5, 3, 4)
+        background_rgb[0, 0, 0, 0] = 0.25
+        with self.assertRaisesRegex(ValueError, "zero outside visible"):
+            motion_mask_from_point_track_map(background_rgb, "das_3d_tracks")
+
+    def test_point_track_padding_must_match_object_count(self):
+        point_map = torch.zeros(12, 5, 3, 4)
+        point_map[7, 0, 0, 0] = 1.0
+        with self.assertRaisesRegex(ValueError, "unused.*slots"):
+            validate_point_track_object_slots(
+                point_map, "das_3d_tracks", object_count=1
+            )
+        validate_point_track_object_slots(
+            point_map, "das_3d_tracks", object_count=2
+        )
 
 
 if __name__ == "__main__":

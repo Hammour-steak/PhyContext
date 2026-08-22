@@ -33,7 +33,8 @@ PhysSweep project/data root + published manifest
         -> validate or run inference
 ```
 
-The dataset is read only. Wan latents, text embeddings, latent point tracks,
+The dataset is read only. Wan latents, text embeddings, full-rate DaS-style
+point-track maps,
 checkpoints, and inference results stay under this repository's `cache/` and
 `outputs/` directories.
 
@@ -80,7 +81,7 @@ backbone              Wan2.2 TI2V-5B, frozen
 resolution            832 x 480
 frames                97 at 24 fps
 scene tokens          128
-trajectory            dense target-sample point tracks
+trajectory            DaS-style 3D tracks, `[12, 97, 30, 52]`
 cross-attention LoRA  rank 16
 direct modulation     rank 32
 trajectory branch     rank 32

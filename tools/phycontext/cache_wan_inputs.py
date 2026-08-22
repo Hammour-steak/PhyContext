@@ -13,7 +13,18 @@ import torch
 from decord import VideoReader, cpu
 from safetensors.torch import save_file
 
-from point_trajectory import POINT_TRAJECTORY_SCHEMA, rasterize_projected_tracks
+from cache_contract import (
+    CURRENT_CACHE_SCHEMA,
+    GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
+    SUPPORTED_CACHE_SCHEMAS,
+)
+from point_trajectory import (
+    DAS_TRACK_CHANNELS_PER_OBJECT,
+    POINT_TRAJECTORY_SCHEMA,
+    TRACK_CHANNELS_PER_OBJECT,
+    rasterize_das_3d_tracks,
+    rasterize_projected_tracks,
+)
 from project_defaults import (
     CACHE_ROOT,
     DATASET_MANIFEST,
@@ -27,6 +38,8 @@ from schema import SWEEP_AXES, iter_jsonl
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CACHE_SCHEMA = CURRENT_CACHE_SCHEMA
+REUSABLE_CACHE_SCHEMAS = set(SUPPORTED_CACHE_SCHEMAS)
 DEFAULT_DATASET = DATASET_ROOT
 DEFAULT_CACHE = CACHE_ROOT
 DEFAULT_WAN_REPO = Path(os.environ.get("PHYCONTEXT_WAN_REPO", "external/Wan2.2"))
@@ -72,9 +85,74 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=VIDEO_WIDTH)
     parser.add_argument("--height", type=int, default=VIDEO_HEIGHT)
     parser.add_argument("--frames", type=int, default=VIDEO_FRAMES)
+    parser.add_argument(
+        "--trajectory-representation",
+        choices=("das_3d_tracks", "dense_point_tracks"),
+        default="das_3d_tracks",
+        help="point-track rasterization stored in the Wan cache",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def evenly_spaced_frame_indices(
+    source_frames: int, output_frames: int
+) -> list[int]:
+    """Select frames without silently duplicating a shorter source sequence."""
+    if source_frames <= 0 or output_frames <= 0:
+        raise ValueError("source and output frame counts must be positive")
+    if source_frames < output_frames:
+        raise ValueError(
+            "source sequence has fewer frames than the requested Wan input"
+        )
+    return np.rint(
+        np.linspace(0, source_frames - 1, output_frames)
+    ).astype(np.int64).tolist()
+
+
+def trajectory_frame_indices(
+    representation: str,
+    source_frames: int,
+    video_frames: int,
+    latent_frames: int,
+) -> list[int]:
+    if representation == "das_3d_tracks":
+        return evenly_spaced_frame_indices(source_frames, video_frames)
+    if representation == "dense_point_tracks":
+        return evenly_spaced_frame_indices(source_frames, latent_frames)
+    raise ValueError(f"unsupported trajectory representation: {representation}")
+
+
+def expected_point_track_shape(
+    representation: str,
+    video_frames: int,
+    latent_shape: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    if representation == "das_3d_tracks":
+        channels = 3 * DAS_TRACK_CHANNELS_PER_OBJECT
+        frames = video_frames
+    elif representation == "dense_point_tracks":
+        channels = 3 * TRACK_CHANNELS_PER_OBJECT
+        frames = latent_shape[1]
+    else:
+        raise ValueError(f"unsupported trajectory representation: {representation}")
+    return channels, frames, latent_shape[2], latent_shape[3]
+
+
+def record_dynamic_object_ids(record: dict) -> list[str]:
+    physics = record["conditioning"]["physics"]
+    objects = physics.get("objects")
+    if objects is None:
+        objects = [physics["object"]]
+    elif isinstance(objects, dict):
+        objects = [objects[key] for key in sorted(objects)]
+    if not isinstance(objects, list) or not 1 <= len(objects) <= 3:
+        raise ValueError("training record must contain one to three dynamic objects")
+    object_ids = [str(item["object_id"]) for item in objects]
+    if len(set(object_ids)) != len(object_ids):
+        raise ValueError("training record dynamic object ids must be unique")
+    return object_ids
 
 
 def sha256(path: Path) -> str:
@@ -87,6 +165,37 @@ def sha256(path: Path) -> str:
 
 def relative(path: Path, root: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
+
+
+def descriptor_matches_file(
+    descriptor: dict | None,
+    path: Path,
+    root: Path,
+) -> bool:
+    """Trust a cached artifact only when its manifest binding still verifies."""
+    if not isinstance(descriptor, dict) or not path.is_file():
+        return False
+    return (
+        descriptor.get("path") == relative(path, root)
+        and descriptor.get("sha256") == sha256(path)
+    )
+
+
+def should_build_local_artifact(
+    path: Path,
+    *,
+    current_matches: bool,
+    reusable_matches: bool = False,
+    overwrite: bool = False,
+) -> bool:
+    """Never let an untrusted local file shadow a verified reusable artifact."""
+    return bool(
+        overwrite
+        or (
+            not current_matches
+            and (path.exists() or not reusable_matches)
+        )
+    )
 
 
 def select_records(records: list[dict], args: argparse.Namespace) -> list[dict]:
@@ -171,7 +280,9 @@ def load_video(path: Path, width: int, height: int, frame_count: int) -> torch.T
     reader = VideoReader(str(path), ctx=cpu(0), num_threads=4)
     if len(reader) == 0:
         raise ValueError(f"video has no frames: {path}")
-    indices = np.rint(np.linspace(0, len(reader) - 1, frame_count)).astype(np.int64)
+    indices = np.asarray(
+        evenly_spaced_frame_indices(len(reader), frame_count), dtype=np.int64
+    )
     frames = reader.get_batch(indices).asnumpy()
     cropped = cover_center_crop(frames, width, height, cv2.INTER_AREA)
     return torch.from_numpy(cropped).permute(3, 0, 1, 2).float().div_(127.5).sub_(1.0)
@@ -189,6 +300,14 @@ def atomic_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
+    if (
+        args.trajectory_representation == "dense_point_tracks"
+        and args.cache_root == DEFAULT_CACHE
+    ):
+        raise ValueError(
+            "dense_point_tracks requires an explicit dedicated --cache-root; "
+            "the default root is reserved for full-rate das_3d_tracks"
+        )
     if args.point_trajectory_manifest is None:
         raise ValueError("formal PhyContext caching requires dense point trajectories")
     if args.width % 32 or args.height % 32:
@@ -235,9 +354,20 @@ def main() -> None:
             raise ValueError("point trajectories belong to a different training manifest")
         if int(point_manifest.get("point_count", 0)) != 2048:
             raise ValueError("point trajectory manifest must contain 2048 points per object")
-        point_records = {
-            item["sample_id"]: item for item in point_manifest["records"]
-        }
+        raw_point_records = point_manifest.get("records")
+        if not isinstance(raw_point_records, list):
+            raise ValueError("point trajectory manifest records must be a list")
+        point_sample_ids = [item.get("sample_id") for item in raw_point_records]
+        if any(not sample_id for sample_id in point_sample_ids):
+            raise ValueError("point trajectory manifest contains an empty sample id")
+        if len(set(point_sample_ids)) != len(point_sample_ids):
+            raise ValueError("point trajectory manifest contains duplicate samples")
+        if (
+            "record_count" in point_manifest
+            and int(point_manifest["record_count"]) != len(raw_point_records)
+        ):
+            raise ValueError("point trajectory manifest record count is inconsistent")
+        point_records = dict(zip(point_sample_ids, raw_point_records))
         missing_points = sorted(
             record["sample_id"]
             for record in selected
@@ -249,7 +379,7 @@ def main() -> None:
             record["sample_id"]
             for record in selected
             if point_records[record["sample_id"]].get("object_ids")
-            != [record["conditioning"]["physics"]["object"]["object_id"]]
+            != record_dynamic_object_ids(record)
         )
         if mismatched_points:
             raise ValueError(
@@ -269,15 +399,44 @@ def main() -> None:
         args.height // 16,
         args.width // 16,
     )
-    point_track_preprocess = {
-        "source_schema": POINT_TRAJECTORY_SCHEMA,
-        "channels_per_object": 6,
-        "max_objects": 3,
-        "frame_selection": "evenly_spaced_from_first_to_last",
-        "spatial_grid": "Wan_latent_grid",
-        "spatial_transform": "cover_then_center_crop_to_preprocess_size",
-        "preprocess_size_px": [args.width, args.height],
-    }
+    if args.trajectory_representation == "dense_point_tracks":
+        point_track_preprocess = {
+            "source_schema": POINT_TRAJECTORY_SCHEMA,
+            "channels_per_object": TRACK_CHANNELS_PER_OBJECT,
+            "max_objects": 3,
+            "frame_selection": "evenly_spaced_from_first_to_last",
+            "spatial_grid": "Wan_latent_grid",
+            "spatial_transform": "cover_then_center_crop_to_preprocess_size",
+            "pixel_center_convention": "opencv_half_pixel",
+            "geometry_compute_dtype": GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA[
+                CACHE_SCHEMA
+            ],
+            "preprocess_size_px": [args.width, args.height],
+        }
+    else:
+        point_track_preprocess = {
+            "source_schema": POINT_TRAJECTORY_SCHEMA,
+            "representation": "das_3d_tracks",
+            "channels_per_object": DAS_TRACK_CHANNELS_PER_OBJECT,
+            "channels": ["identity_r", "identity_g", "identity_b", "visibility"],
+            "max_objects": 3,
+            "frame_selection": "same_evenly_spaced_indices_as_preprocessed_video",
+            "source_frame_alignment": "trajectory_count_equals_source_video_count",
+            "spatial_grid": "Wan_VAE_grid_after_full_resolution_visibility",
+            "spatial_transform": "cover_then_center_crop_to_preprocess_size",
+            "pixel_center_convention": "opencv_half_pixel",
+            "geometry_compute_dtype": GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA[
+                CACHE_SCHEMA
+            ],
+            "preprocess_size_px": [args.width, args.height],
+            "point_identity": "first_frame_camera_xyz_with_reciprocal_z_rgb",
+            "color_normalization": "shared_xy_minmax_inverse_z_2_98_percentile",
+            "visibility": "full_resolution_dynamic_and_static_nearest_depth_z_buffer",
+            "visibility_depth_range": "source_camera_clip_start_end",
+            "spatial_reduction": "visible_point_identity_mean_and_binary_occupancy",
+            "temporal_encoding": "conditioner_first_frame_plus_learned_stride4_windows",
+            "point_splat_radius_px": 1,
+        }
     reuse_cache_path = None
     reuse_cache_hash = None
     reuse_records = {}
@@ -286,8 +445,8 @@ def main() -> None:
         reuse_cache_path = (root / args.reuse_cache_manifest).resolve()
         reuse_cache_hash = sha256(reuse_cache_path)
         reuse_cache = json.loads(reuse_cache_path.read_text(encoding="utf-8"))
-        if reuse_cache.get("schema") != "phycontext.wan_ti2v_cache.v3":
-            raise ValueError("reused cache must use the dense-point-track v3 schema")
+        if reuse_cache.get("schema") not in REUSABLE_CACHE_SCHEMAS:
+            raise ValueError("reused cache uses an unsupported schema")
         reused_dataset_root = Path(reuse_cache.get("dataset_root", "")).resolve()
         if reused_dataset_root != dataset_root:
             raise ValueError("reused cache belongs to a different dataset root")
@@ -342,8 +501,10 @@ def main() -> None:
     cached = {}
     if cache_manifest_path.is_file() and not args.overwrite:
         existing = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
-        if existing.get("schema") != "phycontext.wan_ti2v_cache.v3":
-            raise ValueError("cache must use the dense-point-track v3 schema")
+        if existing.get("schema") != CACHE_SCHEMA:
+            raise ValueError(
+                f"cache must use the current trajectory schema {CACHE_SCHEMA}"
+            )
         existing_dataset_root = Path(existing.get("dataset_root", "")).resolve()
         if existing_dataset_root != dataset_root:
             raise ValueError("cache belongs to a different dataset root")
@@ -375,29 +536,88 @@ def main() -> None:
 
     point_track_targets = []
     if point_manifest_path is not None:
+        expected_point_shape = expected_point_track_shape(
+            args.trajectory_representation,
+            args.frames,
+            expected_latent_shape,
+        )
         for record in selected:
             point_path = point_track_root / f"{record['sample_id']}.safetensors"
-            if args.overwrite or not point_path.is_file():
+            cached_descriptor = cached.get(record["sample_id"], {}).get(
+                "point_track"
+            )
+            current_matches = descriptor_matches_file(
+                cached_descriptor, point_path, root
+            )
+            if should_build_local_artifact(
+                point_path,
+                current_matches=current_matches,
+                overwrite=args.overwrite,
+            ):
                 point_track_targets.append((record, point_path))
-        frame_indices = np.rint(
-            np.linspace(0, args.frames - 1, expected_latent_shape[1])
-        ).astype(np.int64).tolist()
-        expected_point_shape = (
-            18,
-            expected_latent_shape[1],
-            expected_latent_shape[2],
-            expected_latent_shape[3],
-        )
         for index, (record, point_path) in enumerate(point_track_targets, 1):
-            source_path = dataset_root / point_records[record["sample_id"]]["path"]
+            source = point_records[record["sample_id"]]
+            source_path = (dataset_root / source["path"]).resolve()
+            if (
+                not source_path.is_relative_to(dataset_root)
+                or not source_path.is_file()
+                or sha256(source_path) != source.get("sha256")
+            ):
+                raise ValueError(
+                    "point trajectory file/hash mismatch for "
+                    f"{record['sample_id']}"
+                )
             with np.load(source_path, allow_pickle=False) as archive:
                 point_payload = {key: archive[key] for key in archive.files}
-            point_track_map = rasterize_projected_tracks(
+            source_frame_count = int(point_payload["points_world_m"].shape[0])
+            video_path = dataset_root / record["target"]["video"]
+            source_video = VideoReader(
+                str(video_path), ctx=cpu(0), num_threads=1
+            )
+            source_video_frame_count = len(source_video)
+            del source_video
+            if source_frame_count != source_video_frame_count:
+                raise ValueError(
+                    "point trajectory and source video frame counts differ for "
+                    f"{record['sample_id']}: {source_frame_count} != "
+                    f"{source_video_frame_count}"
+                )
+            frame_indices = trajectory_frame_indices(
+                args.trajectory_representation,
+                source_frame_count,
+                args.frames,
+                expected_latent_shape[1],
+            )
+            renderer = (
+                rasterize_das_3d_tracks
+                if args.trajectory_representation == "das_3d_tracks"
+                else rasterize_projected_tracks
+            )
+            static_points_camera0_m = None
+            if args.trajectory_representation == "das_3d_tracks":
+                scene_path = dataset_root / record["conditioning"]["scene"]
+                with np.load(scene_path, allow_pickle=False) as scene_archive:
+                    if "environment_xyz_camera_m" not in scene_archive:
+                        raise ValueError(
+                            f"scene condition has no static environment points: {scene_path}"
+                        )
+                    static_points_camera0_m = scene_archive[
+                        "environment_xyz_camera_m"
+                    ].astype(np.float32)
+            point_track_map = renderer(
                 point_payload,
                 (expected_latent_shape[3], expected_latent_shape[2]),
                 preprocess_size_px=(args.width, args.height),
                 frame_indices=frame_indices,
                 max_objects=3,
+                **(
+                    {
+                        "static_points_camera0_m": static_points_camera0_m,
+                        "point_radius_px": 1,
+                    }
+                    if args.trajectory_representation == "das_3d_tracks"
+                    else {}
+                ),
             )
             if tuple(point_track_map.shape) != expected_point_shape:
                 raise ValueError(
@@ -417,13 +637,18 @@ def main() -> None:
     for record in selected:
         latent_path = latent_root / f"{record['sample_id']}.safetensors"
         reusable = reuse_records.get(record["sample_id"], {}).get("latent")
-        if args.overwrite or (
-            not latent_path.is_file()
-            and not (
-                reusable
-                and (root / reusable["path"]).is_file()
-                and sha256(root / reusable["path"]) == reusable["sha256"]
-            )
+        current = cached.get(record["sample_id"], {}).get("latent")
+        current_matches = descriptor_matches_file(current, latent_path, root)
+        reusable_matches = bool(
+            reusable
+            and (root / reusable["path"]).is_file()
+            and sha256(root / reusable["path"]) == reusable["sha256"]
+        )
+        if should_build_local_artifact(
+            latent_path,
+            current_matches=current_matches,
+            reusable_matches=reusable_matches,
+            overwrite=args.overwrite,
         ):
             latent_targets.append((record, latent_path))
 
@@ -461,18 +686,28 @@ def main() -> None:
         prompt = record["conditioning"]["text"]
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         text_by_hash[prompt_hash] = prompt
+    cached_text_by_hash = {}
+    for item in cached.values():
+        descriptor = item.get("text_context")
+        if isinstance(descriptor, dict) and descriptor.get("prompt_sha256"):
+            cached_text_by_hash[descriptor["prompt_sha256"]] = descriptor
     missing_text = [
         (prompt_hash, prompt)
         for prompt_hash, prompt in text_by_hash.items()
-        if args.overwrite
-        or (
-            not (text_root / f"{prompt_hash}.safetensors").is_file()
-            and not (
+        if should_build_local_artifact(
+            text_root / f"{prompt_hash}.safetensors",
+            current_matches=descriptor_matches_file(
+                cached_text_by_hash.get(prompt_hash),
+                text_root / f"{prompt_hash}.safetensors",
+                root,
+            ),
+            reusable_matches=(
                 prompt_hash in reused_text_by_hash
                 and (root / reused_text_by_hash[prompt_hash]["path"]).is_file()
                 and sha256(root / reused_text_by_hash[prompt_hash]["path"])
                 == reused_text_by_hash[prompt_hash]["sha256"]
-            )
+            ),
+            overwrite=args.overwrite,
         )
     ]
     if missing_text:
@@ -506,6 +741,8 @@ def main() -> None:
         latent_path = latent_root / f"{record['sample_id']}.safetensors"
         text_path = text_root / f"{prompt_hash}.safetensors"
         video_path = dataset_root / record["target"]["video"]
+        first_frame_path = dataset_root / record["conditioning"]["first_frame"]
+        scene_path = dataset_root / record["conditioning"]["scene"]
         reused = reuse_records.get(record["sample_id"], {})
         latent_descriptor = (
             {
@@ -534,6 +771,8 @@ def main() -> None:
             "latent": latent_descriptor,
             "text_context": text_descriptor,
             "source_video_sha256": sha256(video_path),
+            "source_first_frame_sha256": sha256(first_frame_path),
+            "source_scene_sha256": sha256(scene_path),
         }
         if point_manifest_path is not None:
             point_path = point_track_root / f"{record['sample_id']}.safetensors"
@@ -541,12 +780,7 @@ def main() -> None:
             cached_record["point_track"] = {
                 "path": relative(point_path, root),
                 "sha256": sha256(point_path),
-                "shape": [
-                    18,
-                    expected_latent_shape[1],
-                    expected_latent_shape[2],
-                    expected_latent_shape[3],
-                ],
+                "shape": list(expected_point_shape),
                 "dtype": "float32",
                 "source_point_trajectory": source["path"],
                 "source_point_trajectory_sha256": source["sha256"],
@@ -557,7 +791,7 @@ def main() -> None:
 
     cache_root.mkdir(parents=True, exist_ok=True)
     cache_manifest = {
-        "schema": "phycontext.wan_ti2v_cache.v3",
+        "schema": CACHE_SCHEMA,
         "dataset_root": str(dataset_root),
         "source_manifest": relative(manifest_path, dataset_root),
         "source_manifest_sha256": manifest_hash,

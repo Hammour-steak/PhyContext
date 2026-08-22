@@ -1,60 +1,122 @@
-# Dense Point-Trajectory Condition
+# DaS-Style 3D Point-Trajectory Condition
 
-PhyContext uses a simulator-derived dense point-trajectory condition:
+PhyContext uses simulator-derived dense point trajectories. The simulator is the
+source of truth for object motion, and every dynamic object keeps 2048 stable
+surface-point identities through the sequence. The published cache contains
+world and camera coordinates with shape `[T, O, 2048, 3]`, projected pixels,
+depth, and projection validity.
 
-1. The simulator is the source of truth for each object's pose.
-2. Each object keeps a fixed set of 2048 surface points, so point identity is
-   stable over time.
-3. The cache stores world and camera coordinates for every frame as
-   `[T, O, 2048, 3]`, plus projected pixels, depth, and projection validity.
-4. The video model receives projected track maps, not a raw variable-length
-   point cloud. Each of three object slots has six channels: source occupancy,
-   current occupancy, source-anchored x/y displacement, depth, and validity.
+## Default representation: `das_3d_tracks`
 
-The fixed-width condition is `[18, T_latent, H_latent, W_latent]`. Empty object
-slots are zero-filled, so the encoder interface can represent one, two, or three
-objects. The current published dataset schema and formal training configuration
-remain one-object; multi-object publication is not claimed yet.
-The trajectory must be generated for the same physical sample as the target
-video; a nominal base trajectory is retained only as an explicit ablation.
+The default Wan condition is a DaS-inspired representation adapted to Wan2.2.
+It uses DaS point identities but a lightweight Wan patch conditioner rather
+than DaS's copied multi-block condition DiT:
 
-The scene encoder adds a learned object-slot embedding (`0`, `1`, or `2`) to
-each object's point block. The point encoder weights are shared across objects,
-but the model can distinguish object identity and align it with the matching
-per-object physics tokens and track-map channels.
+1. Assign every finite positive-depth point a fixed RGB identity from its
+   first-frame camera coordinate `(x, y, 1/z)`. Frame-zero image bounds do not
+   suppress a point that enters view later.
+2. Normalize camera x/y with sample-wide min/max and inverse z with the robust
+   2nd/98th percentiles across all object slots.
+3. Select the same 97 evenly spaced source frames used by video preprocessing,
+   require the source video and trajectory frame counts to agree, and project
+   the same points using the simulator-provided camera projection.
+4. At 832 x 480, resolve dynamic points and static-environment points with one
+   global nearest-positive-depth z-buffer.
+5. Only after visibility is resolved, aggregate visible identities and binary
+   occupancy onto the 52 x 30 Wan VAE spatial grid.
+6. Keep the RGB identity unchanged while the projected position moves.
 
-The current point cache uses projection and clipping validity. It does not claim
-to be a z-buffer visibility mask. Occlusion-aware visibility can be added later
-without changing the point identity or object-slot contract.
+The cover-resize coordinate transform uses OpenCV's half-pixel center
+convention, matching the RGB preprocessing rather than approximating it with a
+corner-aligned scale.
 
-The rasterized depth channel uses one robust percentile range per sample across
-all frames and object slots, so its scale does not change from frame to frame.
+After source-array decoding, rasterization geometry stays in float64 through
+projection, resize, and crop, and is converted to integer pixels only at the
+z-buffer; this prevents additional precision loss at a half-pixel rounding
+boundary. Cache schema v4 records this contract together with static-point camera
+clipping, so older point maps cannot be consumed as current DaS conditions.
 
-The motion mask is not a model input in this representation. Point-track maps
-are the trajectory condition; when auxiliary motion losses are enabled, the
-trainer derives a temporary source/current occupancy envelope from those maps.
-This keeps the point-track cache self-contained. Centroid-only and
-source-bound mask representations are not part of the maintained pipeline.
+`unproject_physweep_tracks` provides the metric-depth inverse of the published
+projection. `tools/phycontext/audit_das_roundtrip.py` uses it to verify a real
+sample in both directions: raw rigid poses, world/camera transforms, pixels and
+depth, GT scene identity, DaS RGB identity, an independent reference z-buffer,
+rendered masks, and the 97-to-25 temporal window. The audit fails closed when a
+metric exceeds its declared numerical or alignment tolerance. Temporal window
+averaging and per-cell RGB aggregation are intentionally many-to-one, so their
+conservation semantics can be verified but individual source frames or points
+cannot be reconstructed from the compressed condition alone.
 
-The direct physical modulation branch uses the same fixed object slots. Each
-slot contributes three physical controls plus one initial state, so its input
-is `12 * O_max` values; absent slots are zero-padded.
+Each object slot contributes four channels:
+
+```text
+identity_r, identity_g, identity_b, visibility
+```
+
+With three fixed object slots, the cached model input is `[12, 97, 30, 52]`.
+The trajectory conditioner preserves frame zero and applies a learned causal
+four-frame window to frames 1-96, producing the Wan-aligned temporal grid
+`[12, 25, 30, 52]` before patch projection. Empty slots are zero-filled. The explicit
+visibility channel avoids confusing black background with a valid point whose
+normalized coordinate color is near zero. Visibility also supplies a temporary
+source/current motion envelope for auxiliary training losses; it is not a second
+model condition.
+
+Static occlusion uses the 8,192 environment points in the scene condition,
+transformed through the published camera transform or camera sequence. A single
+static `[4,4]` PhysSweep camera is broadcast over all frames. Static projection
+uses the same PhysSweep right/up/forward camera convention as dynamic tracks,
+including its left-handed camera basis and the image-row sign flip
+`v = cy - fy*y/z`. It is a point-cloud
+approximation; continuous mesh/depth-buffer visibility would require the dataset
+to publish an environment depth video or renderable scene mesh.
+
+## Legacy ablation: `dense_point_tracks`
+
+The previous representation remains supported as an explicit ablation. Each of
+three object slots has six channels: source occupancy, current occupancy,
+source-anchored x/y displacement, normalized depth, and projection validity. Its
+fixed shape is `[18, T_latent, H_latent, W_latent]`.
+
+Old caches and checkpoints are not overwritten. DaS-style caching uses:
+
+```text
+cache/wan/physweep_training/das_3d_tracks_fullres_v4_832x480x97/
+```
+
+The legacy cache remains under `dense_point_tracks_832x480x97/`.
 
 ## Pipeline
 
-Point trajectories must be exported and published by the dataset project from
-the same simulation record used to render each target video. This method
-project treats them as immutable dataset inputs.
+Point trajectories must be exported by the dataset project from the same
+simulation record used to render each target video. PhyContext treats them as
+immutable inputs and records their hashes in the Wan cache.
 
-Build Wan cache entries with the point-trajectory manifest. The cache records
-its hash, so a trajectory from another sweep sample cannot be silently reused:
+Build the default cache with:
 
 ```bash
 python tools/phycontext/cache_wan_inputs.py \
   --dataset-root "$PHYCONTEXT_DATASET_ROOT" \
-  --point-trajectory-manifest datasets/physweep_training/point_trajectories/manifest.json
+  --point-trajectory-manifest \
+    datasets/physweep_training/point_trajectories/manifest.json \
+  --trajectory-representation das_3d_tracks
 ```
 
-Train with `--trajectory-input --trajectory-representation
-dense_point_tracks`. The default trajectory source is the target sample;
-`nominal_base` remains an explicit fixed-trajectory ablation only.
+Train with:
+
+```bash
+python tools/phycontext/train_wan_formal.py \
+  --trajectory-input \
+  --trajectory-representation das_3d_tracks
+```
+
+For a one-record, one-step integration smoke test, add `--ordinary-only`. This
+disables paired physics-response updates and validation and records zero response
+share in the adapter metadata. The trainer rejects more than one step in this
+mode. Do not use the flag for an ablation or full PhysSweep training run: the
+default remains the 60/40 ordinary/paired-response schedule and requires complete
+low/base/high sweep groups.
+
+The default trajectory source is the target sample. `nominal_base` remains an
+explicit fixed-trajectory physics-response ablation. The scene encoder and direct
+physical modulation branches retain their three object slots, so point-track
+conditions stay aligned with the corresponding material and initial-state tokens.

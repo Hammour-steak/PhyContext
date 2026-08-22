@@ -7,6 +7,25 @@ import hashlib
 import json
 from pathlib import Path
 
+CURRENT_CACHE_SCHEMA = "phycontext.wan_ti2v_cache.v4"
+FULL_RATE_DAS_CACHE_SCHEMAS = frozenset(
+    {
+        CURRENT_CACHE_SCHEMA,
+    }
+)
+GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA = {
+    CURRENT_CACHE_SCHEMA: (
+        "float64_after_source_decode_until_integer_rasterization"
+    ),
+}
+FLOAT64_GEOMETRY_CACHE_SCHEMAS = frozenset(GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA)
+SUPPORTED_CACHE_SCHEMAS = frozenset(
+    {
+        "phycontext.wan_ti2v_cache.v3",
+        CURRENT_CACHE_SCHEMA,
+    }
+)
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -24,10 +43,34 @@ def resolve_cache_dataset_root(project_root: Path, cache: dict) -> Path:
     return path.resolve() if path.is_absolute() else (project_root / path).resolve()
 
 
+def validate_cache_artifact(
+    project_root: Path,
+    descriptor: dict,
+    label: str,
+) -> Path:
+    """Resolve and hash-check one project-local cache artifact."""
+    if not isinstance(descriptor, dict):
+        raise ValueError(f"Wan cache is missing its {label} descriptor")
+    relative_value = descriptor.get("path")
+    expected_hash = descriptor.get("sha256")
+    if not relative_value or not expected_hash:
+        raise ValueError(f"Wan cache {label} descriptor is incomplete")
+    relative_path = Path(relative_value)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError(f"Wan cache {label} path must be project-root-relative")
+    root = project_root.resolve()
+    path = (root / relative_path).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise FileNotFoundError(f"Wan cache {label} artifact is missing: {path}")
+    if _sha256(path) != expected_hash:
+        raise ValueError(f"Wan cache {label} artifact hash mismatch: {path}")
+    return path
+
+
 def validate_cache_source_manifest(project_root: Path, cache: dict) -> Path:
     """Reject a cache when its source manifest has changed since preprocessing."""
-    if cache.get("schema") != "phycontext.wan_ti2v_cache.v3":
-        raise ValueError("Wan cache must use the dense-point-track v3 schema")
+    if cache.get("schema") not in SUPPORTED_CACHE_SCHEMAS:
+        raise ValueError("Wan cache uses an unsupported schema")
     dataset_root = resolve_cache_dataset_root(project_root, cache)
     source_value = cache.get("source_manifest")
     expected_hash = cache.get("source_manifest_sha256")
@@ -70,7 +113,7 @@ def validate_cache_source_manifest(project_root: Path, cache: dict) -> Path:
     point_value = cache.get("source_point_trajectory_manifest")
     point_hash = cache.get("source_point_trajectory_manifest_sha256")
     if not point_value or not point_hash:
-        raise ValueError("Wan cache is missing its dense point-trajectory contract")
+        raise ValueError("Wan cache is missing its point-trajectory contract")
     point_path = Path(point_value).expanduser()
     if point_path.is_absolute() or ".." in point_path.parts:
         raise ValueError("point-trajectory manifest path must be dataset-root-relative")

@@ -19,6 +19,7 @@ if str(PHYCONTEXT_TOOLS) not in sys.path:
     sys.path.insert(0, str(PHYCONTEXT_TOOLS))
 
 from cache_contract import (  # noqa: E402
+    CURRENT_CACHE_SCHEMA,
     resolve_cache_dataset_root,
     validate_cache_source_manifest,
 )
@@ -84,6 +85,25 @@ def preflight(root: Path, config: dict[str, Any]) -> tuple[Path, Path]:
     if not cache_manifest.is_file():
         raise FileNotFoundError(f"Wan cache manifest is missing: {cache_manifest}")
     cache = json.loads(cache_manifest.read_text(encoding="utf-8"))
+    expected_representation = config.get("training", {}).get(
+        "trajectory_representation"
+    )
+    if expected_representation is not None:
+        cache_representation = cache.get("point_track_preprocess", {}).get(
+            "representation", "dense_point_tracks"
+        )
+        if cache_representation != expected_representation:
+            raise ValueError(
+                "Wan cache trajectory representation differs from training config"
+            )
+        if (
+            expected_representation == "das_3d_tracks"
+            and cache.get("schema") != CURRENT_CACHE_SCHEMA
+        ):
+            raise ValueError(
+                "full-rate das_3d_tracks training requires the current cache "
+                f"schema {CURRENT_CACHE_SCHEMA}"
+            )
     cache_dataset_root = resolve_cache_dataset_root(root, cache)
     if cache_dataset_root != dataset_root:
         raise ValueError(

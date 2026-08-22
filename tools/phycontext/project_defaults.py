@@ -12,7 +12,9 @@ from pathlib import Path
 _DATASET_ROOT_VALUE = os.environ.get("PHYCONTEXT_DATASET_ROOT")
 DATASET_ROOT = Path(_DATASET_ROOT_VALUE).expanduser() if _DATASET_ROOT_VALUE else None
 DATASET_MANIFEST = Path("datasets/physweep_training/manifest.jsonl")
-CACHE_ROOT = Path("cache/wan/physweep_training/dense_point_tracks_832x480x97")
+CACHE_ROOT = Path(
+    "cache/wan/physweep_training/das_3d_tracks_fullres_v4_832x480x97"
+)
 CACHE_MANIFEST = CACHE_ROOT / "manifest.json"
 POINT_TRAJECTORY_MANIFEST = Path(
     "datasets/physweep_training/point_trajectories/manifest.json"

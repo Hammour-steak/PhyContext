@@ -233,6 +233,50 @@ class WanTrainingTest(unittest.TestCase):
             source_trajectory.output_projection.weight,
         )
 
+    def test_full_rate_das_trajectory_conditioning_round_trip(self) -> None:
+        source_model = DummyTrajectoryModel()
+        inject_cross_attention_lora(source_model, rank=2, alpha=2)
+        source_trajectory = inject_trajectory_conditioning(
+            source_model, rank=3, representation="das_3d_tracks"
+        )
+        with torch.no_grad():
+            source_trajectory.output_projection.weight.fill_(0.125)
+            source_trajectory.temporal_projection.weight.add_(0.03125)
+        source_condition = nn.Linear(3, 4)
+        metadata = {
+            "schema": "phycontext.wan_condition_adapter.v3",
+            "lora": {"rank": 2, "alpha": 2.0, "module_count": 8},
+            "trajectory_conditioning": {
+                "enabled": True,
+                "rank": 3,
+                "representation": "das_3d_tracks",
+                "input_channels": 12,
+                "architecture": "full_frame_causal_patch_v2",
+                "patch_size": [1, 2, 2],
+            },
+        }
+        with TemporaryDirectory() as directory:
+            adapter = Path(directory)
+            save_condition_checkpoint(
+                adapter, source_model, source_condition, metadata
+            )
+            target_model = DummyTrajectoryModel()
+            target_condition = nn.Linear(3, 4)
+            load_condition_checkpoint(adapter, target_model, target_condition)
+        target_trajectory = target_model.phycontext_trajectory_conditioner
+        self.assertEqual(target_trajectory.representation, "das_3d_tracks")
+        self.assertEqual(
+            target_trajectory.architecture, "full_frame_causal_patch_v2"
+        )
+        torch.testing.assert_close(
+            target_trajectory.output_projection.weight,
+            source_trajectory.output_projection.weight,
+        )
+        torch.testing.assert_close(
+            target_trajectory.temporal_projection.weight,
+            source_trajectory.temporal_projection.weight,
+        )
+
     def test_formal_learning_rate_warms_up_and_cosine_decays(self) -> None:
         factors = [
             learning_rate_factor(step, 100, warmup_ratio=0.1, minimum_ratio=0.1)
@@ -549,6 +593,26 @@ class WanTrainingTest(unittest.TestCase):
             )[0]
         ]
         self.assertNotEqual(rank_batches[2], rank_one)
+
+    def test_formal_schedule_can_disable_response_updates(self) -> None:
+        records = [{"sample_id": "single", "base_scene_id": "base"}]
+        batch, mode, axis = make_formal_training_batch(
+            records,
+            [],
+            step=0,
+            accumulation_index=0,
+            gradient_accumulation=1,
+            rank=0,
+            world_size=1,
+            seed=13,
+            response_updates=False,
+        )
+        self.assertEqual(
+            [item["sample_id"] for item in batch], ["single", "single"]
+        )
+        self.assertEqual(mode, "ordinary")
+        self.assertIsNone(axis)
+
 
     def test_ti2v_flow_keeps_first_latent_frame_clean(self) -> None:
         latent = torch.randn(4, 5, 6, 8)

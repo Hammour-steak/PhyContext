@@ -228,6 +228,7 @@ def make_formal_training_batch(
     rank: int,
     world_size: int,
     seed: int,
+    response_updates: bool = True,
 ) -> tuple[list[dict], str, str | None]:
     """Build one deterministic two-video microbatch for formal DDP training."""
     if gradient_accumulation <= 0 or not 0 <= accumulation_index < gradient_accumulation:
@@ -237,7 +238,7 @@ def make_formal_training_batch(
     if not records:
         raise ValueError("formal training requires records")
 
-    if is_formal_response_step(step):
+    if response_updates and is_formal_response_step(step):
         response_index = formal_response_step_index(step)
         response_micro_index = response_index * gradient_accumulation + accumulation_index
         axis = FORMAL_RESPONSE_AXIS_CYCLE[
@@ -252,7 +253,9 @@ def make_formal_training_batch(
         )
         return [pair["low"], pair["high"]], "response", axis
 
-    ordinary_index = formal_ordinary_step_index(step)
+    ordinary_index = (
+        formal_ordinary_step_index(step) if response_updates else step
+    )
     ordinary_micro_index = ordinary_index * gradient_accumulation + accumulation_index
     start = (ordinary_micro_index * world_size + rank) * 2
     batch = [
@@ -290,12 +293,48 @@ class LoRALinear(nn.Module):
         return base_output + delta.to(base_output.dtype) * self.scaling
 
 
-TRAJECTORY_REPRESENTATION_CHANNELS = {"dense_point_tracks": 18}
+TRAJECTORY_REPRESENTATION_CHANNELS = {
+    "dense_point_tracks": 18,
+    "das_3d_tracks": 12,
+}
+TRAJECTORY_CHANNELS_PER_OBJECT = {
+    "dense_point_tracks": 6,
+    "das_3d_tracks": 4,
+}
+TRAJECTORY_CHANNEL_SEMANTICS = {
+    "dense_point_tracks": (
+        "source_occupancy",
+        "current_occupancy",
+        "delta_x",
+        "delta_y",
+        "depth",
+        "validity",
+    ),
+    "das_3d_tracks": (
+        "identity_r",
+        "identity_g",
+        "identity_b",
+        "visibility",
+    ),
+}
 
 def canonical_trajectory_representation(representation: str) -> str:
-    if representation != "dense_point_tracks":
+    if representation not in TRAJECTORY_REPRESENTATION_CHANNELS:
         raise ValueError(f"unsupported trajectory representation: {representation}")
     return representation
+
+def trajectory_channel_names(
+    representation: str,
+    object_slots: int = 3,
+) -> list[str]:
+    representation = canonical_trajectory_representation(representation)
+    if object_slots <= 0:
+        raise ValueError("trajectory object-slot count must be positive")
+    return [
+        f"object_{slot}_{channel}"
+        for slot in range(object_slots)
+        for channel in TRAJECTORY_CHANNEL_SEMANTICS[representation]
+    ]
 
 def validate_point_track_maps(
     point_track_maps: list[torch.Tensor] | None,
@@ -303,21 +342,66 @@ def validate_point_track_maps(
 ) -> list[torch.Tensor]:
     canonical_trajectory_representation(representation)
     if point_track_maps is None:
-        raise ValueError("dense_point_tracks requires pre-rasterized point tracks")
-    expected_channels = TRAJECTORY_REPRESENTATION_CHANNELS["dense_point_tracks"]
+        raise ValueError(
+            f"{representation} requires pre-rasterized point tracks"
+        )
+    expected_channels = TRAJECTORY_REPRESENTATION_CHANNELS[representation]
     validated = []
     for condition in point_track_maps:
         if condition.ndim != 4 or condition.shape[0] != expected_channels:
             raise ValueError(
                 "point-track condition must have shape "
-                f"[{expected_channels}, latent_frames, latent_height, latent_width]"
+                f"[{expected_channels}, trajectory_frames, latent_height, latent_width]"
             )
         if not torch.isfinite(condition).all():
             raise ValueError("point-track condition contains non-finite values")
+        if representation == "das_3d_tracks":
+            slots = condition.reshape(
+                expected_channels // 4, 4, *condition.shape[1:]
+            )
+            rgb = slots[:, :3]
+            visibility = slots[:, 3:4]
+            if bool((condition < -1.0e-6).any()) or bool(
+                (condition > 1.0 + 1.0e-6).any()
+            ):
+                raise ValueError("das_3d_tracks values must lie in [0, 1]")
+            binary_visibility = torch.logical_or(
+                visibility == 0, visibility == 1
+            )
+            if not bool(binary_visibility.all()):
+                raise ValueError("das_3d_tracks visibility must be binary")
+            background_rgb = rgb.masked_select(visibility.expand_as(rgb) == 0)
+            if len(background_rgb) and bool((background_rgb.abs() > 1.0e-6).any()):
+                raise ValueError(
+                    "das_3d_tracks RGB must be zero outside visible cells"
+                )
         validated.append(condition)
     return validated
 
-def motion_mask_from_point_track_map(point_track_map: torch.Tensor) -> torch.Tensor:
+
+def validate_point_track_object_slots(
+    point_track_map: torch.Tensor,
+    representation: str,
+    object_count: int,
+) -> torch.Tensor:
+    """Validate fixed-slot padding against the sample's bound object count."""
+    representation = canonical_trajectory_representation(representation)
+    if not 1 <= int(object_count) <= 3:
+        raise ValueError("point-track object count must be between one and three")
+    point_track_map = validate_point_track_maps(
+        [point_track_map], representation
+    )[0]
+    channels_per_object = TRAJECTORY_CHANNELS_PER_OBJECT[representation]
+    unused = point_track_map[int(object_count) * channels_per_object :]
+    if unused.numel() and bool((unused.abs() > 1.0e-6).any()):
+        raise ValueError("unused point-track object slots must be zero")
+    return point_track_map
+
+
+def motion_mask_from_point_track_map(
+    point_track_map: torch.Tensor,
+    representation: str | None = None,
+) -> torch.Tensor:
     """Build a training-only motion envelope from point-track occupancy.
 
     Point-track maps are the model condition.  This derived mask is used only
@@ -326,20 +410,53 @@ def motion_mask_from_point_track_map(point_track_map: torch.Tensor) -> torch.Ten
     """
     if point_track_map.ndim != 4:
         raise ValueError("point-track map must have shape C x F x H x W")
+    if representation is None:
+        matches = [
+            name
+            for name, channel_count in TRAJECTORY_REPRESENTATION_CHANNELS.items()
+            if point_track_map.shape[0] == channel_count
+        ]
+        if len(matches) != 1:
+            raise ValueError("point-track map has an unexpected channel count")
+        representation = matches[0]
+    representation = canonical_trajectory_representation(representation)
     if point_track_map.shape[0] != TRAJECTORY_REPRESENTATION_CHANNELS[
-        "dense_point_tracks"
+        representation
     ]:
-        raise ValueError("point-track map has an unexpected channel count")
-    if not torch.isfinite(point_track_map).all():
-        raise ValueError("point-track map contains non-finite values")
-    source = point_track_map[0::6].amax(dim=0)
-    current = point_track_map[1::6].amax(dim=0)
+        raise ValueError("point-track map does not match its representation")
+    point_track_map = validate_point_track_maps(
+        [point_track_map], representation
+    )[0]
+    if representation == "dense_point_tracks":
+        source = point_track_map[0::6].amax(dim=0)
+        current = point_track_map[1::6].amax(dim=0)
+    else:
+        visibility = point_track_map[3::4]
+        full_current = visibility.amax(dim=0)
+        frame_count = int(full_current.shape[0])
+        if frame_count < 1 or (frame_count - 1) % 4:
+            raise ValueError(
+                "das_3d_tracks must contain 4n+1 full-rate trajectory frames"
+            )
+        if frame_count == 1:
+            current = full_current
+        else:
+            current = torch.cat(
+                (
+                    full_current[:1],
+                    full_current[1:].reshape(
+                        (frame_count - 1) // 4, 4, *full_current.shape[1:]
+                    ).amax(dim=1),
+                ),
+                dim=0,
+            )
+        source = full_current[:1].expand_as(current)
     envelope = torch.maximum(source, current).gt(0)
     return envelope.unsqueeze(0).to(dtype=point_track_map.dtype)
 
 
 class TrajectoryPatchConditioner(nn.Module):
-    """Project one-object trajectory conditions into Wan video patch features."""
+    """Project DaS-inspired fixed-slot trajectories into Wan patch features."""
 
     def __init__(
         self,
@@ -347,6 +464,7 @@ class TrajectoryPatchConditioner(nn.Module):
         patch_size: tuple[int, int, int],
         rank: int = 32,
         representation: str = "dense_point_tracks",
+        architecture: str | None = None,
     ):
         super().__init__()
         if hidden_dim <= 0 or rank <= 0 or len(patch_size) != 3:
@@ -361,6 +479,33 @@ class TrajectoryPatchConditioner(nn.Module):
             raise ValueError("unsupported trajectory representation")
         self.representation = representation
         self.input_channels = TRAJECTORY_REPRESENTATION_CHANNELS[representation]
+        if architecture is None:
+            architecture = (
+                "full_frame_causal_patch_v2"
+                if representation == "das_3d_tracks"
+                else "framewise_patch"
+            )
+        allowed_architectures = {"framewise_patch"}
+        if representation == "das_3d_tracks":
+            allowed_architectures.add("full_frame_causal_patch_v2")
+        if architecture not in allowed_architectures:
+            raise ValueError(
+                f"unsupported trajectory conditioner architecture: {architecture}"
+            )
+        self.architecture = architecture
+        if architecture == "full_frame_causal_patch_v2":
+            self.temporal_projection = nn.Conv3d(
+                self.input_channels,
+                self.input_channels,
+                kernel_size=(4, 1, 1),
+                stride=(4, 1, 1),
+                bias=False,
+                dtype=torch.float32,
+            )
+            nn.init.zeros_(self.temporal_projection.weight)
+            with torch.no_grad():
+                for channel in range(self.input_channels):
+                    self.temporal_projection.weight[channel, channel, :, 0, 0] = 0.25
         self.patch_projection = nn.Conv3d(
             self.input_channels,
             rank,
@@ -421,12 +566,29 @@ class TrajectoryPatchConditioner(nn.Module):
         if not self._enabled:
             return patch_features
         condition_map = self._condition_maps[sample_index]
-        if condition_map.shape[1:] != video.shape[2:]:
-            raise ValueError("trajectory and Wan latent grids do not match")
+        if condition_map.shape[2:] != video.shape[3:]:
+            raise ValueError("trajectory and Wan spatial latent grids do not match")
         condition_map = condition_map.unsqueeze(0).to(
             device=video.device,
             dtype=torch.float32,
         )
+        if self.architecture == "full_frame_causal_patch_v2":
+            expected_frames = 1 + 4 * (int(video.shape[2]) - 1)
+            if condition_map.shape[2] != expected_frames:
+                raise ValueError(
+                    "full-rate trajectory must contain exactly 4*(latent_frames-1)+1 frames"
+                )
+            first = condition_map[:, :, :1]
+            condition_map = (
+                first
+                if expected_frames == 1
+                else torch.cat(
+                    (first, self.temporal_projection(condition_map[:, :, 1:])),
+                    dim=2,
+                )
+            )
+        elif condition_map.shape[2] != video.shape[2]:
+            raise ValueError("trajectory and Wan temporal latent grids do not match")
         residual = self.output_projection(
             torch.nn.functional.silu(self.patch_projection(condition_map))
         )
@@ -462,6 +624,7 @@ def inject_trajectory_conditioning(
     model: nn.Module,
     rank: int = 32,
     representation: str = "dense_point_tracks",
+    architecture: str | None = None,
 ) -> TrajectoryPatchConditioner:
     """Attach a zero-initialized spatial-temporal trajectory branch to Wan."""
     if hasattr(model, "phycontext_trajectory_conditioner"):
@@ -473,6 +636,7 @@ def inject_trajectory_conditioning(
         patch_size=tuple(model.patch_size),
         rank=rank,
         representation=representation,
+        architecture=architecture,
     )
     model.add_module("phycontext_trajectory_conditioner", conditioner)
     model.patch_embedding = TrajectoryConditionedPatchEmbedding(
@@ -827,7 +991,10 @@ def load_condition_checkpoint(
     condition_encoder: nn.Module,
 ) -> dict:
     metadata = json.loads((adapter_dir / "adapter.json").read_text(encoding="utf-8"))
-    if metadata.get("schema") != "phycontext.wan_condition_adapter.v2":
+    if metadata.get("schema") not in {
+        "phycontext.wan_condition_adapter.v2",
+        "phycontext.wan_condition_adapter.v3",
+    }:
         raise ValueError("adapter uses an unsupported conditioning schema")
     lora = metadata["lora"]
     replaced = inject_cross_attention_lora(
@@ -883,12 +1050,12 @@ def load_condition_checkpoint(
     trajectory_config = metadata.get("trajectory_conditioning", {})
     if trajectory_config.get("enabled", False):
         representation = trajectory_config.get("representation", "dense_point_tracks")
-        if trajectory_config.get("architecture") != "framewise_patch":
-            raise ValueError("adapter trajectory architecture is unsupported")
+        architecture = trajectory_config.get("architecture", "framewise_patch")
         conditioner = inject_trajectory_conditioning(
             model,
             rank=int(trajectory_config["rank"]),
             representation=representation,
+            architecture=architecture,
         )
         expected_input_channels = int(
             trajectory_config.get("input_channels", conditioner.input_channels)

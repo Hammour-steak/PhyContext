@@ -14,7 +14,10 @@ PHYCONTEXT_TOOLS = ROOT / "tools" / "phycontext"
 if str(PHYCONTEXT_TOOLS) not in sys.path:
     sys.path.insert(0, str(PHYCONTEXT_TOOLS))
 
-from cache_contract import validate_cache_source_manifest  # noqa: E402
+from cache_contract import (  # noqa: E402
+    validate_cache_artifact,
+    validate_cache_source_manifest,
+)
 
 
 def load_training_entry():
@@ -85,6 +88,27 @@ class ExternalDatasetBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dataset summary changed"):
             validate_cache_source_manifest(self.method_root, self.cache)
 
+    def test_cache_artifact_is_hash_bound_and_project_local(self) -> None:
+        artifact = self.method_root / "cache" / "sample.safetensors"
+        artifact.parent.mkdir()
+        artifact.write_bytes(b"artifact")
+        descriptor = {
+            "path": "cache/sample.safetensors",
+            "sha256": sha256(artifact),
+        }
+        self.assertEqual(
+            validate_cache_artifact(self.method_root, descriptor, "test"),
+            artifact.resolve(),
+        )
+
+        descriptor["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            validate_cache_artifact(self.method_root, descriptor, "test")
+
+        descriptor["path"] = "../outside.safetensors"
+        with self.assertRaisesRegex(ValueError, "project-root-relative"):
+            validate_cache_artifact(self.method_root, descriptor, "test")
+
     def test_training_preflight_keeps_dataset_and_cache_roots_separate(self) -> None:
         cache_path = self.method_root / "cache" / "manifest.json"
         cache_path.parent.mkdir()
@@ -119,6 +143,27 @@ class ExternalDatasetBoundaryTests(unittest.TestCase):
         }
         entry = load_training_entry()
         with self.assertRaisesRegex(ValueError, "different dataset root"):
+            entry.preflight(self.method_root, config)
+
+    def test_training_preflight_rejects_trajectory_protocol_mismatch(self) -> None:
+        cache_path = self.method_root / "cache" / "manifest.json"
+        cache_path.parent.mkdir()
+        cache_path.write_text(json.dumps(self.cache), encoding="utf-8")
+        config = {
+            "dataset_root": str(self.dataset_root),
+            "dataset_manifest": "datasets/physweep_training/manifest.jsonl",
+            "cache_manifest": "cache/manifest.json",
+            "training": {"trajectory_representation": "das_3d_tracks"},
+        }
+        entry = load_training_entry()
+        with self.assertRaisesRegex(ValueError, "representation differs"):
+            entry.preflight(self.method_root, config)
+
+        self.cache["point_track_preprocess"] = {
+            "representation": "das_3d_tracks"
+        }
+        cache_path.write_text(json.dumps(self.cache), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "requires the current cache"):
             entry.preflight(self.method_root, config)
 
 

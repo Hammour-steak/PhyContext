@@ -28,6 +28,19 @@ TRAJECTORY_REPRESENTATION_CONTRACTS = {
             )
         ],
     },
+    "das_3d_tracks": {
+        "input_channels": 12,
+        "channels": [
+            f"object_{slot}_{channel}"
+            for slot in range(3)
+            for channel in (
+                "identity_r",
+                "identity_g",
+                "identity_b",
+                "visibility",
+            )
+        ],
+    },
 }
 
 
@@ -51,7 +64,10 @@ def main() -> None:
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     tensors = load_file(str(tensor_path), device="cpu")
     errors = []
-    if metadata.get("schema") != "phycontext.wan_condition_adapter.v2":
+    if metadata.get("schema") not in {
+        "phycontext.wan_condition_adapter.v2",
+        "phycontext.wan_condition_adapter.v3",
+    }:
         errors.append("adapter conditioning schema mismatch")
     lora_keys = sorted(key for key in tensors if key.startswith("wan_lora."))
     condition_keys = sorted(
@@ -112,6 +128,14 @@ def main() -> None:
         if trajectory_conditioning_config.get("future_appearance_or_silhouette"):
             errors.append("trajectory conditioning leaks future appearance")
         if contract is not None:
+            architecture = trajectory_conditioning_config.get("architecture")
+            supported_architectures = (
+                {"framewise_patch", "full_frame_causal_patch_v2"}
+                if representation == "das_3d_tracks"
+                else {"framewise_patch"}
+            )
+            if architecture not in supported_architectures:
+                errors.append("trajectory conditioning architecture is unsupported")
             expected_channels = int(contract["input_channels"])
             if int(trajectory_conditioning_config.get("input_channels", 0)) != (
                 expected_channels
@@ -145,6 +169,24 @@ def main() -> None:
                 )
                 if patch_size and tuple(projection.shape[2:]) != patch_size:
                     errors.append("trajectory conditioning patch size is invalid")
+            temporal_key = "trajectory_conditioning.temporal_projection.weight"
+            temporal_projection = tensors.get(temporal_key)
+            if architecture == "full_frame_causal_patch_v2":
+                expected_temporal_shape = (
+                    expected_channels,
+                    expected_channels,
+                    4,
+                    1,
+                    1,
+                )
+                if temporal_projection is None or tuple(
+                    temporal_projection.shape
+                ) != expected_temporal_shape:
+                    errors.append(
+                        "trajectory temporal projection is missing or has invalid shape"
+                    )
+            elif temporal_projection is not None:
+                errors.append("legacy trajectory adapter has unexpected temporal state")
         if int(trajectory_conditioning_config.get("rank", 0)) <= 0:
             errors.append("trajectory conditioning rank is invalid")
     elif trajectory_conditioning_keys:
