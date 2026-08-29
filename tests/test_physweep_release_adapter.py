@@ -4,6 +4,7 @@ from copy import deepcopy
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,7 @@ sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 from adapt_physweep_release import (  # noqa: E402
     IMAGE_SIZE_PX,
     POINT_COUNT,
+    _artifact_paths,
     _group_sample_descriptors,
     _load_fixture,
     _physics_condition,
@@ -29,10 +31,49 @@ from adapt_physweep_release import (  # noqa: E402
     quaternion_matrix_wxyz,
     resolve_roots,
     sample_dynamic_proxy,
+    sha256_file,
 )
 
 
 class PhysSweepReleaseAdapterTest(unittest.TestCase):
+    def test_release_artifacts_require_a_fully_decoded_97_frame_video(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sample = Path(temporary)
+            artifacts = {
+                "video": sample / "video.mp4",
+                "trajectory": sample / "trajectory.npz",
+                "mask_manifest": sample / "mask_manifest.json",
+            }
+            for name, path in artifacts.items():
+                path.write_bytes(name.encode("utf-8"))
+            (sample / "metadata.json").write_text("{}", encoding="utf-8")
+            metadata = {
+                "artifacts": {
+                    "video": {"sha256": sha256_file(artifacts["video"])},
+                    "trajectory": {"sha256": sha256_file(artifacts["trajectory"])},
+                    "masks": {
+                        "manifest_sha256": sha256_file(artifacts["mask_manifest"])
+                    },
+                }
+            }
+            with patch(
+                "adapt_physweep_release.decoded_video_frame_count",
+                return_value=70,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "expected=97 observed=70",
+                ):
+                    _artifact_paths(sample, metadata, "ffprobe")
+            with patch(
+                "adapt_physweep_release.decoded_video_frame_count",
+                return_value=97,
+            ):
+                self.assertEqual(
+                    _artifact_paths(sample, metadata, "ffprobe")["video"],
+                    artifacts["video"],
+                )
+
     def test_sweep_descriptor_is_explicit_and_does_not_mutate_inputs(self) -> None:
         physics = {"object": {"mass_kg": 1.25}}
         sweep = {

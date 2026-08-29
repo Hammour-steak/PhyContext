@@ -104,6 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-groups", type=int)
     parser.add_argument("--seed", type=int, default=20260829)
     parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -121,6 +122,43 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def decoded_video_frame_count(video: Path, ffprobe: str = "ffprobe") -> int:
+    if not video.is_file() or video.stat().st_size == 0:
+        raise FileNotFoundError(f"release video is missing: {video}")
+    completed = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    values = [value.strip() for value in completed.stdout.splitlines() if value.strip()]
+    if completed.returncode != 0 or len(values) != 1:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"failed to count decoded release video frames: {video}: {detail}")
+    try:
+        frame_count = int(values[0])
+    except ValueError as exc:
+        raise RuntimeError(
+            f"ffprobe returned an invalid decoded frame count for {video}: {values[0]!r}"
+        ) from exc
+    if frame_count <= 0:
+        raise RuntimeError(f"release video contains no decoded frames: {video}")
+    return frame_count
 
 
 def stable_seed(name: str, seed: int) -> int:
@@ -1189,7 +1227,11 @@ def _extract_first_frame(video: Path, output: Path, ffmpeg: str, overwrite: bool
         temporary.unlink(missing_ok=True)
 
 
-def _artifact_paths(sample_root: Path, metadata: dict[str, Any]) -> dict[str, Path]:
+def _artifact_paths(
+    sample_root: Path,
+    metadata: dict[str, Any],
+    ffprobe: str,
+) -> dict[str, Path]:
     paths = {
         "video": sample_root / "video.mp4",
         "trajectory": sample_root / "trajectory.npz",
@@ -1207,6 +1249,12 @@ def _artifact_paths(sample_root: Path, metadata: dict[str, Any]) -> dict[str, Pa
     for name, expected_hash in expected.items():
         if sha256_file(paths[name]) != expected_hash:
             raise ValueError(f"release artifact hash mismatch ({name}): {paths[name]}")
+    video_frame_count = decoded_video_frame_count(paths["video"], ffprobe)
+    if video_frame_count != RELEASE_FRAME_COUNT:
+        raise ValueError(
+            f"release video frame count differs: {paths['video']}: "
+            f"expected={RELEASE_FRAME_COUNT} observed={video_frame_count}"
+        )
     return paths
 
 
@@ -1533,6 +1581,7 @@ def _load_release_sample(
     object_id: str,
     is_base: bool,
     base_metadata: dict[str, Any] | None,
+    ffprobe: str,
 ) -> ReleaseSample:
     if is_base != (base_metadata is None):
         raise ValueError("base metadata must be absent only while loading the base sample")
@@ -1552,7 +1601,7 @@ def _load_release_sample(
         object_id,
         is_base,
     )
-    artifacts = _artifact_paths(sample_root, metadata)
+    artifacts = _artifact_paths(sample_root, metadata, ffprobe)
     trajectory = _trajectory(artifacts["trajectory"], object_id)
     _validate_t0(metadata, trajectory, object_id)
     return ReleaseSample(
@@ -1835,6 +1884,7 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
             object_id,
             True,
             None,
+            args.ffprobe,
         )
         base_metadata = base_sample.metadata
         camera = base_metadata["visual"]["camera"]
@@ -1907,6 +1957,7 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
                     object_id,
                     False,
                     base_metadata,
+                    args.ffprobe,
                 )
             )
             point_payload, roundtrip = build_point_trajectory_payload(
