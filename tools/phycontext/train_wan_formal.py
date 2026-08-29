@@ -92,6 +92,13 @@ BASE_DYNAMICS_LAYOUT = [
     "angular_damping",
 ]
 
+TRAINING_CODE_PATHS = (
+    Path("tools/phycontext/train_wan_formal.py"),
+    Path("tools/phycontext/wan_training.py"),
+    Path("tools/phycontext/conditioning_model.py"),
+    Path("tools/phycontext/cache_contract.py"),
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -186,7 +193,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--validation-every", type=int, default=512)
-    parser.add_argument("--validation-batches", type=int, default=16)
+    parser.add_argument(
+        "--validation-batches",
+        type=int,
+        default=15,
+        help=(
+            "deterministic mixed validation microbatches per distributed rank; "
+            "formal training requires a positive multiple of five"
+        ),
+    )
     parser.add_argument("--save-every", type=int, default=512)
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
@@ -199,6 +214,14 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def training_code_sha256() -> dict[str, str]:
+    """Fingerprint the local implementations that define training semantics."""
+    return {
+        relative.as_posix(): sha256(PROJECT_ROOT / relative)
+        for relative in TRAINING_CODE_PATHS
+    }
 
 
 def setup_distributed() -> tuple[int, int, int, torch.device]:
@@ -546,11 +569,13 @@ def clean_latent_lpips_loss(
     """Compare contiguous low-resolution temporal windows with LPIPS.
 
     Wan's VAE is causal and keeps temporal feature caches while decoding a
-    sequence.  Decoding one latent slice at a time therefore produces a
-    different result from decoding a video.  We keep the auxiliary graph small
-    by decoding several contiguous latent frames per window; every compared
-    frame now shares one VAE temporal context instead of being an isolated
-    decode.
+    sequence. Decoding one latent slice at a time therefore produces a
+    different result from decoding a video. We keep the auxiliary graph small
+    by decoding several contiguous generated latent frames per local window;
+    each window deliberately starts a fresh causal cache and is an appearance
+    objective, not a claim of exact full-sequence decoding.
+    The clean TI2V condition frame is excluded because it is provided to the
+    model rather than generated.
     """
     if len(predicted_clean) != len(target_latents):
         raise ValueError("LPIPS prediction and target batch sizes differ")
@@ -567,12 +592,15 @@ def clean_latent_lpips_loss(
         if predicted.shape != target.shape:
             raise ValueError("LPIPS prediction and target latent shapes differ")
         latent_frame_count = int(predicted.shape[1])
-        window_length = min(int(temporal_window), latent_frame_count)
+        if latent_frame_count < 2:
+            raise ValueError("LPIPS requires at least one generated latent frame")
+        generated_frame_count = latent_frame_count - 1
+        window_length = min(int(temporal_window), generated_frame_count)
         max_start = latent_frame_count - window_length
         window_starts = torch.linspace(
-            0,
+            1,
             max_start,
-            steps=min(window_count, max_start + 1),
+            steps=min(window_count, max_start),
             device=predicted.device,
         ).round().long().unique()
         # Decode no more spatial detail than LPIPS consumes.  Resizing after a
@@ -804,6 +832,7 @@ def validate(
     condition_encoder,
     root: Path,
     dataset_root: Path,
+    records: list[dict],
     pairs: list[dict],
     nominal_records: dict[str, dict],
     args: argparse.Namespace,
@@ -813,6 +842,7 @@ def validate(
     vae=None,
     perceptual_model=None,
 ) -> dict[str, float]:
+    """Evaluate the same 60/40 ordinary-response mixture used for training."""
     model.eval()
     condition_encoder.eval()
     totals = {
@@ -829,10 +859,19 @@ def validate(
         )
     }
     counts = {key: 0.0 for key in totals}
-    ordered = sorted(pairs, key=lambda item: (item["base_scene_id"], item["axis"]))
+    mode_counts = {"ordinary": 0.0, "response": 0.0}
     for batch_index in range(args.validation_batches):
-        pair = ordered[(batch_index * world_size + rank) % len(ordered)]
-        targets = [pair["low"], pair["high"]]
+        targets, mode, _ = make_formal_training_batch(
+            records,
+            pairs,
+            step=batch_index,
+            accumulation_index=0,
+            gradient_accumulation=1,
+            rank=rank,
+            world_size=world_size,
+            seed=args.seed + 9_000_000,
+            response_updates=True,
+        )
         trajectory_batch = (
             select_trajectory_input_records(
                 targets, nominal_records, args.trajectory_input_source
@@ -849,8 +888,9 @@ def validate(
             trajectory_representation=args.trajectory_representation,
         )
         generator = torch.Generator(device=device).manual_seed(
-            args.seed + 9_000_000 + batch_index * world_size + rank
+            args.seed + 10_000_000 + batch_index * world_size + rank
         )
+        response_enabled = mode == "response"
         losses = forward_losses(
             model,
             condition_encoder,
@@ -858,15 +898,27 @@ def validate(
             args,
             device,
             generator,
-            response_enabled=True,
+            response_enabled=response_enabled,
             vae=vae,
             perceptual_model=perceptual_model,
             fixed_sigma=0.7,
         )
+        mode_counts[mode] += 1.0
         for key in totals:
+            if key == "response" and not response_enabled:
+                continue
             totals[key] += float(losses[key].detach().cpu())
             counts[key] += 1.0
     metrics = reduce_metrics(totals, counts, device, world_size)
+    mode_tensor = torch.tensor(
+        [mode_counts["ordinary"], mode_counts["response"]],
+        dtype=torch.float64,
+        device=device,
+    )
+    if world_size > 1:
+        dist.all_reduce(mode_tensor, op=dist.ReduceOp.SUM)
+    metrics["ordinary_batches"] = float(mode_tensor[0].cpu())
+    metrics["response_batches"] = float(mode_tensor[1].cpu())
     model.train()
     condition_encoder.train()
     return metrics
@@ -996,6 +1048,17 @@ def adapter_metadata(
                 if args.ordinary_only
                 else "same_base_same_axis_low_high_common_noise_sigma"
             ),
+        },
+        "validation": {
+            "enabled": not args.ordinary_only,
+            "batches_per_rank": 0 if args.ordinary_only else args.validation_batches,
+            "selection": "deterministic_formal_training_schedule",
+            "ordinary_share": 1.0 if args.ordinary_only else 0.6,
+            "response_share": 0.0 if args.ordinary_only else 0.4,
+            "response_metric_scope": "response_batches_only",
+            "diffusion_sigma": 0.7,
+            "clean_condition_frame_in_lpips": False,
+            "lpips_decode_protocol": "local_generated_windows_fresh_causal_cache",
         },
         "motion_supervision": {
             "enabled": True,
@@ -1207,7 +1270,8 @@ def write_run_contract(
     validation_records: list[dict],
 ) -> None:
     payload = {
-        "schema": "phycontext.formal_training_run.v1",
+        "schema": "phycontext.formal_training_run.v2",
+        "training_code_sha256": training_code_sha256(),
         "cache_manifest": str(cache_path),
         "cache_manifest_sha256": sha256(cache_path),
         "source_manifest": cache["source_manifest"],
@@ -1226,6 +1290,7 @@ def write_run_contract(
 
 RESUME_IMMUTABLE_ARGUMENTS = (
     "checkpoint",
+    "wan_repo",
     "training_stage",
     "steps",
     "ordinary_only",
@@ -1265,6 +1330,9 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "trajectory_condition_rank",
     "trajectory_representation",
     "max_grad_norm",
+    "validation_every",
+    "validation_batches",
+    "save_every",
     "no_gradient_checkpointing",
     "seed",
 )
@@ -1280,6 +1348,17 @@ def validate_resume_contract(
             f"resume requires its original run contract: {contract_path}"
         )
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if contract.get("schema") != "phycontext.formal_training_run.v2":
+        raise ValueError(
+            "resume requires a v2 run contract with training code fingerprints"
+        )
+    previous_code = contract.get("training_code_sha256")
+    current_code = training_code_sha256()
+    if previous_code != current_code:
+        raise ValueError(
+            "resume training code differs from the original run; initialize a "
+            "new adapter run instead"
+        )
     if contract.get("cache_manifest_sha256") != sha256(cache_path):
         raise ValueError("resume cache manifest differs from the original run")
     previous = contract.get("arguments", {})
@@ -1342,6 +1421,13 @@ def main() -> None:
         or args.save_every <= 0
     ):
         raise ValueError("validation and save intervals must be positive")
+    if not args.ordinary_only and (
+        args.validation_batches < 5 or args.validation_batches % 5 != 0
+    ):
+        raise ValueError(
+            "formal validation batches must be a positive multiple of five "
+            "to preserve the 60/40 mixture"
+        )
     if not 0 < args.motion_foreground_share < 1:
         raise ValueError("motion foreground share must be between zero and one")
     if args.reconstruction_loss_weight < 0:
@@ -1448,9 +1534,9 @@ def main() -> None:
                 validation_records
             )
 
+        if output.exists() and any(output.iterdir()) and args.resume is None:
+            raise FileExistsError(f"formal training output is not empty: {output}")
         if rank == 0:
-            if output.exists() and any(output.iterdir()) and args.resume is None:
-                raise FileExistsError(f"formal training output is not empty: {output}")
             output.mkdir(parents=True, exist_ok=True)
             if not (output / "run_contract.json").is_file():
                 write_run_contract(
@@ -1497,6 +1583,16 @@ def main() -> None:
             ):
                 raise ValueError("source adapter architecture differs from arguments")
             previous_direct = previous.get("direct_modulation", {})
+            if (
+                not previous_direct.get("enabled", False)
+                or int(previous_direct.get("rank", 0)) != args.modulation_rank
+                or float(previous_direct.get("alpha", 0.0))
+                != args.modulation_alpha
+            ):
+                raise ValueError(
+                    "source adapter direct-modulation architecture differs "
+                    "from arguments"
+                )
             previous_slots = int(
                 previous_direct.get(
                     "object_slots", int(previous_direct.get("input_dim", 12)) // 12
@@ -1580,7 +1676,7 @@ def main() -> None:
                 dtype=torch.bfloat16,
                 device=device,
             )
-            vae.model.to(dtype=torch.bfloat16)
+            vae.model.to(dtype=torch.bfloat16).requires_grad_(False).eval()
             perceptual_model = lpips.LPIPS(net=args.lpips_net).to(device).eval()
             for parameter in perceptual_model.parameters():
                 parameter.requires_grad_(False)
@@ -1717,7 +1813,11 @@ def main() -> None:
                 for group in optimizer.param_groups
                 for parameter in group["params"]
             ]
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable,
+                args.max_grad_norm,
+                error_if_nonfinite=True,
+            )
             optimizer.step()
             completed_steps = step + 1
             metrics = reduce_metrics(local_sums, local_counts, device, world_size)
@@ -1752,6 +1852,7 @@ def main() -> None:
                     condition_encoder,
                     root,
                     dataset_root,
+                    validation_records,
                     validation_pairs,
                     validation_nominal_records,
                     args,

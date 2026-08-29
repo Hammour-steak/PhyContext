@@ -57,6 +57,24 @@ class TemporalConsistencyTest(unittest.TestCase):
         self.assertEqual(vae.temporal_lengths, [3, 3, 3, 3])
         self.assertTrue(torch.isfinite(predicted.grad).all())
 
+    def test_lpips_excludes_the_clean_condition_frame(self):
+        predicted = torch.zeros(3, 7, 8, 8, requires_grad=True)
+        with torch.no_grad():
+            predicted[:, 0].fill_(10.0)
+        target = torch.zeros_like(predicted)
+        loss = clean_latent_lpips_loss(
+            [predicted],
+            [target],
+            FakeVAE(),
+            FakePerceptual(),
+            window_count=2,
+            resolution=16,
+            temporal_window=3,
+        )
+        self.assertEqual(float(loss), 0.0)
+        loss.backward()
+        self.assertEqual(float(predicted.grad[:, 0].abs().sum()), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

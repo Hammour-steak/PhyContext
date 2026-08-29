@@ -230,6 +230,8 @@ class TrainingDefaultTests(unittest.TestCase):
         self.assertEqual(args.trajectory_input_source, "target")
         self.assertEqual(args.trajectory_representation, "das_3d_tracks")
         self.assertFalse(args.ordinary_only)
+        self.assertEqual(args.validation_batches, 15)
+        self.assertEqual(args.validation_batches % 5, 0)
         self.assertEqual(
             (VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FRAMES), (832, 480, 97)
         )
@@ -250,6 +252,10 @@ class TrainingDefaultTests(unittest.TestCase):
             (checkpoint.parent / "run_contract.json").write_text(
                 json.dumps(
                     {
+                        "schema": "phycontext.formal_training_run.v2",
+                        "training_code_sha256": (
+                            train_wan_formal.training_code_sha256()
+                        ),
                         "cache_manifest_sha256": train_wan_formal.sha256(cache),
                         "arguments": arguments,
                     }
@@ -259,6 +265,20 @@ class TrainingDefaultTests(unittest.TestCase):
             train_wan_formal.validate_resume_contract(
                 root, Path("run/latest"), cache, args
             )
+            contract_path = checkpoint.parent / "run_contract.json"
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            contract["training_code_sha256"][
+                "tools/phycontext/train_wan_formal.py"
+            ] = "changed"
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "training code differs"):
+                train_wan_formal.validate_resume_contract(
+                    root, Path("run/latest"), cache, args
+                )
+            contract["training_code_sha256"] = (
+                train_wan_formal.training_code_sha256()
+            )
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
             args.reconstruction_loss_weight += 1.0
             with self.assertRaisesRegex(ValueError, "run contract"):
                 train_wan_formal.validate_resume_contract(

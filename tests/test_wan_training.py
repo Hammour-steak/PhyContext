@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -17,6 +18,7 @@ from train_wan_formal import (
     configure_training_stage,
     learning_rate_factor,
     optimizer_groups,
+    validate,
     training_condition_mode,
 )
 from wan_training import (
@@ -582,6 +584,67 @@ class WanTrainingTest(unittest.TestCase):
         ]
         self.assertNotEqual(rank_batches[2], rank_one)
 
+    def test_validation_mirrors_the_formal_sixty_forty_mixture(self) -> None:
+        records = [
+            {"sample_id": f"record-{index}", "base_scene_id": f"base-{index}"}
+            for index in range(20)
+        ]
+        pairs = [
+            {
+                "axis": axis,
+                "low": {"sample_id": f"{axis}-low", "base_scene_id": "pair"},
+                "high": {"sample_id": f"{axis}-high", "base_scene_id": "pair"},
+            }
+            for axis in ("mass_kg", "contact_friction", "contact_restitution")
+        ]
+        args = SimpleNamespace(
+            validation_batches=5,
+            seed=13,
+            trajectory_input=False,
+            trajectory_input_source="target",
+            trajectory_representation="das_3d_tracks",
+        )
+        response_flags = []
+
+        def fake_forward_losses(*unused_args, response_enabled, **unused_kwargs):
+            response_flags.append(response_enabled)
+            one = torch.tensor(1.0)
+            return {
+                "total": one,
+                "reconstruction": one,
+                "response": torch.tensor(2.0 if response_enabled else 100.0),
+                "trajectory_center": one,
+                "trajectory_distribution": one,
+                "trajectory_velocity": one,
+                "temporal_consistency": one,
+                "lpips": one,
+            }
+
+        model = nn.Linear(1, 1)
+        condition_encoder = nn.Linear(1, 1)
+        with patch("train_wan_formal.load_microbatch", return_value={}), patch(
+            "train_wan_formal.forward_losses", side_effect=fake_forward_losses
+        ):
+            metrics = validate(
+                model,
+                condition_encoder,
+                Path("."),
+                Path("."),
+                records,
+                pairs,
+                {},
+                args,
+                torch.device("cpu"),
+                rank=0,
+                world_size=1,
+            )
+        self.assertEqual(response_flags, [True, True, False, False, False])
+        self.assertEqual(metrics["response"], 2.0)
+        self.assertEqual(metrics["response_batches"], 2.0)
+        self.assertEqual(metrics["ordinary_batches"], 3.0)
+        self.assertTrue(model.training)
+        self.assertTrue(condition_encoder.training)
+
     def test_formal_schedule_can_disable_response_updates(self) -> None:
         records = [{"sample_id": "single", "base_scene_id": "base"}]
         batch, mode, axis = make_formal_training_batch(
@@ -632,7 +695,20 @@ class WanTrainingTest(unittest.TestCase):
         recovered = recover_clean_latents(
             batch["noisy_latents"], batch["targets"], torch.tensor([0.65])
         )[0]
-        torch.testing.assert_close(recovered[:, 1:], latent[:, 1:])
+        torch.testing.assert_close(recovered, latent)
+
+    def test_clean_latent_recovery_has_no_condition_frame_prediction_gradient(
+        self,
+    ) -> None:
+        noisy = torch.randn(3, 4, 2, 2)
+        prediction = torch.randn_like(noisy, requires_grad=True)
+        recovered = recover_clean_latents(
+            [noisy], [prediction], torch.tensor([0.65])
+        )[0]
+        recovered.sum().backward()
+        torch.testing.assert_close(recovered[:, 0], noisy[:, 0])
+        self.assertEqual(float(prediction.grad[:, 0].abs().sum()), 0.0)
+        self.assertGreater(float(prediction.grad[:, 1:].abs().sum()), 0.0)
 
     def test_latent_trajectory_matches_moving_object_and_has_gradients(self) -> None:
         target = torch.zeros(3, 4, 5, 6)

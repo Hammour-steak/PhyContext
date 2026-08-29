@@ -22,7 +22,7 @@
     "lpips_loss_weight": 0.1,
     "lpips_frame_count": 2,
     "validation_every": 512,
-    "validation_batches": 16,
+    "validation_batches": 15,
     "save_every": 512,
     "seed": 20260820
   }

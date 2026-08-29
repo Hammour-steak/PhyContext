@@ -1115,14 +1115,15 @@ def recover_clean_latents(
     predictions: list[torch.Tensor],
     sigmas: torch.Tensor,
 ) -> list[torch.Tensor]:
-    """Recover the model's clean-latent estimate from rectified-flow output."""
+    """Recover clean TI2V latents while preserving the supplied condition frame."""
     if not (len(noisy_latents) == len(predictions) == len(sigmas)):
         raise ValueError("clean-latent inputs have different batch sizes")
     clean = []
     for noisy, prediction, sigma in zip(noisy_latents, predictions, sigmas):
         if noisy.shape != prediction.shape or noisy.ndim != 4:
             raise ValueError("noisy and predicted latents must share C x F x H x W")
-        clean.append(noisy.float() - sigma.float() * prediction.float())
+        estimate = noisy.float() - sigma.float() * prediction.float()
+        clean.append(torch.cat((noisy.float()[:, :1], estimate[:, 1:]), dim=1))
     return clean
 
 
