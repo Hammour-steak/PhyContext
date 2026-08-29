@@ -44,10 +44,10 @@ PhysSweep project/data root + immutable one-object release
         -> validate or run inference
 ```
 
-The dataset is read only. Wan latents, text embeddings, full-rate DaS-style
-point-track maps,
-checkpoints, and inference results stay under this repository's `cache/` and
-`outputs/` directories.
+The dataset is read only. Wan latents, text embeddings, and full-rate DaS-style
+point-track maps default to this repository's `cache/` directory, but an
+external cache root is supported for large runs. Checkpoints and inference
+results stay under `outputs/` unless explicitly redirected.
 
 ## Quick Start
 
@@ -63,6 +63,7 @@ CUDA_HOME=/path/to/cuda-toolkit \
   pip install --no-build-isolation -r requirements.txt
 
 export PHYCONTEXT_DATASET_ROOT=/path/to/PhysSweep
+export PHYCONTEXT_CACHE_ROOT=/path/to/PhyContext-cache
 export PHYCONTEXT_WAN_REPO=/path/to/Wan2.2
 export PHYCONTEXT_WAN_CHECKPOINT=/path/to/Wan2.2-TI2V-5B
 
@@ -72,18 +73,23 @@ python tools/phycontext/adapt_physweep_release.py \
 
 python tools/phycontext/cache_wan_inputs.py \
   --dataset-root "$PHYCONTEXT_DATASET_ROOT" \
-  --manifest datasets/physweep_training/manifest.jsonl
-python tools/phycontext/audit_wan_cache.py
+  --manifest datasets/physweep_training/manifest.jsonl \
+  --cache-root "$PHYCONTEXT_CACHE_ROOT"
+python tools/phycontext/audit_wan_cache.py \
+  --cache-manifest "$PHYCONTEXT_CACHE_ROOT/manifest.json"
 
-python tools/model_training/train_one_object.py \
+PHYCONTEXT_CACHE_MANIFEST="$PHYCONTEXT_CACHE_ROOT/manifest.json" \
+  python tools/model_training/train_one_object.py \
   --config configs/training/one_object.json \
   --dry-run
 ```
 
 The dataset root is the PhysSweep project/data root, not a directory inside
-PhyContext. Raw release paths remain read only; all Wan cache files are written
-under this repository. The release adapter writes only its explicitly selected,
-disjoint derived-data directory under the external root. Add
+PhyContext. `PHYCONTEXT_CACHE_ROOT` may point inside the repository or to
+external data storage; every cache manifest explicitly binds artifact paths to
+that root. Raw release paths remain read only. The release adapter writes only
+its explicitly selected, disjoint derived-data directory under the external
+root. Add
 `--limit-groups 1 --output-root datasets/adapter_smoke` to validate one complete
 13-sample group without caching or training. Remove `--dry-run` only after the
 dataset and cache audits pass.

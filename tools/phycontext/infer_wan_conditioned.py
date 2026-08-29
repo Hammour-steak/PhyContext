@@ -23,6 +23,7 @@ from conditioning_model import (
 )
 from cache_contract import (
     CURRENT_CACHE_SCHEMA,
+    resolve_cache_artifact_root,
     resolve_cache_dataset_root,
     validate_cache_artifact,
     validate_cache_source_manifest,
@@ -365,6 +366,7 @@ def main() -> None:
             )
         validate_cache_source_manifest(root, cache)
         dataset_root = resolve_cache_dataset_root(root, cache)
+        artifact_root = resolve_cache_artifact_root(root, cache)
         item = select_cache_record(cache, adapter_root, root, args.sample_id)
         record = item["record"]
         sample_id = item["sample_id"]
@@ -399,7 +401,7 @@ def main() -> None:
             raise ValueError("cache record has no point_track descriptor")
         trajectory_path = (
             validate_cache_artifact(
-                root,
+                artifact_root,
                 trajectory_descriptor,
                 f"point track for {trajectory_item['sample_id']}",
             )

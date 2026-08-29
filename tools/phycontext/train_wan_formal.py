@@ -23,6 +23,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from cache_contract import (
     CURRENT_CACHE_SCHEMA,
+    resolve_cache_artifact_root,
     resolve_cache_dataset_root,
     validate_cache_artifact,
     validate_cache_source_manifest,
@@ -275,7 +276,7 @@ def max_dynamic_object_count(records: list[dict]) -> int:
 
 
 def require_complete_cache(
-    root: Path,
+    artifact_root: Path,
     records: list[dict],
     split: str,
     trajectory_representation: str,
@@ -296,7 +297,7 @@ def require_complete_cache(
             ("text_context", f"text context for {sample_id}"),
             ("point_track", f"point track for {sample_id}"),
         ):
-            validate_cache_artifact(root, item.get(key), label)
+            validate_cache_artifact(artifact_root, item.get(key), label)
 
 
 def split_condition_parameters(module: torch.nn.Module):
@@ -470,7 +471,7 @@ def apply_learning_rate(optimizer, factor: float) -> dict[str, float]:
 
 
 def load_microbatch(
-    root: Path,
+    artifact_root: Path,
     dataset_root: Path,
     batch: list[dict],
     device: torch.device,
@@ -486,7 +487,9 @@ def load_microbatch(
         descriptor = item.get("point_track")
         if descriptor is None:
             raise ValueError(f"record has no point-track cache: {item['sample_id']}")
-        point_map = load_file(str(root / descriptor["path"]), device="cpu")[
+        point_map = load_file(
+            str(artifact_root / descriptor["path"]), device="cpu"
+        )[
             "point_track_map"
         ].to(device)
         return validate_point_track_object_slots(
@@ -523,13 +526,15 @@ def load_microbatch(
     return {
         "records": records,
         "latents": [
-            load_file(str(root / item["latent"]["path"]), device="cpu")["latent"].to(
-                device
-            )
+            load_file(
+                str(artifact_root / item["latent"]["path"]), device="cpu"
+            )["latent"].to(device)
             for item in batch
         ],
         "text": [
-            load_file(str(root / item["text_context"]["path"]), device="cpu")
+            load_file(
+                str(artifact_root / item["text_context"]["path"]), device="cpu"
+            )
             ["context"].to(device)
             for item in batch
         ],
@@ -830,7 +835,7 @@ def reduce_metrics(
 def validate(
     model,
     condition_encoder,
-    root: Path,
+    artifact_root: Path,
     dataset_root: Path,
     records: list[dict],
     pairs: list[dict],
@@ -880,7 +885,7 @@ def validate(
             else targets
         )
         loaded = load_microbatch(
-            root,
+            artifact_root,
             dataset_root,
             targets,
             device,
@@ -1485,6 +1490,7 @@ def main() -> None:
             )
         validate_cache_source_manifest(root, cache)
         dataset_root = resolve_cache_dataset_root(root, cache)
+        artifact_root = resolve_cache_artifact_root(root, cache)
         train_records = filter_base_scenes(
             [item for item in cache["records"] if item["record"]["split"] == "train"],
             args.base_scene_count,
@@ -1502,11 +1508,14 @@ def main() -> None:
                 "formal response training requires a non-empty validation split"
             )
         require_complete_cache(
-            root, train_records, "train", args.trajectory_representation
+            artifact_root,
+            train_records,
+            "train",
+            args.trajectory_representation,
         )
         if validation_records:
             require_complete_cache(
-                root,
+                artifact_root,
                 validation_records,
                 "validation",
                 args.trajectory_representation,
@@ -1769,7 +1778,7 @@ def main() -> None:
                     else batch
                 )
                 loaded = load_microbatch(
-                    root,
+                    artifact_root,
                     dataset_root,
                     batch,
                     device,
@@ -1850,7 +1859,7 @@ def main() -> None:
                 validation = validate(
                     model,
                     condition_encoder,
-                    root,
+                    artifact_root,
                     dataset_root,
                     validation_records,
                     validation_pairs,

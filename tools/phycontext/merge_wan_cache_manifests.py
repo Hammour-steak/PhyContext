@@ -26,6 +26,13 @@ def resolve(root: Path, value: Path) -> Path:
     return path
 
 
+def portable_path(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 def main() -> None:
     args = parse_args()
     root = args.project_root.resolve()
@@ -41,6 +48,8 @@ def main() -> None:
             raise ValueError(f"{path} does not use the same cache schema")
 
     invariant_keys = (
+        "artifact_path_base",
+        "artifact_root",
         "dataset_root",
         "source_manifest",
         "source_manifest_sha256",
@@ -88,7 +97,7 @@ def main() -> None:
     merged["selection"] = {
         "mode": "merged_shards",
         "shard_count": len(shards),
-        "shards": [path.relative_to(root).as_posix() for path in shards],
+        "shards": [portable_path(path, root) for path in shards],
     }
     merged["records"] = sorted(records.values(), key=lambda item: source_order[item["sample_id"]])
     output = args.output if args.output.is_absolute() else root / args.output

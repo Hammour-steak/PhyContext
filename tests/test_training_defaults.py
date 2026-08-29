@@ -199,6 +199,34 @@ class TrainingDefaultTests(unittest.TestCase):
                 )
             )
 
+    def test_external_reused_text_is_materialized_in_the_new_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_root = root / "old"
+            new_root = root / "new"
+            prompt_hash = "a" * 64
+            source = old_root / "text" / f"{prompt_hash}.safetensors"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"verified-context")
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            should_build = cache_wan_inputs.prepare_text_artifact(
+                prompt_hash,
+                new_root / "text",
+                new_root,
+                old_root,
+                {},
+                {
+                    prompt_hash: {
+                        "path": f"text/{prompt_hash}.safetensors",
+                        "sha256": digest,
+                    }
+                },
+                False,
+            )
+            target = new_root / "text" / f"{prompt_hash}.safetensors"
+            self.assertFalse(should_build)
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+
     def test_cache_preserves_multi_object_slot_order(self) -> None:
         record = {
             "conditioning": {

@@ -43,12 +43,43 @@ def resolve_cache_dataset_root(project_root: Path, cache: dict) -> Path:
     return path.resolve() if path.is_absolute() else (project_root / path).resolve()
 
 
+def resolve_cache_artifact_root(project_root: Path, cache: dict) -> Path:
+    """Resolve the base directory used by cache artifact descriptors.
+
+    Manifests written before external cache roots were supported omit both
+    fields and remain project-root-relative.  New manifests bind descriptors
+    to an explicit cache root so large artifacts can live on data storage
+    without weakening path traversal checks.
+    """
+    path_base = cache.get("artifact_path_base", "project_root")
+    value = cache.get("artifact_root")
+    if path_base == "project_root":
+        if value is not None:
+            raise ValueError(
+                "Wan cache artifact_root requires artifact_path_base=cache_root"
+            )
+        artifact_root = project_root.resolve()
+    else:
+        if path_base != "cache_root":
+            raise ValueError(f"unsupported Wan cache artifact path base: {path_base}")
+        if not value:
+            raise ValueError("Wan cache is missing its cache artifact root")
+        path = Path(value).expanduser()
+        artifact_root = (
+            path.resolve() if path.is_absolute() else (project_root / path).resolve()
+        )
+    dataset_root = resolve_cache_dataset_root(project_root, cache)
+    if artifact_root.is_relative_to(dataset_root):
+        raise ValueError("Wan cache artifacts must remain outside the published dataset")
+    return artifact_root
+
+
 def validate_cache_artifact(
-    project_root: Path,
+    artifact_root: Path,
     descriptor: dict,
     label: str,
 ) -> Path:
-    """Resolve and hash-check one project-local cache artifact."""
+    """Resolve and hash-check one artifact below its declared cache root."""
     if not isinstance(descriptor, dict):
         raise ValueError(f"Wan cache is missing its {label} descriptor")
     relative_value = descriptor.get("path")
@@ -57,8 +88,8 @@ def validate_cache_artifact(
         raise ValueError(f"Wan cache {label} descriptor is incomplete")
     relative_path = Path(relative_value)
     if relative_path.is_absolute() or ".." in relative_path.parts:
-        raise ValueError(f"Wan cache {label} path must be project-root-relative")
-    root = project_root.resolve()
+        raise ValueError(f"Wan cache {label} path must be cache-root-relative")
+    root = artifact_root.resolve()
     path = (root / relative_path).resolve()
     if not path.is_relative_to(root) or not path.is_file():
         raise FileNotFoundError(f"Wan cache {label} artifact is missing: {path}")

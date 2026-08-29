@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from cache_contract import (
     CURRENT_CACHE_SCHEMA,
     GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
     SUPPORTED_CACHE_SCHEMAS,
+    resolve_cache_artifact_root,
 )
 from point_trajectory import (
     DAS_TRACK_CHANNELS_PER_OBJECT,
@@ -167,6 +169,14 @@ def relative(path: Path, root: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
 
 
+def portable_path(path: Path, root: Path) -> str:
+    """Prefer a project-relative path, retaining absolute external paths."""
+    try:
+        return relative(path, root)
+    except ValueError:
+        return path.resolve().as_posix()
+
+
 def descriptor_matches_file(
     descriptor: dict | None,
     path: Path,
@@ -178,6 +188,66 @@ def descriptor_matches_file(
     return (
         descriptor.get("path") == relative(path, root)
         and descriptor.get("sha256") == sha256(path)
+    )
+
+
+def materialize_reusable_artifact(source: Path, target: Path) -> None:
+    """Atomically place a verified reusable artifact below the new cache root."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
+    try:
+        try:
+            os.link(source, temporary)
+        except OSError:
+            shutil.copy2(source, temporary)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def prepare_text_artifact(
+    prompt_hash: str,
+    text_root: Path,
+    artifact_root: Path,
+    reuse_artifact_root: Path,
+    cached_text_by_hash: dict[str, dict],
+    reused_text_by_hash: dict[str, dict],
+    overwrite: bool,
+) -> bool:
+    """Materialize a trusted reusable context or request a fresh encoding."""
+    target = text_root / f"{prompt_hash}.safetensors"
+    current_matches = descriptor_matches_file(
+        cached_text_by_hash.get(prompt_hash), target, artifact_root
+    )
+    reusable = reused_text_by_hash.get(prompt_hash)
+    reusable_matches = bool(
+        reusable
+        and (reuse_artifact_root / reusable["path"]).is_file()
+        and sha256(reuse_artifact_root / reusable["path"])
+        == reusable["sha256"]
+    )
+    if (
+        reusable_matches
+        and not overwrite
+        and not current_matches
+        and not target.exists()
+    ):
+        materialize_reusable_artifact(
+            reuse_artifact_root / reusable["path"], target
+        )
+        current_matches = descriptor_matches_file(
+            {
+                "path": relative(target, artifact_root),
+                "sha256": reusable["sha256"],
+            },
+            target,
+            artifact_root,
+        )
+    return should_build_local_artifact(
+        target,
+        current_matches=current_matches,
+        reusable_matches=reusable_matches,
+        overwrite=overwrite,
     )
 
 
@@ -290,6 +360,8 @@ def main() -> None:
     root = args.project_root.resolve()
     dataset_root = (root / args.dataset_root).resolve()
     cache_root = (root / args.cache_root).resolve()
+    if cache_root.is_relative_to(dataset_root):
+        raise ValueError("Wan cache root must remain outside the published dataset")
     manifest_path = (
         args.manifest.resolve()
         if args.manifest.is_absolute()
@@ -414,6 +486,7 @@ def main() -> None:
     reuse_cache_hash = None
     reuse_records = {}
     reused_text_by_hash = {}
+    reuse_artifact_root = root
     if args.reuse_cache_manifest is not None:
         reuse_cache_path = (root / args.reuse_cache_manifest).resolve()
         reuse_cache_hash = sha256(reuse_cache_path)
@@ -431,6 +504,7 @@ def main() -> None:
             raise ValueError("reused cache belongs to a different Wan checkpoint")
         if reuse_cache["preprocess"] != preprocess:
             raise ValueError("reused cache uses different video preprocessing")
+        reuse_artifact_root = resolve_cache_artifact_root(root, reuse_cache)
         reuse_records = {
             item["sample_id"]: item for item in reuse_cache["records"]
         }
@@ -471,6 +545,7 @@ def main() -> None:
         else f"manifest.shard-{args.shard_index:05d}-of-{args.shard_count:05d}.json"
     )
     cache_manifest_path = cache_root / cache_manifest_name
+    artifact_root = cache_root
     cached = {}
     if cache_manifest_path.is_file() and not args.overwrite:
         existing = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
@@ -489,6 +564,10 @@ def main() -> None:
             raise ValueError("cache belongs to a different Wan checkpoint")
         if existing.get("preprocess") != preprocess:
             raise ValueError("cache uses different video preprocessing settings")
+        existing_artifact_root = resolve_cache_artifact_root(root, existing)
+        if existing_artifact_root not in (root, cache_root):
+            raise ValueError("cache manifest belongs to a different artifact root")
+        artifact_root = existing_artifact_root
         if existing.get("selection") not in (None, selection):
             raise ValueError("cache shard uses different record selection settings")
         if point_manifest_path is not None:
@@ -520,7 +599,7 @@ def main() -> None:
                 "point_track"
             )
             current_matches = descriptor_matches_file(
-                cached_descriptor, point_path, root
+                cached_descriptor, point_path, artifact_root
             )
             if should_build_local_artifact(
                 point_path,
@@ -611,12 +690,30 @@ def main() -> None:
         latent_path = latent_root / f"{record['sample_id']}.safetensors"
         reusable = reuse_records.get(record["sample_id"], {}).get("latent")
         current = cached.get(record["sample_id"], {}).get("latent")
-        current_matches = descriptor_matches_file(current, latent_path, root)
+        current_matches = descriptor_matches_file(current, latent_path, artifact_root)
         reusable_matches = bool(
             reusable
-            and (root / reusable["path"]).is_file()
-            and sha256(root / reusable["path"]) == reusable["sha256"]
+            and (reuse_artifact_root / reusable["path"]).is_file()
+            and sha256(reuse_artifact_root / reusable["path"])
+            == reusable["sha256"]
         )
+        if (
+            reusable_matches
+            and not args.overwrite
+            and not current_matches
+            and not latent_path.exists()
+        ):
+            materialize_reusable_artifact(
+                reuse_artifact_root / reusable["path"], latent_path
+            )
+            current_matches = descriptor_matches_file(
+                {
+                    "path": relative(latent_path, artifact_root),
+                    "sha256": reusable["sha256"],
+                },
+                latent_path,
+                artifact_root,
+            )
         if should_build_local_artifact(
             latent_path,
             current_matches=current_matches,
@@ -667,20 +764,14 @@ def main() -> None:
     missing_text = [
         (prompt_hash, prompt)
         for prompt_hash, prompt in text_by_hash.items()
-        if should_build_local_artifact(
-            text_root / f"{prompt_hash}.safetensors",
-            current_matches=descriptor_matches_file(
-                cached_text_by_hash.get(prompt_hash),
-                text_root / f"{prompt_hash}.safetensors",
-                root,
-            ),
-            reusable_matches=(
-                prompt_hash in reused_text_by_hash
-                and (root / reused_text_by_hash[prompt_hash]["path"]).is_file()
-                and sha256(root / reused_text_by_hash[prompt_hash]["path"])
-                == reused_text_by_hash[prompt_hash]["sha256"]
-            ),
-            overwrite=args.overwrite,
+        if prepare_text_artifact(
+            prompt_hash,
+            text_root,
+            artifact_root,
+            reuse_artifact_root,
+            cached_text_by_hash,
+            reused_text_by_hash,
+            args.overwrite,
         )
     ]
     if missing_text:
@@ -719,7 +810,7 @@ def main() -> None:
         reused = reuse_records.get(record["sample_id"], {})
         latent_descriptor = (
             {
-                "path": relative(latent_path, root),
+                "path": relative(latent_path, artifact_root),
                 "sha256": sha256(latent_path),
                 "shape": list(expected_latent_shape),
                 "dtype": "bfloat16",
@@ -729,7 +820,7 @@ def main() -> None:
         )
         text_descriptor = (
             {
-                "path": relative(text_path, root),
+                "path": relative(text_path, artifact_root),
                 "sha256": sha256(text_path),
                 "prompt_sha256": prompt_hash,
             }
@@ -751,7 +842,7 @@ def main() -> None:
             point_path = point_track_root / f"{record['sample_id']}.safetensors"
             source = point_records[record["sample_id"]]
             cached_record["point_track"] = {
-                "path": relative(point_path, root),
+                "path": relative(point_path, artifact_root),
                 "sha256": sha256(point_path),
                 "shape": list(expected_point_shape),
                 "dtype": "float32",
@@ -775,6 +866,13 @@ def main() -> None:
         "selection": selection,
         "records": sorted(cached.values(), key=lambda item: order[item["sample_id"]]),
     }
+    if artifact_root != root:
+        cache_manifest.update(
+            {
+                "artifact_path_base": "cache_root",
+                "artifact_root": str(artifact_root),
+            }
+        )
     if point_manifest_path is not None:
         cache_manifest.update(
             {
@@ -788,7 +886,7 @@ def main() -> None:
     if reuse_cache_path is not None:
         cache_manifest.update(
             {
-                "reused_cache_manifest": relative(reuse_cache_path, root),
+                "reused_cache_manifest": portable_path(reuse_cache_path, root),
                 "reused_cache_manifest_sha256": reuse_cache_hash,
             }
         )
@@ -797,7 +895,7 @@ def main() -> None:
     temporary.replace(cache_manifest_path)
     report = {
         "passed": True,
-        "cache_manifest": relative(cache_manifest_path, root),
+        "cache_manifest": portable_path(cache_manifest_path, root),
         "selected_count": len(selected),
         "cached_count": len(cache_manifest["records"]),
         "new_latent_count": len(latent_targets),

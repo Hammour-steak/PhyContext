@@ -15,6 +15,7 @@ from cache_contract import (
     FULL_RATE_DAS_CACHE_SCHEMAS,
     GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
     SUPPORTED_CACHE_SCHEMAS,
+    resolve_cache_artifact_root,
     resolve_cache_dataset_root,
     validate_cache_source_manifest,
 )
@@ -57,6 +58,7 @@ def main() -> None:
     if cache_schema not in SUPPORTED_CACHE_SCHEMAS:
         raise ValueError("cache uses an unsupported trajectory schema")
     dataset_root = resolve_cache_dataset_root(root, cache)
+    artifact_root = resolve_cache_artifact_root(root, cache)
     errors = []
     try:
         source_manifest = validate_cache_source_manifest(root, cache)
@@ -90,7 +92,10 @@ def main() -> None:
             errors.append("source point trajectory manifest record count mismatch")
         point_records = dict(zip(point_sample_ids, raw_point_records))
     if "reused_cache_manifest" in cache:
-        reused_cache = root / cache["reused_cache_manifest"]
+        reused_value = Path(cache["reused_cache_manifest"])
+        reused_cache = (
+            reused_value if reused_value.is_absolute() else root / reused_value
+        ).resolve()
         if (
             not reused_cache.is_file()
             or sha256(reused_cache) != cache["reused_cache_manifest_sha256"]
@@ -213,8 +218,8 @@ def main() -> None:
                 ):
                     errors.append(f"{label} file/hash mismatch: {sample_id}")
 
-        latent_path = root / item["latent"]["path"]
-        text_path = root / item["text_context"]["path"]
+        latent_path = artifact_root / item["latent"]["path"]
+        text_path = artifact_root / item["text_context"]["path"]
         if item["latent"]["path"] in latent_paths:
             errors.append(f"latent path is reused: {item['latent']['path']}")
         latent_paths.add(item["latent"]["path"])
@@ -273,7 +278,7 @@ def main() -> None:
                 or sha256(trajectory_path) != trajectory_hash
             ):
                 errors.append(f"source point trajectory file/hash mismatch: {sample_id}")
-            point_path = root / point_record["path"]
+            point_path = artifact_root / point_record["path"]
             if not point_path.is_file() or sha256(point_path) != point_record["sha256"]:
                 errors.append(f"point-track file/hash mismatch: {sample_id}")
             else:

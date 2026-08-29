@@ -15,6 +15,7 @@ if str(PHYCONTEXT_TOOLS) not in sys.path:
     sys.path.insert(0, str(PHYCONTEXT_TOOLS))
 
 from cache_contract import (  # noqa: E402
+    resolve_cache_artifact_root,
     validate_cache_artifact,
     validate_cache_source_manifest,
 )
@@ -88,7 +89,7 @@ class ExternalDatasetBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dataset summary changed"):
             validate_cache_source_manifest(self.method_root, self.cache)
 
-    def test_cache_artifact_is_hash_bound_and_project_local(self) -> None:
+    def test_legacy_cache_artifact_is_hash_bound_and_project_local(self) -> None:
         artifact = self.method_root / "cache" / "sample.safetensors"
         artifact.parent.mkdir()
         artifact.write_bytes(b"artifact")
@@ -106,8 +107,46 @@ class ExternalDatasetBoundaryTests(unittest.TestCase):
             validate_cache_artifact(self.method_root, descriptor, "test")
 
         descriptor["path"] = "../outside.safetensors"
-        with self.assertRaisesRegex(ValueError, "project-root-relative"):
+        with self.assertRaisesRegex(ValueError, "cache-root-relative"):
             validate_cache_artifact(self.method_root, descriptor, "test")
+
+    def test_cache_artifact_can_use_an_external_cache_root(self) -> None:
+        artifact_root = self.method_root.parent / "external_cache"
+        artifact = artifact_root / "point_tracks" / "sample.safetensors"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"external-artifact")
+        cache = {
+            **self.cache,
+            "artifact_path_base": "cache_root",
+            "artifact_root": str(artifact_root),
+        }
+        resolved_root = resolve_cache_artifact_root(self.method_root, cache)
+        self.assertEqual(resolved_root, artifact_root.resolve())
+        self.assertEqual(
+            validate_cache_artifact(
+                resolved_root,
+                {
+                    "path": "point_tracks/sample.safetensors",
+                    "sha256": sha256(artifact),
+                },
+                "test",
+            ),
+            artifact.resolve(),
+        )
+
+    def test_cache_artifact_root_contract_rejects_ambiguous_fields(self) -> None:
+        cache = {**self.cache, "artifact_root": str(self.dataset_root)}
+        with self.assertRaisesRegex(ValueError, "artifact_path_base=cache_root"):
+            resolve_cache_artifact_root(self.method_root, cache)
+
+    def test_cache_artifacts_cannot_mutate_the_published_dataset(self) -> None:
+        cache = {
+            **self.cache,
+            "artifact_path_base": "cache_root",
+            "artifact_root": str(self.dataset_root / "model_cache"),
+        }
+        with self.assertRaisesRegex(ValueError, "outside the published dataset"):
+            resolve_cache_artifact_root(self.method_root, cache)
 
     def test_training_preflight_keeps_dataset_and_cache_roots_separate(self) -> None:
         cache_path = self.method_root / "cache" / "manifest.json"
