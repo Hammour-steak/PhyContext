@@ -1,8 +1,9 @@
 """Model-side defaults for the current PhysSweep training dataset build.
 
-Dataset production owns ``datasets/``. Wan preprocessing and training own
-``cache/`` and ``outputs/training/`` and must never write derived model data
-inside the external PhysSweep project/data root.
+PhysSweep owns the immutable raw release. The release adapter owns the derived
+``datasets/physweep_training`` interface under the external data root. Wan
+preprocessing and training own only this repository's ``cache/`` and
+``outputs/training/`` trees.
 """
 
 import os

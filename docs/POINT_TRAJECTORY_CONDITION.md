@@ -87,9 +87,19 @@ The legacy cache remains under `dense_point_tracks_832x480x97/`.
 
 ## Pipeline
 
-Point trajectories must be exported by the dataset project from the same
-simulation record used to render each target video. PhyContext treats them as
-immutable inputs and records their hashes in the Wan cache.
+Point trajectories must come from the same simulation record used to render each
+target video. For the immutable one-object release,
+`tools/phycontext/adapt_physweep_release.py` constructs them directly from the
+published rigid poses and a deterministic 2,048-point collision-proxy surface.
+It applies every frame's pose, projects through the published camera, checks the
+inverse rigid and camera transforms, and requires exact frame-zero alignment with
+the shared scene condition. The source release remains immutable and every
+derived trajectory is hash-bound in its own manifest.
+
+The release does not contain rendered dynamic-object meshes. Consequently these
+points are simulation-grounded material identities, not visual-surface truth.
+The adapter reports their first-frame mask coverage as a diagnostic and labels
+the limitation in scene and sample provenance.
 
 Build the default cache with:
 

@@ -6,7 +6,8 @@ Wan2.2 on the first frame, scene geometry, surface and object physics, initial
 state, and the matching dense object point trajectory.
 
 PhyContext does not contain asset ingestion, sampling matrices, PyBullet dataset
-simulation, Blender rendering, or dataset publication code.
+simulation, Blender rendering, or dataset publication code. It does include a
+consumer-side adapter for the immutable PhysSweep one-object release.
 
 ## Input Contract
 
@@ -23,10 +24,17 @@ The trajectory is the physical realization of the same structured scene and
 parameter assignment. Reusing another sample's trajectory is allowed only in an
 explicitly named ablation.
 
+If the external root contains the released `outputs/one_object` layout rather
+than this model-ready contract, run `tools/phycontext/adapt_physweep_release.py`.
+It writes a separate `datasets/physweep_training` tree and never writes below the
+release directory. Dynamic surfaces are labeled as simulator collision proxies;
+the adapter does not claim that unpublished rendered object meshes are available.
+
 ## Maintained Pipeline
 
 ```text
-PhysSweep project/data root + published manifest
+PhysSweep project/data root + immutable one-object release
+        -> adapt release to the model input contract (once)
         -> validate dataset contract
         -> build and audit Wan cache
         -> train PhyContext adapter
@@ -50,6 +58,10 @@ export PHYCONTEXT_DATASET_ROOT=/path/to/PhysSweep
 export PHYCONTEXT_WAN_REPO=/path/to/Wan2.2
 export PHYCONTEXT_WAN_CHECKPOINT=/path/to/Wan2.2-TI2V-5B
 
+python tools/phycontext/adapt_physweep_release.py \
+  --dataset-root "$PHYCONTEXT_DATASET_ROOT" \
+  --release-root outputs/one_object
+
 python tools/phycontext/cache_wan_inputs.py \
   --dataset-root "$PHYCONTEXT_DATASET_ROOT" \
   --manifest datasets/physweep_training/manifest.jsonl
@@ -61,9 +73,12 @@ python tools/model_training/train_one_object.py \
 ```
 
 The dataset root is the PhysSweep project/data root, not a directory inside
-PhyContext. Dataset-relative paths remain read only; all Wan cache files are
-written under this repository. Remove `--dry-run` only after the dataset and
-cache audits pass.
+PhyContext. Raw release paths remain read only; all Wan cache files are written
+under this repository. The release adapter writes only its explicitly selected,
+disjoint derived-data directory under the external root. Add
+`--limit-groups 1 --output-root datasets/adapter_smoke` to validate one complete
+13-sample group without caching or training. Remove `--dry-run` only after the
+dataset and cache audits pass.
 
 ## Layout
 

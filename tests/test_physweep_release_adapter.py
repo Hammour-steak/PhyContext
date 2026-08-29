@@ -1,0 +1,311 @@
+from __future__ import annotations
+
+from copy import deepcopy
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
+
+from adapt_physweep_release import (  # noqa: E402
+    IMAGE_SIZE_PX,
+    POINT_COUNT,
+    _physics_condition,
+    _project_camera,
+    _validate_release_group_sample,
+    build_point_trajectory_payload,
+    camera_contract,
+    fixture_components,
+    quaternion_matrix_wxyz,
+    resolve_roots,
+    sample_dynamic_proxy,
+)
+
+
+class PhysSweepReleaseAdapterTest(unittest.TestCase):
+    def test_camera_contract_projects_target_to_principal_point(self) -> None:
+        camera = {
+            "position_m": [2.0, -4.0, 3.0],
+            "target_m": [0.0, 0.0, 1.0],
+            "focal_length_mm": 50.0,
+            "sensor_width_mm": 36.0,
+        }
+        camera_from_world, intrinsics = camera_contract(camera)
+        target_camera = (
+            camera_from_world[:3, :3] @ np.asarray(camera["target_m"])
+            + camera_from_world[:3, 3]
+        )
+        projected = _project_camera(target_camera[None], intrinsics)[0]
+        np.testing.assert_allclose(projected, np.asarray(IMAGE_SIZE_PX) / 2.0)
+        np.testing.assert_allclose(
+            camera_from_world[:3, :3] @ camera_from_world[:3, :3].T,
+            np.eye(3),
+            atol=1.0e-12,
+        )
+        self.assertAlmostEqual(float(np.linalg.det(camera_from_world[:3, :3])), -1.0)
+
+    def test_every_release_dynamic_proxy_family_produces_fixed_material_points(self) -> None:
+        proxies = [
+            {"type": "sphere", "radius_m": 0.1},
+            {"type": "cuboid", "size_m": [0.1, 0.2, 0.3]},
+            {"type": "cylinder", "size_m": [0.1, 0.1, 0.3]},
+            {
+                "type": "compound",
+                "colliders": [
+                    {
+                        "shape": "box",
+                        "size_m": [0.1, 0.2, 0.3],
+                        "position_m": [0.1, 0.0, 0.0],
+                        "rotation_euler_degrees": [0.0, 0.0, 20.0],
+                    },
+                    {
+                        "shape": "sphere",
+                        "radius_m": 0.05,
+                        "position_m": [-0.1, 0.0, 0.0],
+                    },
+                ],
+            },
+        ]
+        for index, proxy in enumerate(proxies):
+            points, normals, report = sample_dynamic_proxy(
+                proxy, np.random.default_rng(index)
+            )
+            self.assertEqual(points.shape, (POINT_COUNT, 3))
+            self.assertEqual(normals.shape, (POINT_COUNT, 3))
+            np.testing.assert_allclose(np.linalg.norm(normals, axis=1), 1.0, atol=1.0e-6)
+            self.assertEqual(sum(report["component_point_counts"]), POINT_COUNT)
+            if proxy["type"] == "sphere":
+                np.testing.assert_allclose(
+                    np.linalg.norm(points, axis=1),
+                    0.1,
+                    rtol=0.0,
+                    atol=1.0e-12,
+                )
+
+    def test_rigid_track_export_and_inverse_audits_preserve_point_identity(self) -> None:
+        camera = {
+            "position_m": [0.0, -4.0, 2.0],
+            "target_m": [0.0, 0.0, 1.0],
+            "focal_length_mm": 48.0,
+            "sensor_width_mm": 36.0,
+            "clip_start_m": 0.03,
+            "clip_end_m": 100.0,
+        }
+        camera_from_world, intrinsics = camera_contract(camera)
+        rng = np.random.default_rng(4)
+        local = rng.normal(scale=0.05, size=(1, POINT_COUNT, 3))
+        half_angle = np.deg2rad(45.0)
+        trajectory = {
+            "time_s": np.asarray([0.0, 1.0]),
+            "object_ids": np.asarray(["object_a"]),
+            "position_m": np.asarray([[[0.0, 0.0, 1.0]], [[0.2, 0.1, 1.1]]]),
+            "quaternion_wxyz": np.asarray(
+                [[[1.0, 0.0, 0.0, 0.0]], [[np.cos(half_angle), 0.0, 0.0, np.sin(half_angle)]]]
+            ),
+        }
+        payload, report = build_point_trajectory_payload(
+            trajectory, local, camera_from_world, intrinsics, camera
+        )
+        self.assertLess(report["rigid_roundtrip_max_abs_error_m"], 1.0e-10)
+        self.assertLess(report["camera_roundtrip_max_abs_error_m"], 1.0e-10)
+        second_rotation = quaternion_matrix_wxyz(trajectory["quaternion_wxyz"][1, 0])
+        recovered = np.einsum(
+            "ij,nj->ni",
+            second_rotation.T,
+            payload["points_world_m"][1, 0] - trajectory["position_m"][1, 0],
+        )
+        np.testing.assert_allclose(recovered, local[0], atol=2.0e-7)
+
+    def test_axial_velocity_uses_reflection_sign_and_inertia_stays_positive(self) -> None:
+        camera = {
+            "position_m": [0.0, -4.0, 2.0],
+            "target_m": [0.0, 0.0, 1.0],
+            "focal_length_mm": 48.0,
+            "sensor_width_mm": 36.0,
+        }
+        camera_from_world, _ = camera_contract(camera)
+        metadata = {
+            "physics": {
+                "objects": [
+                    {
+                        "object_id": "object_a",
+                        "inertia_diagonal_kg_m2": [0.1, 0.2, 0.3],
+                        "initial_state": {
+                            "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+                            "linear_velocity_m_s": [1.0, 2.0, 3.0],
+                            "angular_velocity_rad_s": [0.5, -0.2, 0.7],
+                        },
+                        "material": {
+                            "mass_kg": 1.0,
+                            "contact_friction": 0.4,
+                            "contact_restitution": 0.2,
+                            "rolling_friction": 0.01,
+                            "spinning_friction": 0.02,
+                            "linear_damping": 0.03,
+                            "angular_damping": 0.04,
+                        },
+                    }
+                ],
+                "world": {"gravity_m_s2": [0.0, 0.0, -9.81]},
+            }
+        }
+        condition = _physics_condition(metadata, "object_a", camera_from_world)
+        rotation = camera_from_world[:3, :3]
+        expected_angular = np.linalg.det(rotation) * rotation @ np.asarray([0.5, -0.2, 0.7])
+        np.testing.assert_allclose(
+            condition["object"]["initial_state"]["angular_velocity_camera_rad_s"],
+            expected_angular,
+        )
+        self.assertTrue(
+            np.all(np.linalg.eigvalsh(condition["object"]["inertia_tensor_camera_kg_m2"]) > 0.0)
+        )
+
+    def test_fixture_parser_uses_collision_geometry_and_ignores_hidden_primitives(self) -> None:
+        fixture = {
+            "physical": {
+                "support": {
+                    "dynamics": {"lateral_friction": 0.6, "restitution": 0.1},
+                    "colliders": [
+                        {
+                            "id": "visible",
+                            "primitive": "box",
+                            "size_m": [2.0, 2.0, 0.1],
+                            "position_m": [0.0, 0.0, -0.05],
+                            "collision_enabled": True,
+                            "visible": True,
+                        },
+                        {
+                            "id": "hidden",
+                            "primitive": "box",
+                            "size_m": [1.0, 1.0, 1.0],
+                            "visible": False,
+                        },
+                    ],
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            components = fixture_components(fixture, Path(temporary))
+        self.assertEqual(len(components), 1)
+        self.assertEqual(components[0].friction, 0.6)
+        self.assertEqual(components[0].restitution, 0.1)
+
+    def test_static_prop_local_proxy_is_composed_with_its_world_placement(self) -> None:
+        fixture = {
+            "physical": {
+                "static_dynamics": {
+                    "static_prop": {"lateral_friction": 0.58, "restitution": 0.06}
+                },
+                "static_prop_binding": {
+                    "position_m": [2.0, 3.0, 4.0],
+                    "yaw_degrees": 90.0,
+                },
+                "static_prop_record": {
+                    "proxy": {
+                        "colliders": [
+                            {
+                                "id": "offset_box",
+                                "shape": "box",
+                                "size_m": [0.2, 0.4, 0.6],
+                                "position_m": [1.0, 0.0, 0.5],
+                                "rotation_euler_degrees": [0.0, 0.0, 0.0],
+                            }
+                        ]
+                    }
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            components = fixture_components(fixture, Path(temporary))
+        self.assertEqual(len(components), 1)
+        np.testing.assert_allclose(
+            components[0].vertices_world_m.mean(axis=0),
+            np.asarray([2.0, 4.0, 4.5]),
+            atol=1.0e-12,
+        )
+        self.assertEqual(components[0].friction, 0.58)
+        self.assertEqual(components[0].restitution, 0.06)
+
+    def test_source_and_output_roots_must_be_disjoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary)
+            release = dataset / "outputs" / "one_object"
+            release.mkdir(parents=True)
+            with self.assertRaisesRegex(ValueError, "disjoint"):
+                resolve_roots(dataset, Path("outputs/one_object"), Path("outputs"))
+            with self.assertRaisesRegex(ValueError, "disjoint"):
+                resolve_roots(dataset, Path("outputs/one_object"), Path("outputs/one_object/derived"))
+            resolved = resolve_roots(dataset, Path("outputs/one_object"), Path("datasets/derived"))
+            self.assertEqual(resolved[1], release.resolve())
+
+    def test_one_factor_validator_rejects_a_second_material_change(self) -> None:
+        base = {
+            "scene_id": "sample_base",
+            "group_id": "group_a",
+            "family": "generic",
+            "sample_kind": "base",
+            "seed": 7,
+            "visual": {"camera": "fixed"},
+            "text": {"caption": "fixed"},
+            "semantics": {"object": "fixed"},
+            "physics": {
+                "backend": {"id": "fixed"},
+                "fixture": {"id": "fixed"},
+                "solver": {"id": "fixed"},
+                "time": {"duration_s": 4.0, "output_fps": 24, "simulation_hz": 240},
+                "world": {"gravity_m_s2": [0.0, 0.0, -9.81]},
+                "objects": [
+                    {
+                        "object_id": "object_a",
+                        "collision_proxy": {"type": "sphere", "radius_m": 0.1},
+                        "initial_state": {"position_m": [0.0, 0.0, 1.0]},
+                        "inertia_diagonal_kg_m2": [0.1, 0.2, 0.3],
+                        "material": {
+                            "mass_kg": 1.0,
+                            "contact_friction": 0.4,
+                            "contact_restitution": 0.2,
+                        },
+                    }
+                ],
+            },
+        }
+        group = {
+            "group_id": "group_a",
+            "family": "generic",
+            "target_object_id": "object_a",
+        }
+        base_descriptor = {"scene_id": "sample_base"}
+        _validate_release_group_sample(
+            base, base, base_descriptor, group, "object_a", True
+        )
+        sweep = deepcopy(base)
+        sweep.update({"scene_id": "sample_sweep", "sample_kind": "sweep"})
+        sweep["physics"]["objects"][0]["material"]["contact_friction"] = 0.8
+        sweep["sweep"] = {
+            "parameter": "contact_friction",
+            "level_index": 4,
+            "target_object_id": "object_a",
+            "value": 0.8,
+        }
+        descriptor = {
+            "scene_id": "sample_sweep",
+            "parameter": "contact_friction",
+            "level_index": 4,
+        }
+        _validate_release_group_sample(
+            base, sweep, descriptor, group, "object_a", False
+        )
+        sweep["physics"]["objects"][0]["material"]["contact_restitution"] = 0.3
+        with self.assertRaisesRegex(ValueError, "unexpectedly changes"):
+            _validate_release_group_sample(
+                base, sweep, descriptor, group, "object_a", False
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
