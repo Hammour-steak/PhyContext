@@ -52,5 +52,10 @@ the implicit PyBullet plane, so the adapter reconstructs only its in-frame
 camera-frustum footprint. Both choices are recorded in output provenance; mask
 overlap is diagnostic, not a false claim of visual-mesh equivalence.
 
+The adapter refuses non-empty output directories by default. `--overwrite`
+accepts only a completed output or an interrupted output carrying this
+adapter's ownership marker; it never removes an unrelated directory. The marker
+is deleted after a successful build.
+
 `train_wan_formal.py` is the only training entry point. Unsupported checkpoint
 contracts are rejected explicitly during audit and inference.

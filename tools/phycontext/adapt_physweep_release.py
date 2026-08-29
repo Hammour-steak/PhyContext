@@ -50,6 +50,10 @@ ENVIRONMENT_POINT_COUNT = 8192
 IMAGE_SIZE_PX = (1280, 720)
 BASE_LEVEL_INDEX = 2
 LEVEL_COUNT = 5
+NON_BASE_LEVEL_INDICES = (0, 1, 3, 4)
+RELEASE_DURATION_S = 4.0
+RELEASE_OUTPUT_FPS = 24
+RELEASE_FRAME_COUNT = int(RELEASE_DURATION_S * RELEASE_OUTPUT_FPS) + 1
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,14 @@ class SurfaceComponent:
         triangles = self.vertices_world_m[self.faces]
         cross = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
         return float(0.5 * np.linalg.norm(cross, axis=1).sum())
+
+
+@dataclass(frozen=True)
+class ReleaseSample:
+    descriptor: dict[str, Any]
+    metadata: dict[str, Any]
+    artifacts: dict[str, Path]
+    trajectory: dict[str, np.ndarray]
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,7 +106,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Replace a completed output from this adapter; unrelated directories are refused.",
+        help=(
+            "Replace a completed or interrupted output from this adapter; "
+            "unrelated directories are refused."
+        ),
     )
     return parser.parse_args()
 
@@ -907,12 +922,12 @@ def _validate_release_group_sample(
         raise ValueError("release sample time contract uses unsupported fields")
     simulation_hz = time_contract["simulation_hz"]
     if (
-        time_contract["duration_s"] != 4.0
-        or time_contract["output_fps"] != 24
+        time_contract["duration_s"] != RELEASE_DURATION_S
+        or time_contract["output_fps"] != RELEASE_OUTPUT_FPS
         or not isinstance(simulation_hz, int)
         or isinstance(simulation_hz, bool)
         or simulation_hz <= 0
-        or simulation_hz % 24 != 0
+        or simulation_hz % RELEASE_OUTPUT_FPS != 0
     ):
         raise ValueError("release sample must use the 4 s, 24 fps closed-endpoint protocol")
 
@@ -945,7 +960,7 @@ def _validate_release_group_sample(
     ):
         raise ValueError(f"group and sample sweep descriptors differ: {metadata['scene_id']}")
     axis = str(sweep["parameter"])
-    if axis not in SWEEP_AXES or int(sweep["level_index"]) not in {0, 1, 3, 4}:
+    if axis not in SWEEP_AXES or int(sweep["level_index"]) not in NON_BASE_LEVEL_INDICES:
         raise ValueError(f"invalid one-factor sweep: {sweep}")
     base_material = base_object["material"]
     target_material = target_object["material"]
@@ -996,12 +1011,12 @@ def _trajectory(path: Path, expected_object_id: str) -> dict[str, np.ndarray]:
     angular_velocity = np.asarray(payload["angular_velocity_rad_s"], dtype=np.float64)
     contact_count = np.asarray(payload["contact_count"])
     if (
-        time_s.shape != (97,)
-        or position.shape != (97, 1, 3)
-        or quaternion.shape != (97, 1, 4)
-        or linear_velocity.shape != (97, 1, 3)
-        or angular_velocity.shape != (97, 1, 3)
-        or contact_count.shape != (97, 1)
+        time_s.shape != (RELEASE_FRAME_COUNT,)
+        or position.shape != (RELEASE_FRAME_COUNT, 1, 3)
+        or quaternion.shape != (RELEASE_FRAME_COUNT, 1, 4)
+        or linear_velocity.shape != (RELEASE_FRAME_COUNT, 1, 3)
+        or angular_velocity.shape != (RELEASE_FRAME_COUNT, 1, 3)
+        or contact_count.shape != (RELEASE_FRAME_COUNT, 1)
     ):
         raise ValueError("release trajectory must have 97 frames and one object")
     for name, value in (
@@ -1018,7 +1033,9 @@ def _trajectory(path: Path, expected_object_id: str) -> dict[str, np.ndarray]:
         raise ValueError("release trajectory contact counts must be non-negative integers")
     if not np.allclose(np.linalg.norm(quaternion, axis=-1), 1.0, rtol=1.0e-6, atol=1.0e-6):
         raise ValueError("release trajectory quaternions must be unit length")
-    expected_time_s = np.linspace(0.0, 4.0, 97, dtype=np.float64)
+    expected_time_s = np.linspace(
+        0.0, RELEASE_DURATION_S, RELEASE_FRAME_COUNT, dtype=np.float64
+    )
     if not np.allclose(time_s, expected_time_s, rtol=0.0, atol=1.0e-7):
         raise ValueError(
             "release trajectory time grid must be the exact closed 24 fps 0..4 s grid"
@@ -1244,12 +1261,20 @@ def _physics_condition(metadata: dict[str, Any], object_id: str, camera_from_wor
 def _mask_projection_audit(mask_manifest_path: Path, tracks_t0: np.ndarray, valid_t0: np.ndarray) -> dict[str, Any]:
     manifest = _json(mask_manifest_path)
     objects = manifest.get("objects")
-    if int(manifest.get("frame_count", -1)) != 97 or not isinstance(objects, list) or len(objects) != 1:
+    if (
+        int(manifest.get("frame_count", -1)) != RELEASE_FRAME_COUNT
+        or not isinstance(objects, list)
+        or len(objects) != 1
+    ):
         raise ValueError("one-object mask manifest must bind one object and 97 frames")
     object_record = objects[0]
     object_id = str(object_record.get("object_id", ""))
     hashes = object_record.get("frame_sha256")
-    if not object_id or not isinstance(hashes, list) or len(hashes) != 97:
+    if (
+        not object_id
+        or not isinstance(hashes, list)
+        or len(hashes) != RELEASE_FRAME_COUNT
+    ):
         raise ValueError("mask manifest object record is incomplete")
     mask_path = (mask_manifest_path.parent / "masks" / object_id / "frame_0001.png").resolve()
     if not mask_path.is_relative_to(mask_manifest_path.parent.resolve()) or not mask_path.is_file():
@@ -1275,8 +1300,10 @@ def _mask_projection_audit(mask_manifest_path: Path, tracks_t0: np.ndarray, vali
     }
 
 
-def _sample_descriptor(record: dict[str, Any], is_base: bool) -> dict[str, Any]:
-    if is_base:
+def _sample_descriptor(
+    physics_condition: dict[str, Any], sweep: dict[str, Any] | None
+) -> dict[str, Any]:
+    if sweep is None:
         return {
             "mode": "base",
             "axis": None,
@@ -1285,12 +1312,11 @@ def _sample_descriptor(record: dict[str, Any], is_base: bool) -> dict[str, Any]:
             "base_level_index": BASE_LEVEL_INDEX,
             "base_level_indices": {axis: BASE_LEVEL_INDEX for axis in SWEEP_AXES},
             "source_axis": "mass_kg",
-            "source_value": float(record["conditioning"]["physics"]["object"]["mass_kg"]),
+            "source_value": float(physics_condition["object"]["mass_kg"]),
         }
-    sweep = record.pop("_raw_sweep")
     axis = str(sweep["parameter"])
     level_index = int(sweep["level_index"])
-    if axis not in SWEEP_AXES or level_index not in {0, 1, 3, 4}:
+    if axis not in SWEEP_AXES or level_index not in NON_BASE_LEVEL_INDICES:
         raise ValueError(f"invalid release sweep descriptor: {sweep}")
     return {
         "mode": "one_factor",
@@ -1436,269 +1462,287 @@ def _record_path(release_root: Path, descriptor: dict[str, Any]) -> Path:
     return path
 
 
-def adapt(args: argparse.Namespace) -> dict[str, Any]:
-    dataset_root, release_root, output_root = resolve_roots(args.dataset_root, args.release_root, args.output_root)
-    group_manifest_path = release_root / "sweep" / "group_manifest.json"
-    group_manifest, groups = _load_groups(group_manifest_path, set(args.group_id), args.limit_groups)
+def _prepare_output_root(output_root: Path, overwrite: bool) -> Path:
+    marker_path = output_root / ".adapter_in_progress.json"
+    if output_root.exists() and not output_root.is_dir():
+        raise ValueError(f"output root is not a directory: {output_root}")
     if output_root.exists() and any(output_root.iterdir()):
-        if not args.overwrite:
+        if not overwrite:
             raise FileExistsError(
-                f"derived output already contains files; use --overwrite deliberately: {output_root}"
+                "derived output already contains files; use --overwrite deliberately: "
+                f"{output_root}"
             )
-        previous_summary_path = output_root / "summary.json"
-        previous_summary = _json(previous_summary_path) if previous_summary_path.is_file() else {}
-        if previous_summary.get("adapter_schema") != ADAPTER_SCHEMA:
+        summary_path = output_root / "summary.json"
+        summary = _json(summary_path) if summary_path.is_file() else {}
+        marker = _json(marker_path) if marker_path.is_file() else {}
+        if (
+            summary.get("adapter_schema") != ADAPTER_SCHEMA
+            and marker.get("adapter_schema") != ADAPTER_SCHEMA
+        ):
             raise ValueError(
-                "refusing to overwrite a non-empty directory that is not a completed output "
-                f"of {ADAPTER_SCHEMA}: {output_root}"
+                "refusing to overwrite a non-empty directory not owned by "
+                f"{ADAPTER_SCHEMA}: {output_root}"
             )
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    training_records: list[dict[str, Any]] = []
-    point_records: list[dict[str, Any]] = []
-    group_audits: list[dict[str, Any]] = []
-    fixture_cache: dict[str, tuple[dict[str, Any], list[SurfaceComponent]]] = {}
-    mesh_geometry_cache: dict[
-        tuple[Path, str], tuple[np.ndarray, np.ndarray]
-    ] = {}
+    _atomic_json(
+        marker_path,
+        {
+            "adapter_schema": ADAPTER_SCHEMA,
+            "state": "in_progress",
+        },
+    )
+    return marker_path
 
-    for group_index, group in enumerate(groups, 1):
-        group_id = str(group["group_id"])
-        object_id = str(group["target_object_id"])
-        sweeps = list(group.get("sweeps", []))
-        if len(sweeps) != 12 or {(str(item["parameter"]), int(item["level_index"])) for item in sweeps} != {
-            (axis, level) for axis in SWEEP_AXES for level in (0, 1, 3, 4)
-        }:
-            raise ValueError(f"group does not contain the required 12 sweeps: {group_id}")
-        descriptors = [(group["base"], True), *[(item, False) for item in sweeps]]
-        base_root = _record_path(release_root, group["base"])
-        base_metadata_path = base_root / "metadata.json"
-        if sha256_file(base_metadata_path) != group["base"]["metadata_sha256"]:
-            raise ValueError(f"group manifest base metadata hash mismatch: {group_id}")
-        base_metadata = _json(base_metadata_path)
-        _validate_release_group_sample(
-            base_metadata,
-            base_metadata,
-            group["base"],
-            group,
-            object_id,
-            True,
-        )
-        base_artifacts = _artifact_paths(base_root, base_metadata)
-        camera = base_metadata["visual"]["camera"]
-        camera_from_world, intrinsics = camera_contract(camera)
-        base_trajectory = _trajectory(base_artifacts["trajectory"], object_id)
-        _validate_t0(base_metadata, base_trajectory, object_id)
 
-        group_rng = np.random.default_rng(stable_seed(group_id, args.seed))
-        object_record = _find_object(base_metadata, object_id)
-        local_points, local_normals, proxy_report = sample_dynamic_proxy(
-            object_record["collision_proxy"], group_rng
-        )
-        fixture_sha = str(base_metadata["physics"]["fixture"]["sha256"])
-        cached_fixture = fixture_cache.get(fixture_sha)
-        if cached_fixture is None:
-            fixture_path = release_root / "base" / "fixtures" / f"{fixture_sha}.json"
-            if not fixture_path.is_file() or sha256_file(fixture_path) != fixture_sha:
-                raise ValueError(f"fixture payload is missing or hash-invalid: {fixture_path}")
-            fixture = _json(fixture_path)
-            components = fixture_components(
-                fixture,
-                release_root,
-                mesh_geometry_cache,
-            )
-            fixture_cache[fixture_sha] = (fixture, components)
-        else:
-            fixture, components = cached_fixture
-        implicit_components = implicit_environment_components(
-            base_metadata,
-            fixture,
-            camera_from_world,
-            intrinsics,
-        )
-        environment_components = [*components, *implicit_components]
-        environment, environment_report = sample_environment(
-            environment_components,
-            camera_from_world,
-            intrinsics,
-            float(camera["clip_start_m"]),
-            float(camera["clip_end_m"]),
-            group_rng,
-        )
-        initial_rotation = quaternion_matrix_wxyz(np.asarray(base_trajectory["quaternion_wxyz"])[0, 0])
-        initial_position = np.asarray(base_trajectory["position_m"], dtype=np.float64)[0, 0]
-        object_world = _apply_transform(local_points, initial_rotation, initial_position)
-        object_camera = _camera_points(object_world, camera_from_world)
-        object_normal_camera = np.einsum(
-            "ij,nj->ni",
-            camera_from_world[:3, :3],
-            np.einsum("ij,nj->ni", initial_rotation, local_normals, optimize=True),
-            optimize=True,
-        )
-
-        first_frame_path = output_root / "first_frames" / f"{group_id}.png"
-        _extract_first_frame(base_artifacts["video"], first_frame_path, args.ffmpeg, args.overwrite)
-        scene_path = output_root / "scenes" / f"{group_id}.npz"
-        scene_metadata = {
-            "schema": SCENE_SCHEMA,
-            "group_id": group_id,
-            "object_ids": [object_id],
-            "dynamic_surface_source": "simulation_collision_proxy_not_rendered_visual_mesh",
-            "environment_surface_source": (
-                "simulation_static_fixture_plus_backend_implicit_collision_geometry"
-                if implicit_components
-                else "simulation_static_fixture_collision_geometry"
-            ),
-            "coordinate_frame": "camera_right_up_forward",
-            "object_point_count": POINT_COUNT,
-            "environment_point_count": ENVIRONMENT_POINT_COUNT,
-            "fixture_sha256": fixture_sha,
-            "base_metadata_sha256": group["base"]["metadata_sha256"],
-            "canonical_first_frame_sha256": sha256_file(first_frame_path),
-            "seed": int(args.seed),
-            "proxy_sampling": proxy_report,
-            "environment_sampling": environment_report,
+def _group_sample_descriptors(
+    group: dict[str, Any],
+) -> list[tuple[dict[str, Any], bool]]:
+    group_id = str(group["group_id"])
+    sweeps = list(group.get("sweeps", []))
+    expected = {
+        (axis, level) for axis in SWEEP_AXES for level in NON_BASE_LEVEL_INDICES
+    }
+    try:
+        actual = {
+            (str(descriptor["parameter"]), int(descriptor["level_index"]))
+            for descriptor in sweeps
         }
-        scene_payload = {
-            "object_xyz_camera_m": object_camera[None].astype(np.float32),
-            "object_normal_camera": object_normal_camera[None].astype(np.float32),
-            "environment_xyz_camera_m": environment["xyz_camera"].astype(np.float32),
-            "environment_normal_camera": environment["normal_camera"].astype(np.float32),
-            "environment_friction": environment["friction"].astype(np.float32),
-            "environment_restitution": environment["restitution"].astype(np.float32),
-            "camera_intrinsics_normalized": np.asarray(
-                [intrinsics[0, 0] / IMAGE_SIZE_PX[0], intrinsics[1, 1] / IMAGE_SIZE_PX[1], intrinsics[0, 2] / IMAGE_SIZE_PX[0], intrinsics[1, 2] / IMAGE_SIZE_PX[1]],
-                dtype=np.float32,
-            ),
-            "object_local_points_m": local_points[None].astype(np.float32),
-            "object_local_normal": local_normals[None].astype(np.float32),
-            "environment_xyz_world_m": environment["xyz_world"].astype(np.float32),
-            "camera_from_world": camera_from_world.astype(np.float32),
-            "camera_intrinsics": intrinsics.astype(np.float32),
-            "image_size_px": np.asarray(IMAGE_SIZE_PX, dtype=np.int32),
-            "metadata_json": np.asarray(json.dumps(scene_metadata, sort_keys=True)),
-        }
-        validate_scene_payload(scene_payload)
-        _atomic_npz(scene_path, scene_payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"group has an invalid sweep descriptor: {group_id}") from exc
+    if len(sweeps) != len(expected) or actual != expected:
+        raise ValueError(f"group does not contain the required 12 sweeps: {group_id}")
+    return [(group["base"], True)] + [
+        (descriptor, False) for descriptor in sweeps
+    ]
 
-        base_point_payload: dict[str, np.ndarray] | None = None
-        for descriptor, is_base in descriptors:
-            if is_base:
-                metadata = base_metadata
-                artifacts = base_artifacts
-                trajectory = base_trajectory
-            else:
-                sample_root = _record_path(release_root, descriptor)
-                metadata_path = sample_root / "metadata.json"
-                if sha256_file(metadata_path) != descriptor["metadata_sha256"]:
-                    raise ValueError(f"group manifest sample metadata hash mismatch: {sample_root}")
-                metadata = _json(metadata_path)
-                _validate_release_group_sample(
-                    base_metadata,
-                    metadata,
-                    descriptor,
-                    group,
-                    object_id,
-                    False,
-                )
-                artifacts = _artifact_paths(sample_root, metadata)
-                trajectory = _trajectory(artifacts["trajectory"], object_id)
-                _validate_t0(metadata, trajectory, object_id)
-            point_payload, roundtrip = build_point_trajectory_payload(
-                trajectory,
-                local_points[None],
-                camera_from_world,
-                intrinsics,
-                camera,
-            )
-            initial_alignment_error = float(
-                np.max(np.abs(point_payload["initial_points_camera_m"] - scene_payload["object_xyz_camera_m"]))
-            )
-            if initial_alignment_error > 1.0e-6:
-                raise ValueError(f"scene and point trajectory t0 differ: {descriptor['scene_id']}")
-            point_metadata = json.loads(str(point_payload["metadata_json"].item()))
-            point_metadata["initial_alignment_error_m"] = initial_alignment_error
-            point_metadata["source_trajectory_sha256"] = metadata["artifacts"]["trajectory"]["sha256"]
-            point_payload["metadata_json"] = np.asarray(json.dumps(point_metadata, sort_keys=True))
-            validate_point_trajectory(point_payload)
-            point_path = output_root / "point_trajectories" / str(descriptor["scene_id"]) / "point_trajectory.npz"
-            _atomic_npz(point_path, point_payload)
-            if is_base:
-                base_point_payload = point_payload
 
-            physics = _physics_condition(metadata, object_id, camera_from_world)
-            training_record: dict[str, Any] = {
-                "schema": SAMPLE_SCHEMA,
-                "sample_id": str(metadata["scene_id"]),
-                "base_scene_id": group_id,
-                "split": split_for_group(group_id),
-                "conditioning": {
-                    "first_frame": _relative(dataset_root, first_frame_path),
-                    "scene": _relative(dataset_root, scene_path),
-                    "scene_source": "simulation_gt",
-                    "text": _training_prompt(metadata, object_id),
-                    "physics": physics,
-                },
-                "target": {
-                    "video": _relative(dataset_root, artifacts["video"]),
-                    "metadata": _relative(dataset_root, artifacts["metadata"]),
-                    "duration_seconds": float(metadata["physics"]["time"]["duration_s"]),
-                    "fps": int(metadata["physics"]["time"]["output_fps"]),
-                },
-                "provenance": {
-                    "adapter_schema": ADAPTER_SCHEMA,
-                    "release_group_manifest": _relative(dataset_root, group_manifest_path),
-                    "release_group_id": group_id,
-                    "release_family": str(group["family"]),
-                    "release_metadata_sha256": descriptor["metadata_sha256"],
-                    "trajectory": _relative(dataset_root, artifacts["trajectory"]),
-                    "trajectory_sha256": metadata["artifacts"]["trajectory"]["sha256"],
-                    "mask_manifest": _relative(dataset_root, artifacts["mask_manifest"]),
-                    "mask_manifest_sha256": metadata["artifacts"]["masks"]["manifest_sha256"],
-                    "scene_geometry_scope": "simulation_physics_proxy_not_visual_mesh",
-                },
-            }
-            if not is_base:
-                training_record["_raw_sweep"] = metadata["sweep"]
-            training_record["sweep"] = _sample_descriptor(training_record, is_base)
-            training_records.append(training_record)
-            point_records.append(
-                {
-                    "sample_id": str(metadata["scene_id"]),
-                    "path": _relative(dataset_root, point_path),
-                    "sha256": sha256_file(point_path),
-                    "schema": POINT_TRAJECTORY_SCHEMA,
-                    "point_count": POINT_COUNT,
-                    "object_count": 1,
-                    "object_ids": [object_id],
-                    "shape": list(point_payload["points_world_m"].shape),
-                    "source_scene": _relative(dataset_root, scene_path),
-                    "source_trajectory": _relative(dataset_root, artifacts["trajectory"]),
-                    "initial_alignment_error_m": initial_alignment_error,
-                    **roundtrip,
-                }
-            )
-        if base_point_payload is None:
-            raise AssertionError("group did not emit a base point trajectory")
-        mask_audit = _mask_projection_audit(
-            base_artifacts["mask_manifest"],
-            base_point_payload["tracks_xy_px"][0, 0],
-            base_point_payload["valid"][0, 0],
-        )
-        group_audits.append(
-            {
-                "group_id": group_id,
-                "family": str(group["family"]),
-                "sample_count": 13,
-                "scene_sha256": sha256_file(scene_path),
-                "canonical_first_frame_sha256": sha256_file(first_frame_path),
-                "mask_projection": mask_audit,
-                "proxy_sampling": proxy_report,
-                "environment_sampling": environment_report,
-            }
-        )
-        print(f"adapt {group_index}/{len(groups)} {group_id}", flush=True)
+def _load_release_sample(
+    release_root: Path,
+    descriptor: dict[str, Any],
+    group: dict[str, Any],
+    object_id: str,
+    is_base: bool,
+    base_metadata: dict[str, Any] | None,
+) -> ReleaseSample:
+    if is_base != (base_metadata is None):
+        raise ValueError("base metadata must be absent only while loading the base sample")
+    sample_root = _record_path(release_root, descriptor)
+    metadata_path = sample_root / "metadata.json"
+    if sha256_file(metadata_path) != descriptor["metadata_sha256"]:
+        raise ValueError(f"group manifest metadata hash mismatch: {sample_root}")
+    metadata = _json(metadata_path)
+    reference_metadata = metadata if is_base else base_metadata
+    if reference_metadata is None:
+        raise AssertionError("sweep loading requires base metadata")
+    _validate_release_group_sample(
+        reference_metadata,
+        metadata,
+        descriptor,
+        group,
+        object_id,
+        is_base,
+    )
+    artifacts = _artifact_paths(sample_root, metadata)
+    trajectory = _trajectory(artifacts["trajectory"], object_id)
+    _validate_t0(metadata, trajectory, object_id)
+    return ReleaseSample(
+        descriptor=descriptor,
+        metadata=metadata,
+        artifacts=artifacts,
+        trajectory=trajectory,
+    )
 
+
+def _load_fixture(
+    release_root: Path,
+    metadata: dict[str, Any],
+    fixture_cache: dict[str, tuple[dict[str, Any], list[SurfaceComponent]]],
+    mesh_geometry_cache: dict[tuple[Path, str], tuple[np.ndarray, np.ndarray]],
+) -> tuple[str, dict[str, Any], list[SurfaceComponent]]:
+    fixture_sha = str(metadata["physics"]["fixture"]["sha256"])
+    if len(fixture_sha) != 64 or any(
+        character not in "0123456789abcdef" for character in fixture_sha
+    ):
+        raise ValueError(f"fixture sha256 is not a lowercase hexadecimal digest: {fixture_sha}")
+    cached = fixture_cache.get(fixture_sha)
+    if cached is None:
+        fixture_path = release_root / "base" / "fixtures" / f"{fixture_sha}.json"
+        if not fixture_path.is_file() or sha256_file(fixture_path) != fixture_sha:
+            raise ValueError(f"fixture payload is missing or hash-invalid: {fixture_path}")
+        fixture = _json(fixture_path)
+        components = fixture_components(fixture, release_root, mesh_geometry_cache)
+        fixture_cache[fixture_sha] = (fixture, components)
+    else:
+        fixture, components = cached
+    return fixture_sha, fixture, components
+
+
+def _scene_payload(
+    *,
+    group_id: str,
+    object_id: str,
+    seed: int,
+    fixture_sha: str,
+    base_metadata_sha256: str,
+    first_frame_sha256: str,
+    implicit_environment: bool,
+    local_points: np.ndarray,
+    local_normals: np.ndarray,
+    base_trajectory: dict[str, np.ndarray],
+    environment: dict[str, np.ndarray],
+    camera_from_world: np.ndarray,
+    intrinsics: np.ndarray,
+    proxy_report: dict[str, Any],
+    environment_report: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    initial_rotation = quaternion_matrix_wxyz(
+        np.asarray(base_trajectory["quaternion_wxyz"])[0, 0]
+    )
+    initial_position = np.asarray(base_trajectory["position_m"], dtype=np.float64)[0, 0]
+    object_world = _apply_transform(local_points, initial_rotation, initial_position)
+    object_camera = _camera_points(object_world, camera_from_world)
+    object_normal_camera = np.einsum(
+        "ij,nj->ni",
+        camera_from_world[:3, :3],
+        np.einsum("ij,nj->ni", initial_rotation, local_normals, optimize=True),
+        optimize=True,
+    )
+    scene_metadata = {
+        "schema": SCENE_SCHEMA,
+        "group_id": group_id,
+        "object_ids": [object_id],
+        "dynamic_surface_source": "simulation_collision_proxy_not_rendered_visual_mesh",
+        "environment_surface_source": (
+            "simulation_static_fixture_plus_backend_implicit_collision_geometry"
+            if implicit_environment
+            else "simulation_static_fixture_collision_geometry"
+        ),
+        "coordinate_frame": "camera_right_up_forward",
+        "object_point_count": POINT_COUNT,
+        "environment_point_count": ENVIRONMENT_POINT_COUNT,
+        "fixture_sha256": fixture_sha,
+        "base_metadata_sha256": base_metadata_sha256,
+        "canonical_first_frame_sha256": first_frame_sha256,
+        "seed": int(seed),
+        "proxy_sampling": proxy_report,
+        "environment_sampling": environment_report,
+    }
+    payload = {
+        "object_xyz_camera_m": object_camera[None].astype(np.float32),
+        "object_normal_camera": object_normal_camera[None].astype(np.float32),
+        "environment_xyz_camera_m": environment["xyz_camera"].astype(np.float32),
+        "environment_normal_camera": environment["normal_camera"].astype(np.float32),
+        "environment_friction": environment["friction"].astype(np.float32),
+        "environment_restitution": environment["restitution"].astype(np.float32),
+        "camera_intrinsics_normalized": np.asarray(
+            [
+                intrinsics[0, 0] / IMAGE_SIZE_PX[0],
+                intrinsics[1, 1] / IMAGE_SIZE_PX[1],
+                intrinsics[0, 2] / IMAGE_SIZE_PX[0],
+                intrinsics[1, 2] / IMAGE_SIZE_PX[1],
+            ],
+            dtype=np.float32,
+        ),
+        "object_local_points_m": local_points[None].astype(np.float32),
+        "object_local_normal": local_normals[None].astype(np.float32),
+        "environment_xyz_world_m": environment["xyz_world"].astype(np.float32),
+        "camera_from_world": camera_from_world.astype(np.float32),
+        "camera_intrinsics": intrinsics.astype(np.float32),
+        "image_size_px": np.asarray(IMAGE_SIZE_PX, dtype=np.int32),
+        "metadata_json": np.asarray(json.dumps(scene_metadata, sort_keys=True)),
+    }
+    validate_scene_payload(payload)
+    return payload
+
+
+def _training_record(
+    *,
+    dataset_root: Path,
+    group_manifest_path: Path,
+    group: dict[str, Any],
+    object_id: str,
+    sample: ReleaseSample,
+    first_frame_path: Path,
+    scene_path: Path,
+    camera_from_world: np.ndarray,
+) -> dict[str, Any]:
+    metadata = sample.metadata
+    physics = _physics_condition(metadata, object_id, camera_from_world)
+    return {
+        "schema": SAMPLE_SCHEMA,
+        "sample_id": str(metadata["scene_id"]),
+        "base_scene_id": str(group["group_id"]),
+        "split": split_for_group(str(group["group_id"])),
+        "conditioning": {
+            "first_frame": _relative(dataset_root, first_frame_path),
+            "scene": _relative(dataset_root, scene_path),
+            "scene_source": "simulation_gt",
+            "text": _training_prompt(metadata, object_id),
+            "physics": physics,
+        },
+        "target": {
+            "video": _relative(dataset_root, sample.artifacts["video"]),
+            "metadata": _relative(dataset_root, sample.artifacts["metadata"]),
+            "duration_seconds": float(metadata["physics"]["time"]["duration_s"]),
+            "fps": int(metadata["physics"]["time"]["output_fps"]),
+        },
+        "provenance": {
+            "adapter_schema": ADAPTER_SCHEMA,
+            "release_group_manifest": _relative(dataset_root, group_manifest_path),
+            "release_group_id": str(group["group_id"]),
+            "release_family": str(group["family"]),
+            "release_metadata_sha256": sample.descriptor["metadata_sha256"],
+            "trajectory": _relative(dataset_root, sample.artifacts["trajectory"]),
+            "trajectory_sha256": metadata["artifacts"]["trajectory"]["sha256"],
+            "mask_manifest": _relative(dataset_root, sample.artifacts["mask_manifest"]),
+            "mask_manifest_sha256": metadata["artifacts"]["masks"]["manifest_sha256"],
+            "scene_geometry_scope": "simulation_physics_proxy_not_visual_mesh",
+        },
+        "sweep": _sample_descriptor(physics, metadata.get("sweep")),
+    }
+
+
+def _point_manifest_record(
+    *,
+    dataset_root: Path,
+    object_id: str,
+    sample: ReleaseSample,
+    point_path: Path,
+    point_payload: dict[str, np.ndarray],
+    scene_path: Path,
+    initial_alignment_error: float,
+    roundtrip: dict[str, float],
+) -> dict[str, Any]:
+    return {
+        "sample_id": str(sample.metadata["scene_id"]),
+        "path": _relative(dataset_root, point_path),
+        "sha256": sha256_file(point_path),
+        "schema": POINT_TRAJECTORY_SCHEMA,
+        "point_count": POINT_COUNT,
+        "object_count": 1,
+        "object_ids": [object_id],
+        "shape": list(point_payload["points_world_m"].shape),
+        "source_scene": _relative(dataset_root, scene_path),
+        "source_trajectory": _relative(dataset_root, sample.artifacts["trajectory"]),
+        "initial_alignment_error_m": initial_alignment_error,
+        **roundtrip,
+    }
+
+
+def _write_dataset_metadata(
+    *,
+    dataset_root: Path,
+    release_root: Path,
+    output_root: Path,
+    group_manifest_path: Path,
+    group_manifest: dict[str, Any],
+    selected_group_count: int,
+    seed: int,
+    training_records: list[dict[str, Any]],
+    point_records: list[dict[str, Any]],
+    group_audits: list[dict[str, Any]],
+) -> dict[str, Any]:
     manifest_path = output_root / "manifest.jsonl"
     _atomic_jsonl(manifest_path, training_records)
     validation = validate_manifest(manifest_path, dataset_root, check_files=True)
@@ -1708,7 +1752,7 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
         "source_manifest": _relative(dataset_root, manifest_path),
         "source_manifest_sha256": sha256_file(manifest_path),
         "point_count": POINT_COUNT,
-        "object_axis": "[T, O, 2048, ...]",
+        "object_axis": f"[T, O, {POINT_COUNT}, ...]",
         "record_count": len(point_records),
         "records": point_records,
     }
@@ -1717,7 +1761,7 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
     audit = {
         "schema": ADAPTER_SCHEMA,
         "status": "passed",
-        "group_count": len(groups),
+        "group_count": selected_group_count,
         "sample_count": len(training_records),
         "groups": group_audits,
         "invariants": {
@@ -1748,13 +1792,194 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
         "release_group_manifest": _relative(dataset_root, group_manifest_path),
         "release_group_manifest_sha256": sha256_file(group_manifest_path),
         "release_group_count": int(group_manifest["group_count"]),
-        "selected_group_count": len(groups),
-        "seed": int(args.seed),
+        "selected_group_count": selected_group_count,
+        "seed": int(seed),
         "validation": validation,
         "ready_for_wan_cache": True,
         "training_was_run": False,
     }
     _atomic_json(summary_path, summary)
+    return summary
+
+
+def adapt(args: argparse.Namespace) -> dict[str, Any]:
+    dataset_root, release_root, output_root = resolve_roots(args.dataset_root, args.release_root, args.output_root)
+    group_manifest_path = release_root / "sweep" / "group_manifest.json"
+    group_manifest, groups = _load_groups(group_manifest_path, set(args.group_id), args.limit_groups)
+    in_progress_marker = _prepare_output_root(output_root, args.overwrite)
+    training_records: list[dict[str, Any]] = []
+    point_records: list[dict[str, Any]] = []
+    group_audits: list[dict[str, Any]] = []
+    fixture_cache: dict[str, tuple[dict[str, Any], list[SurfaceComponent]]] = {}
+    mesh_geometry_cache: dict[
+        tuple[Path, str], tuple[np.ndarray, np.ndarray]
+    ] = {}
+
+    for group_index, group in enumerate(groups, 1):
+        group_id = str(group["group_id"])
+        object_id = str(group["target_object_id"])
+        descriptors = _group_sample_descriptors(group)
+        base_sample = _load_release_sample(
+            release_root,
+            descriptors[0][0],
+            group,
+            object_id,
+            True,
+            None,
+        )
+        base_metadata = base_sample.metadata
+        camera = base_metadata["visual"]["camera"]
+        camera_from_world, intrinsics = camera_contract(camera)
+
+        group_rng = np.random.default_rng(stable_seed(group_id, args.seed))
+        object_record = _find_object(base_metadata, object_id)
+        local_points, local_normals, proxy_report = sample_dynamic_proxy(
+            object_record["collision_proxy"], group_rng
+        )
+        fixture_sha, fixture, components = _load_fixture(
+            release_root,
+            base_metadata,
+            fixture_cache,
+            mesh_geometry_cache,
+        )
+        implicit_components = implicit_environment_components(
+            base_metadata,
+            fixture,
+            camera_from_world,
+            intrinsics,
+        )
+        environment_components = [*components, *implicit_components]
+        environment, environment_report = sample_environment(
+            environment_components,
+            camera_from_world,
+            intrinsics,
+            float(camera["clip_start_m"]),
+            float(camera["clip_end_m"]),
+            group_rng,
+        )
+
+        first_frame_path = output_root / "first_frames" / f"{group_id}.png"
+        _extract_first_frame(
+            base_sample.artifacts["video"],
+            first_frame_path,
+            args.ffmpeg,
+            args.overwrite,
+        )
+        first_frame_sha256 = sha256_file(first_frame_path)
+        scene_path = output_root / "scenes" / f"{group_id}.npz"
+        scene_payload = _scene_payload(
+            group_id=group_id,
+            object_id=object_id,
+            seed=args.seed,
+            fixture_sha=fixture_sha,
+            base_metadata_sha256=str(group["base"]["metadata_sha256"]),
+            first_frame_sha256=first_frame_sha256,
+            implicit_environment=bool(implicit_components),
+            local_points=local_points,
+            local_normals=local_normals,
+            base_trajectory=base_sample.trajectory,
+            environment=environment,
+            camera_from_world=camera_from_world,
+            intrinsics=intrinsics,
+            proxy_report=proxy_report,
+            environment_report=environment_report,
+        )
+        _atomic_npz(scene_path, scene_payload)
+
+        base_point_payload: dict[str, np.ndarray] | None = None
+        for descriptor, is_base in descriptors:
+            sample = (
+                base_sample
+                if is_base
+                else _load_release_sample(
+                    release_root,
+                    descriptor,
+                    group,
+                    object_id,
+                    False,
+                    base_metadata,
+                )
+            )
+            point_payload, roundtrip = build_point_trajectory_payload(
+                sample.trajectory,
+                local_points[None],
+                camera_from_world,
+                intrinsics,
+                camera,
+            )
+            initial_alignment_error = float(
+                np.max(np.abs(point_payload["initial_points_camera_m"] - scene_payload["object_xyz_camera_m"]))
+            )
+            if initial_alignment_error > 1.0e-6:
+                raise ValueError(f"scene and point trajectory t0 differ: {descriptor['scene_id']}")
+            point_metadata = json.loads(str(point_payload["metadata_json"].item()))
+            point_metadata["initial_alignment_error_m"] = initial_alignment_error
+            point_metadata["source_trajectory_sha256"] = sample.metadata["artifacts"]["trajectory"]["sha256"]
+            point_payload["metadata_json"] = np.asarray(json.dumps(point_metadata, sort_keys=True))
+            validate_point_trajectory(point_payload)
+            point_path = output_root / "point_trajectories" / str(descriptor["scene_id"]) / "point_trajectory.npz"
+            _atomic_npz(point_path, point_payload)
+            if is_base:
+                base_point_payload = point_payload
+
+            training_records.append(
+                _training_record(
+                    dataset_root=dataset_root,
+                    group_manifest_path=group_manifest_path,
+                    group=group,
+                    object_id=object_id,
+                    sample=sample,
+                    first_frame_path=first_frame_path,
+                    scene_path=scene_path,
+                    camera_from_world=camera_from_world,
+                )
+            )
+            point_records.append(
+                _point_manifest_record(
+                    dataset_root=dataset_root,
+                    object_id=object_id,
+                    sample=sample,
+                    point_path=point_path,
+                    point_payload=point_payload,
+                    scene_path=scene_path,
+                    initial_alignment_error=initial_alignment_error,
+                    roundtrip=roundtrip,
+                )
+            )
+        if base_point_payload is None:
+            raise AssertionError("group did not emit a base point trajectory")
+        mask_audit = _mask_projection_audit(
+            base_sample.artifacts["mask_manifest"],
+            base_point_payload["tracks_xy_px"][0, 0],
+            base_point_payload["valid"][0, 0],
+        )
+        group_audits.append(
+            {
+                "group_id": group_id,
+                "family": str(group["family"]),
+                "sample_count": len(descriptors),
+                "scene_sha256": sha256_file(scene_path),
+                "canonical_first_frame_sha256": first_frame_sha256,
+                "mask_projection": mask_audit,
+                "proxy_sampling": proxy_report,
+                "environment_sampling": environment_report,
+            }
+        )
+        print(f"adapt {group_index}/{len(groups)} {group_id}", flush=True)
+
+    summary = _write_dataset_metadata(
+        dataset_root=dataset_root,
+        release_root=release_root,
+        output_root=output_root,
+        group_manifest_path=group_manifest_path,
+        group_manifest=group_manifest,
+        selected_group_count=len(groups),
+        seed=args.seed,
+        training_records=training_records,
+        point_records=point_records,
+        group_audits=group_audits,
+    )
+    in_progress_marker.unlink()
     return summary
 
 

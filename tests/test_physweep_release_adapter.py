@@ -15,8 +15,12 @@ sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 from adapt_physweep_release import (  # noqa: E402
     IMAGE_SIZE_PX,
     POINT_COUNT,
+    _group_sample_descriptors,
+    _load_fixture,
     _physics_condition,
+    _prepare_output_root,
     _project_camera,
+    _sample_descriptor,
     _validate_release_group_sample,
     build_point_trajectory_payload,
     camera_contract,
@@ -29,6 +33,63 @@ from adapt_physweep_release import (  # noqa: E402
 
 
 class PhysSweepReleaseAdapterTest(unittest.TestCase):
+    def test_sweep_descriptor_is_explicit_and_does_not_mutate_inputs(self) -> None:
+        physics = {"object": {"mass_kg": 1.25}}
+        sweep = {
+            "parameter": "contact_friction",
+            "level_index": 4,
+            "value": 0.8,
+        }
+        original = deepcopy(sweep)
+        base_descriptor = _sample_descriptor(physics, None)
+        sweep_descriptor = _sample_descriptor(physics, sweep)
+        self.assertEqual(base_descriptor["mode"], "base")
+        self.assertEqual(base_descriptor["source_value"], 1.25)
+        self.assertEqual(sweep_descriptor["mode"], "one_factor")
+        self.assertEqual(sweep_descriptor["axis"], "contact_friction")
+        self.assertEqual(sweep, original)
+
+    def test_group_descriptor_validation_rejects_duplicate_sweep_cells(self) -> None:
+        sweeps = [
+            {"parameter": axis, "level_index": level}
+            for axis in ("mass_kg", "contact_friction", "contact_restitution")
+            for level in (0, 1, 3, 4)
+        ]
+        group = {"group_id": "group_a", "base": {"scene_id": "base"}, "sweeps": sweeps}
+        self.assertEqual(len(_group_sample_descriptors(group)), 13)
+        group["sweeps"][-1] = deepcopy(group["sweeps"][0])
+        with self.assertRaisesRegex(ValueError, "required 12 sweeps"):
+            _group_sample_descriptors(group)
+
+    def test_fixture_hash_is_validated_before_path_construction(self) -> None:
+        metadata = {"physics": {"fixture": {"sha256": "../outside"}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "lowercase hexadecimal digest"):
+                _load_fixture(Path(temporary), metadata, {}, {})
+
+    def test_interrupted_adapter_output_is_owned_and_safely_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "derived"
+            marker = _prepare_output_root(output, overwrite=False)
+            (output / "partial.npz").write_bytes(b"incomplete")
+            self.assertTrue(marker.is_file())
+            with self.assertRaises(FileExistsError):
+                _prepare_output_root(output, overwrite=False)
+            replacement_marker = _prepare_output_root(output, overwrite=True)
+            self.assertTrue(replacement_marker.is_file())
+            self.assertFalse((output / "partial.npz").exists())
+
+    def test_unrelated_output_directory_is_never_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "unrelated"
+            output.mkdir()
+            (output / "user_file.txt").write_text("keep", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "not owned"):
+                _prepare_output_root(output, overwrite=True)
+            self.assertEqual(
+                (output / "user_file.txt").read_text(encoding="utf-8"), "keep"
+            )
+
     def test_camera_contract_projects_target_to_principal_point(self) -> None:
         camera = {
             "position_m": [2.0, -4.0, 3.0],
