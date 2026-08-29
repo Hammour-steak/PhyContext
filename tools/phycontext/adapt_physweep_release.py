@@ -490,9 +490,23 @@ def _load_trimesh(path: Path) -> trimesh.Trimesh:
     return loaded
 
 
-def fixture_components(fixture: dict[str, Any], release_root: Path) -> list[SurfaceComponent]:
+def fixture_components(
+    fixture: dict[str, Any],
+    release_root: Path,
+    mesh_geometry_cache: dict[
+        tuple[Path, str], tuple[np.ndarray, np.ndarray]
+    ]
+    | None = None,
+) -> list[SurfaceComponent]:
     components: list[SurfaceComponent] = []
-    seen_mesh_bindings: set[tuple[str, tuple[float, ...], tuple[float, ...], tuple[float, ...]]] = set()
+    seen_mesh_bindings: set[
+        tuple[
+            str,
+            tuple[float, ...],
+            tuple[float, ...],
+            tuple[float, ...],
+        ]
+    ] = set()
 
     physical = fixture.get("physical", {})
     prop_binding = physical.get("static_prop_binding")
@@ -584,23 +598,37 @@ def fixture_components(fixture: dict[str, Any], release_root: Path) -> list[Surf
             base_root = (release_root / "base").resolve()
             if not path.is_relative_to(base_root) or not path.is_file():
                 raise FileNotFoundError(f"fixture mesh is missing: {path}")
-            expected_hash = node.get("sha256")
-            if expected_hash and sha256_file(path) != expected_hash:
-                raise ValueError(f"fixture mesh hash mismatch: {path}")
+            expected_hash_value = node.get("sha256")
+            expected_hash = "" if expected_hash_value is None else str(expected_hash_value)
             position = tuple(float(value) for value in current.get("position", [0.0, 0.0, 0.0]))
             scale = tuple(float(value) for value in current.get("scale", [1.0, 1.0, 1.0]))
-            quaternion = tuple(float(value) for value in current.get("quaternion", [0.0, 0.0, 0.0, 1.0]))
-            binding = (str(relative), position, scale, quaternion)
+            rotation = (
+                quaternion_matrix_xyzw(current["quaternion"])
+                if "quaternion" in current
+                else euler_xyz_matrix_degrees(current.get("euler", [0.0, 0.0, 0.0]))
+            )
+            cache_key = (path, expected_hash)
+            cached_geometry = (
+                mesh_geometry_cache.get(cache_key)
+                if mesh_geometry_cache is not None
+                else None
+            )
+            if cached_geometry is None:
+                if expected_hash and sha256_file(path) != expected_hash:
+                    raise ValueError(f"fixture mesh hash mismatch: {path}")
+                cached_geometry = _mesh_arrays(_load_trimesh(path))
+                if mesh_geometry_cache is not None:
+                    mesh_geometry_cache[cache_key] = cached_geometry
+            binding = (
+                str(relative),
+                position,
+                scale,
+                tuple(float(value) for value in rotation.reshape(-1)),
+            )
             if binding not in seen_mesh_bindings:
                 seen_mesh_bindings.add(binding)
-                mesh = _load_trimesh(path)
-                vertices, faces = _mesh_arrays(mesh)
+                vertices, faces = cached_geometry
                 vertices = vertices * np.asarray(scale, dtype=np.float64)
-                rotation = (
-                    quaternion_matrix_xyzw(quaternion)
-                    if "quaternion" in current
-                    else euler_xyz_matrix_degrees(current.get("euler", [0.0, 0.0, 0.0]))
-                )
                 friction, restitution = _fixture_material(fixture, "mesh")
                 components.append(
                     SurfaceComponent(
@@ -1285,6 +1313,10 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
     training_records: list[dict[str, Any]] = []
     point_records: list[dict[str, Any]] = []
     group_audits: list[dict[str, Any]] = []
+    fixture_component_cache: dict[str, list[SurfaceComponent]] = {}
+    mesh_geometry_cache: dict[
+        tuple[Path, str], tuple[np.ndarray, np.ndarray]
+    ] = {}
 
     for group_index, group in enumerate(groups, 1):
         group_id = str(group["group_id"])
@@ -1320,11 +1352,18 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
             object_record["collision_proxy"], group_rng
         )
         fixture_sha = str(base_metadata["physics"]["fixture"]["sha256"])
-        fixture_path = release_root / "base" / "fixtures" / f"{fixture_sha}.json"
-        if not fixture_path.is_file() or sha256_file(fixture_path) != fixture_sha:
-            raise ValueError(f"fixture payload is missing or hash-invalid: {fixture_path}")
-        fixture = _json(fixture_path)
-        components = fixture_components(fixture, release_root)
+        components = fixture_component_cache.get(fixture_sha)
+        if components is None:
+            fixture_path = release_root / "base" / "fixtures" / f"{fixture_sha}.json"
+            if not fixture_path.is_file() or sha256_file(fixture_path) != fixture_sha:
+                raise ValueError(f"fixture payload is missing or hash-invalid: {fixture_path}")
+            fixture = _json(fixture_path)
+            components = fixture_components(
+                fixture,
+                release_root,
+                mesh_geometry_cache,
+            )
+            fixture_component_cache[fixture_sha] = components
         environment, environment_report = sample_environment(
             components,
             camera_from_world,
@@ -1387,22 +1426,27 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
 
         base_point_payload: dict[str, np.ndarray] | None = None
         for descriptor, is_base in descriptors:
-            sample_root = _record_path(release_root, descriptor)
-            metadata_path = sample_root / "metadata.json"
-            if sha256_file(metadata_path) != descriptor["metadata_sha256"]:
-                raise ValueError(f"group manifest sample metadata hash mismatch: {sample_root}")
-            metadata = _json(metadata_path)
-            _validate_release_group_sample(
-                base_metadata,
-                metadata,
-                descriptor,
-                group,
-                object_id,
-                is_base,
-            )
-            artifacts = _artifact_paths(sample_root, metadata)
-            trajectory = _trajectory(artifacts["trajectory"], object_id)
-            _validate_t0(metadata, trajectory, object_id)
+            if is_base:
+                metadata = base_metadata
+                artifacts = base_artifacts
+                trajectory = base_trajectory
+            else:
+                sample_root = _record_path(release_root, descriptor)
+                metadata_path = sample_root / "metadata.json"
+                if sha256_file(metadata_path) != descriptor["metadata_sha256"]:
+                    raise ValueError(f"group manifest sample metadata hash mismatch: {sample_root}")
+                metadata = _json(metadata_path)
+                _validate_release_group_sample(
+                    base_metadata,
+                    metadata,
+                    descriptor,
+                    group,
+                    object_id,
+                    False,
+                )
+                artifacts = _artifact_paths(sample_root, metadata)
+                trajectory = _trajectory(artifacts["trajectory"], object_id)
+                _validate_t0(metadata, trajectory, object_id)
             point_payload, roundtrip = build_point_trajectory_payload(
                 trajectory,
                 local_points[None],
