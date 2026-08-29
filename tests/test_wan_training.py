@@ -1,14 +1,22 @@
+from __future__ import annotations
+
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import torch
 from torch import nn
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 
 from conditioning_model import PhyContextConditionEncoder
 from train_wan_formal import (
     configure_training_stage,
     learning_rate_factor,
+    optimizer_groups,
     training_condition_mode,
 )
 from wan_training import (
@@ -19,20 +27,16 @@ from wan_training import (
     inject_cross_attention_lora,
     inject_trajectory_conditioning,
     index_nominal_trajectory_records,
-    is_paired_response_epoch,
     load_condition_checkpoint,
     latent_correspondence_motion,
     latent_correspondence_trajectory,
     latent_motion_supervision_losses,
     lora_parameters,
     make_ti2v_flow_batch,
-    make_complete_sweep_response_batches,
     make_formal_training_batch,
     masked_flow_loss,
     masked_flow_response_loss,
     recover_clean_latents,
-    select_complete_sweep_levels,
-    select_round_robin_records,
     select_sweep_endpoint_pairs,
     select_trajectory_input_records,
     set_direct_condition,
@@ -40,7 +44,6 @@ from wan_training import (
     save_condition_checkpoint,
     source_target_motion_envelope,
     structured_direct_condition,
-    union_motion_masks,
 )
 
 
@@ -101,7 +104,9 @@ class WanTrainingTest(unittest.TestCase):
         )
         configure_training_stage(encoder, model, "trajectory_warmup")
         self.assertEqual(training_condition_mode("trajectory_warmup"), "scene_only")
-        self.assertTrue(any(p.requires_grad for p in encoder.scene_encoder.parameters()))
+        self.assertTrue(
+            any(p.requires_grad for p in encoder.scene_encoder.parameters())
+        )
         for module in (
             encoder.physics_encoder,
             encoder.dynamics_encoder,
@@ -171,7 +176,9 @@ class WanTrainingTest(unittest.TestCase):
             [low, high],
         )
 
-    def test_transport_envelope_supervises_source_removal_and_target_occupancy(self) -> None:
+    def test_transport_envelope_supervises_source_removal_and_target_occupancy(
+        self,
+    ) -> None:
         mask = torch.zeros(1, 3, 4, 6, dtype=torch.uint8)
         mask[:, 0, 2, 1] = 1
         mask[:, 1, 2, 3] = 1
@@ -189,9 +196,7 @@ class WanTrainingTest(unittest.TestCase):
         expected = [item.detach().clone() for item in model(videos)]
         conditioner = inject_trajectory_conditioning(model, rank=3)
         point_maps = [torch.randn(18, 3, 6, 8) for _ in videos]
-        self.assertTrue(
-            set_trajectory_condition(model, point_maps)
-        )
+        self.assertTrue(set_trajectory_condition(model, point_maps))
         actual = model(videos)
         for value, reference in zip(actual, expected):
             torch.testing.assert_close(value, reference)
@@ -287,6 +292,7 @@ class WanTrainingTest(unittest.TestCase):
         self.assertGreater(factors[10], factors[50])
         self.assertGreater(factors[50], factors[-1])
         self.assertGreaterEqual(factors[-1], 0.1)
+        self.assertAlmostEqual(factors[-1], 0.1)
 
     def test_adapter_round_trip_restores_lora_and_condition_encoder(self) -> None:
         source_model = DummyModel()
@@ -318,17 +324,54 @@ class WanTrainingTest(unittest.TestCase):
             target_condition.weight, source_condition.weight
         )
 
-    def test_training_records_rotate_across_base_scenes(self) -> None:
-        records = [
-            {"sample_id": f"{scene}-{index}", "base_scene_id": scene}
-            for scene in ("a", "b", "c")
-            for index in range(3)
-        ]
-        selected = select_round_robin_records(records, 7, 3)
-        self.assertEqual(
-            [record["sample_id"] for record in selected],
-            ["a-0", "b-0", "c-0", "a-1", "b-1", "c-1", "a-2"],
+    def test_optimizer_covers_every_trainable_parameter_exactly_once(self) -> None:
+        model = DummyTrajectoryModel().requires_grad_(False)
+        inject_cross_attention_lora(model, rank=2, alpha=2.0)
+        inject_direct_condition_modulation(
+            model, rank=2, alpha=2.0, input_dim=36, object_slots=3
         )
+        inject_trajectory_conditioning(
+            model, rank=2, representation="das_3d_tracks"
+        )
+        encoder = PhyContextConditionEncoder(
+            hidden_dim=16,
+            context_dim=32,
+            scene_token_count=4,
+            num_heads=4,
+            num_layers=1,
+        )
+        args = SimpleNamespace(
+            encoder_learning_rate=1.0e-4,
+            encoder_weight_decay=0.01,
+            lora_learning_rate=5.0e-5,
+            direct_learning_rate=5.0e-5,
+            trajectory_learning_rate=1.0e-4,
+            trajectory_input=True,
+            training_stage="joint",
+        )
+        groups = optimizer_groups(encoder, model, args)
+        grouped = [
+            parameter for group in groups for parameter in group["params"]
+        ]
+        expected = [
+            parameter
+            for module in (encoder, model)
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        ]
+        self.assertEqual(
+            {id(parameter) for parameter in grouped},
+            {id(parameter) for parameter in expected},
+        )
+        self.assertEqual(
+            len(grouped), len({id(parameter) for parameter in grouped})
+        )
+
+        model.register_parameter(
+            "untracked_trainable", nn.Parameter(torch.ones(1))
+        )
+        with self.assertRaisesRegex(ValueError, "missing from the optimizer"):
+            optimizer_groups(encoder, model, args)
 
     def test_direct_modulation_starts_as_exact_identity_delta(self) -> None:
         model = DummyModel()
@@ -422,6 +465,7 @@ class WanTrainingTest(unittest.TestCase):
             target_model.phycontext_direct_modulator.up[0].weight,
             source_modulator.up[0].weight,
         )
+
     def test_sweep_endpoint_pairs_restore_canonical_base_level(self) -> None:
         axes = ("mass_kg", "contact_friction", "contact_restitution")
         base = {
@@ -456,73 +500,11 @@ class WanTrainingTest(unittest.TestCase):
                 )
         pairs = select_sweep_endpoint_pairs(records, 1)
         self.assertEqual([pair["axis"] for pair in pairs], list(axes))
-        self.assertTrue(all(pair["low"]["sample_id"].endswith("-0") for pair in pairs))
-        self.assertTrue(all(pair["high"]["sample_id"].endswith("-4") for pair in pairs))
-
-    def test_complete_sweep_levels_include_canonical_base_in_order(self) -> None:
-        axes = ("mass_kg", "contact_friction", "contact_restitution")
-        base = {
-            "sample_id": "scene-base",
-            "base_scene_id": "scene",
-            "record": {
-                "sweep": {
-                    "mode": "base",
-                    "axis": None,
-                    "level_count": 5,
-                    "level_index": 2,
-                    "base_level_indices": {axis: 2 for axis in axes},
-                }
-            },
-        }
-        records = [base]
-        for level in (0, 1, 3, 4):
-            records.append(
-                {
-                    "sample_id": f"scene-contact_friction-{level}",
-                    "base_scene_id": "scene",
-                    "record": {
-                        "sweep": {
-                            "mode": "sweep",
-                            "axis": "contact_friction",
-                            "level_count": 5,
-                            "level_index": level,
-                        }
-                    },
-                }
-            )
-        levels = select_complete_sweep_levels(
-            records, "scene", "contact_friction"
+        self.assertTrue(
+            all(pair["low"]["sample_id"].endswith("-0") for pair in pairs)
         )
-        self.assertEqual(
-            [item["sample_id"] for item in levels],
-            [
-                "scene-contact_friction-0",
-                "scene-contact_friction-1",
-                "scene-base",
-                "scene-contact_friction-3",
-                "scene-contact_friction-4",
-            ],
-        )
-
-    def test_complete_sweep_response_batches_cover_local_and_global_changes(self) -> None:
-        levels = [{"sample_id": f"level-{index}"} for index in range(5)]
-        batches = make_complete_sweep_response_batches(levels)
-        self.assertEqual(
-            [[item["sample_id"] for item in batch] for batch in batches],
-            [
-                ["level-0", "level-1"],
-                ["level-1", "level-2"],
-                ["level-2", "level-3"],
-                ["level-3", "level-4"],
-                ["level-0", "level-4"],
-            ],
-        )
-
-    def test_response_schedule_alternates_complete_pair_epochs(self) -> None:
-        flags = [is_paired_response_epoch(step, 3, 2) for step in range(12)]
-        self.assertEqual(
-            flags,
-            [True, True, True, False, False, False] * 2,
+        self.assertTrue(
+            all(pair["high"]["sample_id"].endswith("-4") for pair in pairs)
         )
 
     def test_lora_starts_as_exact_identity_delta(self) -> None:
@@ -536,9 +518,15 @@ class WanTrainingTest(unittest.TestCase):
         torch.testing.assert_close(actual, expected)
         actual.sum().backward()
         active = model.blocks[0].cross_attn.q
-        self.assertTrue(all(parameter.grad is not None for parameter in active.down.parameters()))
-        self.assertTrue(all(parameter.grad is not None for parameter in active.up.parameters()))
-        self.assertTrue(all(parameter.grad is None for parameter in active.base.parameters()))
+        self.assertTrue(
+            all(parameter.grad is not None for parameter in active.down.parameters())
+        )
+        self.assertTrue(
+            all(parameter.grad is not None for parameter in active.up.parameters())
+        )
+        self.assertTrue(
+            all(parameter.grad is None for parameter in active.base.parameters())
+        )
         self.assertEqual(len(list(lora_parameters(model))), 16)
 
     def test_formal_schedule_is_sixty_forty_and_axis_weighted(self) -> None:
@@ -612,7 +600,6 @@ class WanTrainingTest(unittest.TestCase):
         )
         self.assertEqual(mode, "ordinary")
         self.assertIsNone(axis)
-
 
     def test_ti2v_flow_keeps_first_latent_frame_clean(self) -> None:
         latent = torch.randn(4, 5, 6, 8)
@@ -755,17 +742,6 @@ class WanTrainingTest(unittest.TestCase):
         foreground_share = weighted[expanded].sum() / weighted.sum()
         self.assertAlmostEqual(float(foreground_share), 0.75, places=6)
         self.assertAlmostEqual(float(weighted.sum()), float(base.sum()), places=6)
-
-    def test_sweep_motion_union_preserves_per_frame_trajectory_envelope(self) -> None:
-        low = torch.zeros(1, 3, 2, 3, dtype=torch.uint8)
-        high = torch.zeros_like(low)
-        low[:, :, 0, 0] = 1
-        high[:, :, 1, 2] = 1
-        envelope = union_motion_masks([low, high])
-        self.assertEqual(envelope.dtype, torch.uint8)
-        self.assertEqual(int(envelope.sum()), 6)
-        self.assertTrue(torch.equal(envelope[:, :, 0, 0], torch.ones(1, 3)))
-        self.assertTrue(torch.equal(envelope[:, :, 1, 2], torch.ones(1, 3)))
 
     def test_response_loss_matches_low_high_target_delta(self) -> None:
         low = torch.zeros(2, 3, 2, 2)

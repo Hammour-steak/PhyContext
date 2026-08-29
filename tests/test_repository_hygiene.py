@@ -40,7 +40,7 @@ class RepositoryHygieneTest(unittest.TestCase):
     def test_public_payload_has_no_github_oversized_file(self) -> None:
         oversized = []
         for path in self.public_files():
-            if path.stat().st_size >= 95 * 1024 * 1024:
+            if path.is_file() and path.stat().st_size >= 95 * 1024 * 1024:
                 oversized.append(str(path.relative_to(ROOT)))
         self.assertEqual(oversized, [])
 

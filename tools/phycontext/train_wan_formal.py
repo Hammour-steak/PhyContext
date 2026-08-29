@@ -391,6 +391,30 @@ def optimizer_groups(
     missing = sorted(required - names)
     if missing:
         raise ValueError(f"missing optimizer parameter groups: {missing}")
+
+    grouped_parameters = [
+        parameter for group in groups for parameter in group["params"]
+    ]
+    grouped_ids = [id(parameter) for parameter in grouped_parameters]
+    if len(grouped_ids) != len(set(grouped_ids)):
+        raise ValueError("an optimizer parameter appears in more than one group")
+    expected = {
+        id(parameter): f"{prefix}.{name}"
+        for prefix, module in (
+            ("condition_encoder", condition_encoder),
+            ("model", model),
+        )
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad
+    }
+    omitted = sorted(
+        expected[parameter_id] for parameter_id in set(expected) - set(grouped_ids)
+    )
+    if omitted:
+        raise ValueError(
+            "trainable parameters are missing from the optimizer: "
+            + ", ".join(omitted[:10])
+        )
     return groups
 
 
@@ -408,7 +432,8 @@ def learning_rate_factor(
     if step < warmup_steps:
         return (step + 1) / warmup_steps
     decay_steps = max(1, total_steps - warmup_steps)
-    progress = min(1.0, (step - warmup_steps) / decay_steps)
+    decay_intervals = max(1, decay_steps - 1)
+    progress = min(1.0, (step - warmup_steps) / decay_intervals)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return minimum_ratio + (1.0 - minimum_ratio) * cosine
 
@@ -1287,6 +1312,28 @@ def main() -> None:
         )
     if args.steps <= 0 or args.gradient_accumulation <= 0:
         raise ValueError("steps and gradient accumulation must be positive")
+    if args.scene_tokens <= 0:
+        raise ValueError("scene token count must be positive")
+    if min(
+        args.lora_rank,
+        args.modulation_rank,
+        args.trajectory_condition_rank,
+    ) <= 0:
+        raise ValueError("adapter ranks must be positive")
+    if args.lora_alpha <= 0 or args.modulation_alpha <= 0:
+        raise ValueError("adapter alpha values must be positive")
+    if not 0 <= args.warmup_ratio < 1:
+        raise ValueError("warmup ratio must lie in [0, 1)")
+    if not 0 < args.minimum_learning_rate_ratio <= 1:
+        raise ValueError("minimum learning-rate ratio must lie in (0, 1]")
+    if args.encoder_weight_decay < 0:
+        raise ValueError("encoder weight decay must be nonnegative")
+    if args.flow_shift <= 0 or args.max_grad_norm <= 0:
+        raise ValueError("flow shift and maximum gradient norm must be positive")
+    if args.response_loss_weight < 0:
+        raise ValueError("response loss weight must be nonnegative")
+    if args.minimum_response_energy <= 0:
+        raise ValueError("minimum response energy must be positive")
     if args.ordinary_only and args.steps != 1:
         raise ValueError("ordinary-only integration smoke requires exactly one step")
     if (
@@ -1331,7 +1378,8 @@ def main() -> None:
     root = args.project_root.resolve()
     cache_path = (root / args.cache_manifest).resolve()
     output = (root / args.output).resolve()
-    checkpoint = args.checkpoint.resolve()
+    checkpoint = (root / args.checkpoint).resolve()
+    wan_repo = (root / args.wan_repo).resolve()
     try:
         cache = json.loads(cache_path.read_text(encoding="utf-8"))
         cache_representation = cache.get("point_track_preprocess", {}).get(
@@ -1363,6 +1411,10 @@ def main() -> None:
             ],
             args.base_scene_count,
         )
+        if not validation_records and not args.ordinary_only:
+            raise ValueError(
+                "formal response training requires a non-empty validation split"
+            )
         require_complete_cache(
             root, train_records, "train", args.trajectory_representation
         )
@@ -1415,7 +1467,7 @@ def main() -> None:
         np.random.seed(args.seed + rank)
         torch.manual_seed(args.seed + rank)
         torch.cuda.manual_seed(args.seed + rank)
-        sys.path.insert(0, str(args.wan_repo.resolve()))
+        sys.path.insert(0, str(wan_repo))
         from wan.modules.model import WanModel
 
         model = WanModel.from_pretrained(

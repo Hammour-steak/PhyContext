@@ -10,32 +10,6 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 
-def select_round_robin_records(
-    records: list[dict],
-    sample_count: int,
-    base_scene_count: int,
-) -> list[dict]:
-    if sample_count <= 0 or base_scene_count <= 0:
-        raise ValueError("sample and base-scene counts must be positive")
-    groups: dict[str, list[dict]] = {}
-    for record in records:
-        scene_id = record["base_scene_id"]
-        if scene_id not in groups:
-            if len(groups) == base_scene_count:
-                continue
-            groups[scene_id] = []
-        groups[scene_id].append(record)
-    selected = []
-    max_group_size = max((len(group) for group in groups.values()), default=0)
-    for index in range(max_group_size):
-        for group in groups.values():
-            if index < len(group):
-                selected.append(group[index])
-                if len(selected) == sample_count:
-                    return selected
-    return selected
-
-
 SWEEP_AXES = ("mass_kg", "contact_friction", "contact_restitution")
 TRAJECTORY_INPUT_SOURCES = ("target", "nominal_base")
 FORMAL_RESPONSE_AXIS_CYCLE = (
@@ -134,57 +108,6 @@ def select_sweep_endpoint_pairs(
                 }
             )
     return pairs
-
-
-def select_complete_sweep_levels(
-    records: list[dict],
-    base_scene_id: str,
-    axis: str,
-) -> list[dict]:
-    """Return every ordered level for one complete one-factor sweep."""
-    if axis not in SWEEP_AXES:
-        raise ValueError(f"unsupported sweep axis: {axis}")
-    group = [item for item in records if item["base_scene_id"] == base_scene_id]
-    if not group:
-        raise ValueError(f"unknown base scene: {base_scene_id}")
-    base_items = [
-        item for item in group if item["record"]["sweep"]["mode"] == "base"
-    ]
-    if len(base_items) != 1:
-        raise ValueError(f"{base_scene_id} must contain exactly one canonical base record")
-    base_item = base_items[0]
-    base_sweep = base_item["record"]["sweep"]
-    base_level = int(base_sweep["base_level_indices"][axis])
-    levels = {base_level: base_item}
-    for item in group:
-        sweep = item["record"]["sweep"]
-        if sweep.get("axis") != axis:
-            continue
-        level = int(sweep["level_index"])
-        if level in levels:
-            raise ValueError(f"duplicate {base_scene_id}/{axis} level {level}")
-        levels[level] = item
-    expected_count = int(base_sweep["level_count"])
-    if sorted(levels) != list(range(expected_count)):
-        raise ValueError(
-            f"{base_scene_id}/{axis} is incomplete: levels={sorted(levels)}"
-        )
-    return [levels[level] for level in range(expected_count)]
-
-
-def make_complete_sweep_response_batches(levels: list[dict]) -> list[list[dict]]:
-    """Pair adjacent levels plus the global endpoints for continuous control."""
-    if len(levels) < 3:
-        raise ValueError("complete sweep requires at least three ordered levels")
-    batches = [[levels[index], levels[index + 1]] for index in range(len(levels) - 1)]
-    batches.append([levels[0], levels[-1]])
-    return batches
-
-
-def is_paired_response_epoch(step: int, batch_count: int, epoch_interval: int) -> bool:
-    if step < 0 or batch_count <= 0 or epoch_interval <= 0:
-        raise ValueError("response schedule inputs are invalid")
-    return (step // batch_count) % epoch_interval == 0
 
 
 def is_formal_response_step(step: int) -> bool:
@@ -1489,19 +1412,6 @@ def source_target_motion_envelope(motion_mask: torch.Tensor) -> torch.Tensor:
         raise ValueError("motion envelope requires a frame-zero object mask")
     source = source.expand(-1, motion_mask.shape[1], -1, -1)
     return torch.logical_or(source, motion_mask.gt(0)).to(motion_mask.dtype)
-
-
-def union_motion_masks(motion_masks: list[torch.Tensor]) -> torch.Tensor:
-    """Build a per-frame envelope covering every trajectory in one sweep."""
-    if not motion_masks:
-        raise ValueError("at least one motion mask is required")
-    reference_shape = motion_masks[0].shape
-    if any(mask.ndim != 4 or mask.shape != reference_shape for mask in motion_masks):
-        raise ValueError("motion masks must share one C x F x H x W grid")
-    union = motion_masks[0].gt(0)
-    for mask in motion_masks[1:]:
-        union = torch.logical_or(union, mask.gt(0))
-    return union.to(dtype=motion_masks[0].dtype)
 
 
 def masked_flow_response_loss(
