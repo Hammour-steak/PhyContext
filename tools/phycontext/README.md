@@ -46,8 +46,11 @@ python tools/phycontext/adapt_physweep_release.py \
 The dynamic object surface is the simulator's collision proxy because the
 release does not publish its rendered visual mesh. Static points come from the
 released collision fixture, including bound static-prop placement transforms.
-Both choices are recorded in the output provenance; mask overlap is diagnostic,
-not a false claim of visual-mesh equivalence.
+For `asset_proxy_v3`, they also include the simulator's authoritative `z=0`
+environment floor: the release fixture preserves its contact material but not
+the implicit PyBullet plane, so the adapter reconstructs only its in-frame
+camera-frustum footprint. Both choices are recorded in output provenance; mask
+overlap is diagnostic, not a false claim of visual-mesh equivalence.
 
 `train_wan_formal.py` is the only training entry point. Unsupported checkpoint
 contracts are rejected explicitly during audit and inference.

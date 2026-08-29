@@ -29,6 +29,9 @@ than this model-ready contract, run `tools/phycontext/adapt_physweep_release.py`
 It writes a separate `datasets/physweep_training` tree and never writes below the
 release directory. Dynamic surfaces are labeled as simulator collision proxies;
 the adapter does not claim that unpublished rendered object meshes are available.
+Static geometry includes released fixture proxies and any backend-authored
+collision surface that the fixture references but does not serialize, currently
+the authoritative `z=0` asset-proxy environment floor.
 
 ## Maintained Pipeline
 

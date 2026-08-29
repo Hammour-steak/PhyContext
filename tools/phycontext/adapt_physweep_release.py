@@ -477,6 +477,86 @@ def _fixture_material(fixture: dict[str, Any], component_kind: str) -> tuple[flo
     raise ValueError("fixture does not expose friction and restitution for its static geometry")
 
 
+def implicit_environment_components(
+    metadata: dict[str, Any],
+    fixture: dict[str, Any],
+    camera_from_world: np.ndarray,
+    intrinsics: np.ndarray,
+    image_size_px: tuple[int, int] = IMAGE_SIZE_PX,
+) -> list[SurfaceComponent]:
+    """Recover static collision geometry created by a backend but absent from its fixture.
+
+    Asset-proxy simulation creates an authoritative infinite PyBullet plane at
+    world z=0. Its finite render counterpart is the room floor at z=-0.002 m,
+    while the release fixture serializes only the plane's contact material. A
+    camera-frustum footprint is sufficient because the scene conditioner keeps
+    only in-frame static points.
+    """
+    adapter_id = str(
+        metadata.get("physics", {}).get("backend", {}).get("adapter_id", "")
+    )
+    if adapter_id != "asset_proxy_v3":
+        return []
+    ground = fixture.get("physical", {}).get("static_dynamics", {}).get("ground")
+    if not isinstance(ground, dict):
+        raise ValueError("asset-proxy fixture does not expose its implicit ground material")
+    friction = ground.get("contact_friction", ground.get("lateral_friction"))
+    restitution = ground.get("contact_restitution", ground.get("restitution"))
+    if friction is None or restitution is None:
+        raise ValueError("asset-proxy implicit ground material is incomplete")
+
+    transform = np.asarray(camera_from_world, dtype=np.float64)
+    intrinsics = np.asarray(intrinsics, dtype=np.float64)
+    if transform.shape != (4, 4) or intrinsics.shape != (3, 3):
+        raise ValueError("implicit ground requires 4x4 extrinsics and 3x3 intrinsics")
+    rotation = transform[:3, :3]
+    camera_origin_world = -rotation.T @ transform[:3, 3]
+    width, height = image_size_px
+    image_corners = (
+        (0.0, 0.0),
+        (float(width - 1), 0.0),
+        (float(width - 1), float(height - 1)),
+        (0.0, float(height - 1)),
+    )
+    vertices: list[np.ndarray] = []
+    for pixel_x, pixel_y in image_corners:
+        ray_camera = np.asarray(
+            [
+                (pixel_x - intrinsics[0, 2]) / intrinsics[0, 0],
+                -(pixel_y - intrinsics[1, 2]) / intrinsics[1, 1],
+                1.0,
+            ],
+            dtype=np.float64,
+        )
+        ray_world = rotation.T @ ray_camera
+        if abs(float(ray_world[2])) < 1.0e-10:
+            raise ValueError("camera frustum is parallel to the asset-proxy ground")
+        distance = -float(camera_origin_world[2]) / float(ray_world[2])
+        if not np.isfinite(distance) or distance <= 0.0:
+            raise ValueError("asset-proxy ground is not in front of the camera")
+        vertex = camera_origin_world + distance * ray_world
+        vertex[2] = 0.0
+        vertices.append(vertex)
+    vertex_array = np.stack(vertices)
+    faces = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    first_triangle = vertex_array[faces[0]]
+    normal = np.cross(
+        first_triangle[1] - first_triangle[0],
+        first_triangle[2] - first_triangle[0],
+    )
+    if float(normal[2]) < 0.0:
+        faces = faces[:, [0, 2, 1]]
+    return [
+        SurfaceComponent(
+            "implicit/environment_floor",
+            vertex_array,
+            faces,
+            float(friction),
+            float(restitution),
+        )
+    ]
+
+
 def _load_trimesh(path: Path) -> trimesh.Trimesh:
     loaded = trimesh.load(path, force=None, process=False)
     if isinstance(loaded, trimesh.Scene):
@@ -682,6 +762,9 @@ def sample_environment(
     count: int = ENVIRONMENT_POINT_COUNT,
     image_size_px: tuple[int, int] = IMAGE_SIZE_PX,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    component_ids = [component.component_id for component in components]
+    if len(component_ids) != len(set(component_ids)):
+        raise ValueError("fixture surface component ids must be unique")
     areas = np.asarray([component.area_m2 for component in components], dtype=np.float64)
     width, height = image_size_px
     candidate_budget = max(65536, count * 8)
@@ -746,6 +829,7 @@ def sample_environment(
             selected = np.concatenate(
                 [reserved_indices, rng.choice(pool, size=count - len(reserved_indices), replace=False)]
             )
+            selected_part_ids = all_part_ids[selected]
             all_friction = np.concatenate(friction)
             all_restitution = np.concatenate(restitution)
             retained = {
@@ -765,11 +849,19 @@ def sample_environment(
         )
     return retained, {
         "component_count": len(components),
+        "output_component_point_counts": {
+            component_id: int(component_count)
+            for component_id, component_count in zip(
+                component_ids,
+                np.bincount(selected_part_ids, minlength=len(components)),
+                strict=True,
+            )
+        },
         "visible_component_count": len(set(visible_part_ids.tolist())),
         "candidate_budget": int(candidate_budget),
         "zbuffer_visible_candidates": int(len(visible_indices)),
         "output_point_count": int(count),
-        "selection": "full_resolution_global_zbuffer_then_surface_sample_with_component_retention",
+        "selection": "rounded_pixel_candidate_zbuffer_then_surface_sample_with_component_retention",
     }
 
 
@@ -790,6 +882,9 @@ def _validate_release_group_sample(
 ) -> None:
     group_id = str(group["group_id"])
     expected_kind = "base" if is_base else "sweep"
+    objects = metadata.get("physics", {}).get("objects")
+    if not isinstance(objects, list) or len(objects) != 1:
+        raise ValueError("one-object release metadata must contain exactly one physics object")
     if (
         metadata.get("scene_id") != descriptor.get("scene_id")
         or metadata.get("group_id") != group_id
@@ -803,11 +898,22 @@ def _validate_release_group_sample(
     for key in ("backend", "fixture", "solver", "time", "world"):
         if metadata["physics"].get(key) != base_metadata["physics"].get(key):
             raise ValueError(f"physics.{key} changes inside release group {group_id}")
-    if metadata["physics"]["time"] != {
-        "duration_s": 4.0,
-        "output_fps": 24,
-        "simulation_hz": metadata["physics"]["time"]["simulation_hz"],
+    time_contract = metadata["physics"]["time"]
+    if not isinstance(time_contract, dict) or set(time_contract) != {
+        "duration_s",
+        "output_fps",
+        "simulation_hz",
     }:
+        raise ValueError("release sample time contract uses unsupported fields")
+    simulation_hz = time_contract["simulation_hz"]
+    if (
+        time_contract["duration_s"] != 4.0
+        or time_contract["output_fps"] != 24
+        or not isinstance(simulation_hz, int)
+        or isinstance(simulation_hz, bool)
+        or simulation_hz <= 0
+        or simulation_hz % 24 != 0
+    ):
         raise ValueError("release sample must use the 4 s, 24 fps closed-endpoint protocol")
 
     base_object = _find_object(base_metadata, object_id)
@@ -912,8 +1018,11 @@ def _trajectory(path: Path, expected_object_id: str) -> dict[str, np.ndarray]:
         raise ValueError("release trajectory contact counts must be non-negative integers")
     if not np.allclose(np.linalg.norm(quaternion, axis=-1), 1.0, rtol=1.0e-6, atol=1.0e-6):
         raise ValueError("release trajectory quaternions must be unit length")
-    if not np.all(np.diff(time_s) > 0.0) or not np.isclose(time_s[0], 0.0, atol=1.0e-10) or not np.isclose(time_s[-1], 4.0, atol=1.0e-8):
-        raise ValueError("release trajectory time grid must contain closed 0..4 s endpoints")
+    expected_time_s = np.linspace(0.0, 4.0, 97, dtype=np.float64)
+    if not np.allclose(time_s, expected_time_s, rtol=0.0, atol=1.0e-7):
+        raise ValueError(
+            "release trajectory time grid must be the exact closed 24 fps 0..4 s grid"
+        )
     return payload
 
 
@@ -1266,6 +1375,41 @@ def _load_groups(path: Path, selected_ids: set[str], limit: int | None) -> tuple
         raise ValueError("release group manifest has inconsistent group_count")
     if manifest.get("path_base") != "release_parent":
         raise ValueError("release group manifest uses an unsupported path base")
+    group_ids: set[str] = set()
+    sample_ids: set[str] = set()
+    sample_paths: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("release group manifest records must be objects")
+        group_id = str(record.get("group_id", ""))
+        if not group_id or group_id in group_ids:
+            raise ValueError(
+                f"release group manifest has a missing or duplicate group id: {group_id}"
+            )
+        group_ids.add(group_id)
+        sweeps = record.get("sweeps")
+        if not isinstance(sweeps, list):
+            raise ValueError(f"release group {group_id} has an invalid sweep list")
+        descriptors = [record.get("base"), *sweeps]
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                raise ValueError(
+                    f"release group {group_id} has an invalid sample descriptor"
+                )
+            sample_id = str(descriptor.get("scene_id", ""))
+            sample_path = str(descriptor.get("path", ""))
+            if not sample_id or sample_id in sample_ids:
+                raise ValueError(
+                    "release group manifest has a missing or duplicate sample id: "
+                    f"{sample_id}"
+                )
+            if not sample_path or sample_path in sample_paths:
+                raise ValueError(
+                    "release group manifest has a missing or duplicate sample path: "
+                    f"{sample_path}"
+                )
+            sample_ids.add(sample_id)
+            sample_paths.add(sample_path)
     if selected_ids:
         groups = [record for record in records if str(record.get("group_id")) in selected_ids]
         missing = sorted(selected_ids - {str(record.get("group_id")) for record in groups})
@@ -1313,7 +1457,7 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
     training_records: list[dict[str, Any]] = []
     point_records: list[dict[str, Any]] = []
     group_audits: list[dict[str, Any]] = []
-    fixture_component_cache: dict[str, list[SurfaceComponent]] = {}
+    fixture_cache: dict[str, tuple[dict[str, Any], list[SurfaceComponent]]] = {}
     mesh_geometry_cache: dict[
         tuple[Path, str], tuple[np.ndarray, np.ndarray]
     ] = {}
@@ -1352,8 +1496,8 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
             object_record["collision_proxy"], group_rng
         )
         fixture_sha = str(base_metadata["physics"]["fixture"]["sha256"])
-        components = fixture_component_cache.get(fixture_sha)
-        if components is None:
+        cached_fixture = fixture_cache.get(fixture_sha)
+        if cached_fixture is None:
             fixture_path = release_root / "base" / "fixtures" / f"{fixture_sha}.json"
             if not fixture_path.is_file() or sha256_file(fixture_path) != fixture_sha:
                 raise ValueError(f"fixture payload is missing or hash-invalid: {fixture_path}")
@@ -1363,9 +1507,18 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
                 release_root,
                 mesh_geometry_cache,
             )
-            fixture_component_cache[fixture_sha] = components
+            fixture_cache[fixture_sha] = (fixture, components)
+        else:
+            fixture, components = cached_fixture
+        implicit_components = implicit_environment_components(
+            base_metadata,
+            fixture,
+            camera_from_world,
+            intrinsics,
+        )
+        environment_components = [*components, *implicit_components]
         environment, environment_report = sample_environment(
-            components,
+            environment_components,
             camera_from_world,
             intrinsics,
             float(camera["clip_start_m"]),
@@ -1391,7 +1544,11 @@ def adapt(args: argparse.Namespace) -> dict[str, Any]:
             "group_id": group_id,
             "object_ids": [object_id],
             "dynamic_surface_source": "simulation_collision_proxy_not_rendered_visual_mesh",
-            "environment_surface_source": "simulation_static_fixture_collision_geometry",
+            "environment_surface_source": (
+                "simulation_static_fixture_plus_backend_implicit_collision_geometry"
+                if implicit_components
+                else "simulation_static_fixture_collision_geometry"
+            ),
             "coordinate_frame": "camera_right_up_forward",
             "object_point_count": POINT_COUNT,
             "environment_point_count": ENVIRONMENT_POINT_COUNT,

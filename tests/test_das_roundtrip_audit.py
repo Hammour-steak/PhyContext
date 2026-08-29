@@ -14,12 +14,49 @@ sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 
 from audit_das_roundtrip import (  # noqa: E402
     load_cached_das_map,
-    load_nontrivial_alpha_mask,
+    load_nontrivial_mask,
+    raw_object_pose,
+    scene_dynamic_surface_source,
 )
 from audit_point_track_condition import summarize_object  # noqa: E402
 
 
 class DasRoundtripAuditTest(unittest.TestCase):
+    def test_scene_surface_source_reads_collision_proxy_provenance(self) -> None:
+        scene = {
+            "metadata_json": np.asarray(
+                '{"dynamic_surface_source":"simulation_collision_proxy_not_rendered_visual_mesh"}'
+            )
+        }
+
+        self.assertEqual(
+            scene_dynamic_surface_source(scene),
+            "simulation_collision_proxy_not_rendered_visual_mesh",
+        )
+
+    def test_raw_pose_reader_accepts_release_explicit_object_axis(self) -> None:
+        raw = {
+            "object_ids": np.asarray(["object_b", "object_a"]),
+            "position_m": np.arange(18, dtype=np.float64).reshape(3, 2, 3),
+            "quaternion_wxyz": np.arange(24, dtype=np.float64).reshape(3, 2, 4),
+        }
+
+        position, quaternion = raw_object_pose(raw, "object_a")
+
+        np.testing.assert_array_equal(position, raw["position_m"][:, 1])
+        np.testing.assert_array_equal(quaternion, raw["quaternion_wxyz"][:, 1])
+
+    def test_raw_pose_reader_accepts_legacy_flat_object_keys(self) -> None:
+        raw = {
+            "object_a__position_m": np.zeros((3, 3), dtype=np.float64),
+            "object_a__quaternion_wxyz": np.ones((3, 4), dtype=np.float64),
+        }
+
+        position, quaternion = raw_object_pose(raw, "object_a")
+
+        np.testing.assert_array_equal(position, raw["object_a__position_m"])
+        np.testing.assert_array_equal(quaternion, raw["object_a__quaternion_wxyz"])
+
     def test_cached_map_loader_accepts_exact_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "point_track.safetensors"
@@ -52,8 +89,20 @@ class DasRoundtripAuditTest(unittest.TestCase):
             rgba[2:6, 3:7, 3] = 255
             Image.fromarray(rgba, mode="RGBA").save(path)
 
-            alpha = load_nontrivial_alpha_mask(path)
+            alpha = load_nontrivial_mask(path)
 
+            self.assertEqual(alpha.getextrema(), (0, 255))
+
+    def test_mask_loader_accepts_release_grayscale_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mask.png"
+            grayscale = np.zeros((8, 8), dtype=np.uint8)
+            grayscale[2:6, 3:7] = 255
+            Image.fromarray(grayscale, mode="L").save(path)
+
+            alpha = load_nontrivial_mask(path)
+
+            self.assertEqual(alpha.mode, "L")
             self.assertEqual(alpha.getextrema(), (0, 255))
 
     def test_mask_loader_rejects_opaque_alpha(self) -> None:
@@ -64,7 +113,7 @@ class DasRoundtripAuditTest(unittest.TestCase):
             Image.fromarray(rgba, mode="RGBA").save(path)
 
             with self.assertRaisesRegex(ValueError, "nonempty and non-full"):
-                load_nontrivial_alpha_mask(path)
+                load_nontrivial_mask(path)
 
     def test_mask_loader_rejects_rgb_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -73,8 +122,8 @@ class DasRoundtripAuditTest(unittest.TestCase):
                 path
             )
 
-            with self.assertRaisesRegex(ValueError, "no alpha channel"):
-                load_nontrivial_alpha_mask(path)
+            with self.assertRaisesRegex(ValueError, "neither grayscale nor alpha"):
+                load_nontrivial_mask(path)
 
     def test_das_audit_does_not_report_identity_rgb_as_displacement(self) -> None:
         point_map = np.zeros((12, 2, 2, 2), dtype=np.float32)

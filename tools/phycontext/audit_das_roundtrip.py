@@ -40,11 +40,26 @@ def load_cached_das_map(path: Path) -> np.ndarray:
     return tensor.numpy()
 
 
-def load_nontrivial_alpha_mask(path: Path) -> Image.Image:
+def scene_dynamic_surface_source(scene: dict[str, np.ndarray]) -> str:
+    if "metadata_json" not in scene:
+        return "unspecified"
+    try:
+        metadata = json.loads(str(np.asarray(scene["metadata_json"]).reshape(()).item()))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("scene metadata_json is invalid") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError("scene metadata_json must contain an object")
+    return str(metadata.get("dynamic_surface_source", "unspecified"))
+
+
+def load_nontrivial_mask(path: Path) -> Image.Image:
     with Image.open(path) as image:
-        if "A" not in image.getbands():
-            raise ValueError(f"instance mask has no alpha channel: {path}")
-        alpha = image.getchannel("A").copy()
+        if image.mode == "L":
+            alpha = image.copy()
+        elif "A" in image.getbands():
+            alpha = image.getchannel("A").copy()
+        else:
+            raise ValueError(f"instance mask is neither grayscale nor alpha: {path}")
     foreground = np.asarray(alpha) > 0
     if not foreground.any() or foreground.all():
         raise ValueError(f"instance mask must be nonempty and non-full: {path}")
@@ -314,13 +329,59 @@ def dilate_without_wrap(mask: np.ndarray, radius: int) -> np.ndarray:
     return result
 
 
+def raw_object_pose(
+    raw: dict[str, np.ndarray], object_id: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read one pose sequence from either released or legacy trajectory layout."""
+    has_position_axis = "position_m" in raw
+    has_quaternion_axis = "quaternion_wxyz" in raw
+    if has_position_axis != has_quaternion_axis:
+        raise ValueError("raw trajectory has only one explicit-axis pose field")
+    if has_position_axis:
+        if "object_ids" not in raw:
+            raise ValueError("explicit-axis raw trajectory has no object_ids")
+        object_ids = [str(value) for value in np.asarray(raw["object_ids"]).reshape(-1)]
+        if len(object_ids) != len(set(object_ids)):
+            raise ValueError("explicit-axis raw trajectory has duplicate object_ids")
+        if object_id not in object_ids:
+            raise ValueError(f"raw trajectory does not contain object {object_id}")
+        position = np.asarray(raw["position_m"], dtype=np.float64)
+        quaternion = np.asarray(raw["quaternion_wxyz"], dtype=np.float64)
+        if (
+            position.ndim != 3
+            or position.shape[1:] != (len(object_ids), 3)
+            or quaternion.shape != (len(position), len(object_ids), 4)
+        ):
+            raise ValueError("explicit-axis raw trajectory pose arrays have invalid shapes")
+        object_index = object_ids.index(object_id)
+        return position[:, object_index], quaternion[:, object_index]
+
+    position_key = f"{object_id}__position_m"
+    quaternion_key = f"{object_id}__quaternion_wxyz"
+    if position_key not in raw or quaternion_key not in raw:
+        raise ValueError(f"legacy raw trajectory does not contain object {object_id}")
+    position = np.asarray(raw[position_key], dtype=np.float64)
+    quaternion = np.asarray(raw[quaternion_key], dtype=np.float64)
+    if position.ndim != 2 or position.shape[1:] != (3,) or quaternion.shape != (
+        len(position),
+        4,
+    ):
+        raise ValueError("legacy raw trajectory pose arrays have invalid shapes")
+    return position, quaternion
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--point-trajectory", type=Path, required=True)
     parser.add_argument("--scene-condition", type=Path, required=True)
     parser.add_argument("--raw-trajectory", type=Path, required=True)
     parser.add_argument("--point-track-map", type=Path, required=True)
-    parser.add_argument("--mask-root", type=Path, required=True)
+    parser.add_argument(
+        "--mask-root",
+        type=Path,
+        required=True,
+        help="Directory containing frame_####.png for the audited object.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reference-frames", default="0,24,48,72,96")
     return parser.parse_args()
@@ -358,8 +419,9 @@ def main() -> None:
     rigidity_errors = []
     quaternion_norm_errors = []
     for object_index, object_id in enumerate(object_ids):
-        position = np.asarray(raw[f"{object_id}__position_m"], dtype=np.float64)
-        quaternion = np.asarray(raw[f"{object_id}__quaternion_wxyz"], dtype=np.float64)
+        position, quaternion = raw_object_pose(raw, object_id)
+        if len(position) != frame_count:
+            raise ValueError("raw and point trajectory frame counts differ")
         rotations = np.stack([quaternion_wxyz_to_matrix(value) for value in quaternion])
         local = np.einsum(
             "tni,tij->tnj",
@@ -438,7 +500,7 @@ def main() -> None:
     mask_occupancies = []
     image_width, image_height = [int(value) for value in payload["image_size_px"]]
     for frame in range(frame_count):
-        alpha = load_nontrivial_alpha_mask(
+        alpha = load_nontrivial_mask(
             args.mask_root.resolve() / f"frame_{frame + 1:04d}.png"
         )
         mask = np.asarray(alpha) > 0
@@ -562,6 +624,12 @@ def main() -> None:
             np.abs(counterfactual_far - counterfactual_baseline).max()
         ),
     }
+    dynamic_surface_source = scene_dynamic_surface_source(scene)
+    source_mask_alignment = (
+        metrics["point_inside_dilated_mask_min"] >= 0.98
+        and metrics["mask_track_centroid_error_max_px"] <= 16.0
+    )
+    collision_proxy_surface = "collision_proxy" in dynamic_surface_source
     checks = {
         "raw_time": metrics["raw_time_match_max_s"] < 1.0e-7,
         "quaternion_norm": metrics["quaternion_norm_max_error"] < 1.0e-10,
@@ -578,8 +646,6 @@ def main() -> None:
         and metrics["identity_anchor_mismatch_count"] == 0,
         "independent_reference_raster": metrics["reference_raster_max_error"] < 2.0e-6
         and metrics["reference_occupancy_mismatch_count"] == 0,
-        "source_mask_alignment": metrics["point_inside_dilated_mask_min"] >= 0.98
-        and metrics["mask_track_centroid_error_max_px"] <= 16.0,
         "latent_mask_alignment": metrics["latent_occupancy_inside_dilated_mask_min"] >= 0.95,
         "temporal_window_semantics": metrics["temporal_manual_average_max_error"] < 1.0e-7,
         "zero_initialized_adapter": metrics["zero_initialized_residual_max"] == 0.0,
@@ -590,6 +656,17 @@ def main() -> None:
         and metrics["counterfactual_near_static_visible_cells"] == 0
         and metrics["counterfactual_far_static_max_error"] == 0.0,
     }
+    diagnostics = {}
+    advisories = []
+    if collision_proxy_surface:
+        diagnostics["source_mask_alignment"] = {
+            "passed_visual_surface_threshold": source_mask_alignment,
+            "enforcement": "diagnostic_only_for_collision_proxy",
+        }
+        if not source_mask_alignment:
+            advisories.append("collision_proxy_differs_from_unpublished_visual_surface")
+    else:
+        checks["source_mask_alignment"] = source_mask_alignment
     failures = [name for name, passed in checks.items() if not passed]
     report = {
         "schema": "phycontext.das_roundtrip_audit.v1",
@@ -602,8 +679,11 @@ def main() -> None:
             "mask_root": str(args.mask_root.resolve()),
         },
         "reference_frames_zero_based": reference_frames,
+        "dynamic_surface_source": dynamic_surface_source,
         "metrics": metrics,
         "checks": checks,
+        "diagnostics": diagnostics,
+        "advisories": advisories,
         "failures": failures,
         "lossy_boundary": (
             "The 97-to-25 temporal average and latent-cell RGB aggregation are intentionally "

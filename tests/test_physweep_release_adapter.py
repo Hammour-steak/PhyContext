@@ -21,6 +21,7 @@ from adapt_physweep_release import (  # noqa: E402
     build_point_trajectory_payload,
     camera_contract,
     fixture_components,
+    implicit_environment_components,
     quaternion_matrix_wxyz,
     resolve_roots,
     sample_dynamic_proxy,
@@ -231,6 +232,62 @@ class PhysSweepReleaseAdapterTest(unittest.TestCase):
         self.assertEqual(components[0].friction, 0.58)
         self.assertEqual(components[0].restitution, 0.06)
 
+    def test_asset_backend_recovers_authoritative_implicit_ground(self) -> None:
+        camera = {
+            "position_m": [0.0, -4.0, 2.0],
+            "target_m": [0.0, 0.0, 0.8],
+            "focal_length_mm": 48.0,
+            "sensor_width_mm": 36.0,
+        }
+        camera_from_world, intrinsics = camera_contract(camera)
+        metadata = {"physics": {"backend": {"adapter_id": "asset_proxy_v3"}}}
+        fixture = {
+            "physical": {
+                "static_dynamics": {
+                    "ground": {"lateral_friction": 0.75, "restitution": 0.08}
+                }
+            }
+        }
+        components = implicit_environment_components(
+            metadata, fixture, camera_from_world, intrinsics
+        )
+        self.assertEqual(len(components), 1)
+        component = components[0]
+        self.assertEqual(component.component_id, "implicit/environment_floor")
+        self.assertEqual(component.friction, 0.75)
+        self.assertEqual(component.restitution, 0.08)
+        np.testing.assert_allclose(component.vertices_world_m[:, 2], 0.0)
+        normals = np.cross(
+            component.vertices_world_m[component.faces][:, 1]
+            - component.vertices_world_m[component.faces][:, 0],
+            component.vertices_world_m[component.faces][:, 2]
+            - component.vertices_world_m[component.faces][:, 0],
+        )
+        self.assertTrue(np.all(normals[:, 2] > 0.0))
+        projected = _project_camera(
+            (
+                np.einsum(
+                    "ij,nj->ni",
+                    camera_from_world[:3, :3],
+                    component.vertices_world_m,
+                )
+                + camera_from_world[:3, 3]
+            ),
+            intrinsics,
+        )
+        np.testing.assert_allclose(
+            projected,
+            [[0.0, 0.0], [1279.0, 0.0], [1279.0, 719.0], [0.0, 719.0]],
+            atol=1.0e-9,
+        )
+
+    def test_other_backends_do_not_invent_an_implicit_ground(self) -> None:
+        metadata = {"physics": {"backend": {"adapter_id": "generic_rigid_v1"}}}
+        self.assertEqual(
+            implicit_environment_components(metadata, {}, np.eye(4), np.eye(3)),
+            [],
+        )
+
     def test_source_and_output_roots_must_be_disjoint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             dataset = Path(temporary)
@@ -283,6 +340,31 @@ class PhysSweepReleaseAdapterTest(unittest.TestCase):
         _validate_release_group_sample(
             base, base, base_descriptor, group, "object_a", True
         )
+        extra_object = deepcopy(base)
+        extra_object["physics"]["objects"].append(
+            deepcopy(extra_object["physics"]["objects"][0])
+        )
+        extra_object["physics"]["objects"][1]["object_id"] = "object_b"
+        with self.assertRaisesRegex(ValueError, "exactly one physics object"):
+            _validate_release_group_sample(
+                extra_object,
+                extra_object,
+                base_descriptor,
+                group,
+                "object_a",
+                True,
+            )
+        invalid_rate = deepcopy(base)
+        invalid_rate["physics"]["time"]["simulation_hz"] = 239
+        with self.assertRaisesRegex(ValueError, "closed-endpoint protocol"):
+            _validate_release_group_sample(
+                invalid_rate,
+                invalid_rate,
+                base_descriptor,
+                group,
+                "object_a",
+                True,
+            )
         sweep = deepcopy(base)
         sweep.update({"scene_id": "sample_sweep", "sample_kind": "sweep"})
         sweep["physics"]["objects"][0]["material"]["contact_friction"] = 0.8
