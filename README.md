@@ -55,7 +55,12 @@ checkpoints, and inference results stay under this repository's `cache/` and
 conda create --override-channels --channel conda-forge \
   --prefix .venv python=3.10 pip -y
 conda activate "$PWD/.venv"
-pip install -r requirements.txt
+pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
+  torch==2.5.1+cu121 torchvision==0.20.1+cu121
+# flash-attn builds against the active PyTorch/CUDA toolkit. Point CUDA_HOME at
+# a toolkit supported by the installed PyTorch build (11.7 or newer here).
+CUDA_HOME=/path/to/cuda-toolkit \
+  pip install --no-build-isolation -r requirements.txt
 
 export PHYCONTEXT_DATASET_ROOT=/path/to/PhysSweep
 export PHYCONTEXT_WAN_REPO=/path/to/Wan2.2

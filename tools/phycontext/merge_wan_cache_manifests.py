@@ -7,6 +7,8 @@ import argparse
 import json
 from pathlib import Path
 
+from cache_contract import SUPPORTED_CACHE_SCHEMAS
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)

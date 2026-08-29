@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 
 import cache_wan_inputs  # noqa: E402
 import infer_wan_conditioned  # noqa: E402
+import merge_wan_cache_manifests  # noqa: E402
 import train_wan_formal  # noqa: E402
 from video_preprocess import cover_center_crop_frames  # noqa: E402
 from project_defaults import (  # noqa: E402
@@ -57,6 +58,59 @@ class TrainingDefaultTests(unittest.TestCase):
         self.assertEqual(args.manifest, DATASET_MANIFEST)
         self.assertEqual(args.point_trajectory_manifest, POINT_TRAJECTORY_MANIFEST)
         self.assertEqual(args.trajectory_representation, "das_3d_tracks")
+
+    def test_cache_shards_merge_into_source_manifest_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset_root = root / "dataset"
+            dataset_root.mkdir()
+            source_manifest = dataset_root / "manifest.jsonl"
+            source_manifest.write_text(
+                '{"sample_id":"sample_a"}\n{"sample_id":"sample_b"}\n',
+                encoding="utf-8",
+            )
+            common = {
+                "schema": cache_wan_inputs.CACHE_SCHEMA,
+                "dataset_root": str(dataset_root),
+                "source_manifest": "manifest.jsonl",
+            }
+            shard_paths = []
+            for index, sample_id in enumerate(("sample_b", "sample_a")):
+                path = root / f"shard-{index}.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            **common,
+                            "records": [
+                                {
+                                    "sample_id": sample_id,
+                                    "point_track": {"path": f"{sample_id}.safetensors"},
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                shard_paths.append(path)
+            output = root / "manifest.json"
+            argv = [
+                "merge_wan_cache_manifests.py",
+                "--project-root",
+                str(root),
+                "--shard",
+                str(shard_paths[0]),
+                "--shard",
+                str(shard_paths[1]),
+                "--output",
+                str(output),
+            ]
+            with patch.object(sys, "argv", argv):
+                merge_wan_cache_manifests.main()
+            merged = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["sample_id"] for item in merged["records"]],
+                ["sample_a", "sample_b"],
+            )
 
     def test_das_cache_keeps_all_frames_until_the_conditioner(self) -> None:
         indices = cache_wan_inputs.trajectory_frame_indices(

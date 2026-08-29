@@ -12,6 +12,7 @@ from point_trajectory import (  # noqa: E402
     rasterize_das_3d_tracks,
     validate_point_trajectory,
     cover_center_crop_coordinates,
+    project_camera_points,
     unproject_physweep_tracks,
 )
 
@@ -66,6 +67,26 @@ class DasPointTrajectoryTest(unittest.TestCase):
         )
 
         np.testing.assert_allclose(recovered, camera_points, rtol=1.0e-6, atol=1.0e-6)
+
+    def test_serialized_projection_owns_the_image_boundary_contract(self) -> None:
+        point_before_serialization = np.asarray(
+            [[[[np.nextafter(1280.0, -np.inf), 0.0, 1.0]]]],
+            dtype=np.float64,
+        )
+        self.assertLess(float(point_before_serialization[..., 0].item()), 1280.0)
+        serialized_point = point_before_serialization.astype(np.float32)
+        self.assertEqual(float(serialized_point[..., 0].item()), 1280.0)
+
+        tracks, valid = project_camera_points(
+            serialized_point,
+            np.eye(3, dtype=np.float32),
+            (1280, 720),
+            0.03,
+            100.0,
+        )
+
+        self.assertEqual(float(tracks[..., 0].item()), 1280.0)
+        self.assertFalse(bool(valid.item()))
 
     def test_published_payload_geometry_and_projection_are_cross_checked(self) -> None:
         payload = point_payload()

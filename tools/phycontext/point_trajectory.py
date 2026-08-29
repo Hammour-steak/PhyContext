@@ -34,6 +34,70 @@ def _trajectory_metadata(payload: dict[str, np.ndarray]) -> dict:
     return metadata
 
 
+def project_camera_points(
+    points_camera_m: np.ndarray,
+    camera_intrinsics: np.ndarray,
+    image_size_px: np.ndarray | tuple[int, int],
+    clip_start_m: float,
+    clip_end_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project camera points and derive validity from the serialized values."""
+    points_camera = np.asarray(points_camera_m, dtype=np.float64)
+    if points_camera.ndim != 4 or points_camera.shape[-1] != 3:
+        raise ValueError("points_camera_m must have shape [T, O, N, 3]")
+    frame_count = points_camera.shape[0]
+    intrinsic_sequence = np.asarray(camera_intrinsics, dtype=np.float64)
+    if intrinsic_sequence.ndim == 2:
+        if intrinsic_sequence.shape != (3, 3):
+            raise ValueError(
+                "camera_intrinsics must have shape [3, 3] or [T, 3, 3]"
+            )
+        intrinsic_sequence = np.broadcast_to(
+            intrinsic_sequence, (frame_count, 3, 3)
+        )
+    elif intrinsic_sequence.shape != (frame_count, 3, 3):
+        raise ValueError(
+            "camera_intrinsics must have shape [3, 3] or [T, 3, 3]"
+        )
+    image_size = np.asarray(image_size_px).reshape(-1)
+    if (
+        image_size.shape != (2,)
+        or not np.isfinite(image_size).all()
+        or np.any(image_size <= 0)
+        or not np.allclose(image_size, np.rint(image_size))
+    ):
+        raise ValueError(
+            "image_size_px must contain an integer positive width and height"
+        )
+    if not 0.0 <= float(clip_start_m) < float(clip_end_m):
+        raise ValueError("camera clip range is invalid")
+    projection_points = points_camera.copy()
+    projection_points[..., 1] *= -1.0
+    projected = np.einsum(
+        "tij,tonj->toni", intrinsic_sequence, projection_points, optimize=True
+    )
+    tracks = np.zeros(points_camera.shape[:-1] + (2,), dtype=np.float64)
+    nonzero_projection = np.abs(projected[..., 2]) > 1.0e-12
+    np.divide(
+        projected[..., :2],
+        projected[..., 2:3],
+        out=tracks,
+        where=nonzero_projection[..., None],
+    )
+    width, height = [int(value) for value in image_size]
+    valid = (
+        np.isfinite(tracks).all(axis=-1)
+        & np.isfinite(points_camera).all(axis=-1)
+        & (points_camera[..., 2] > float(clip_start_m))
+        & (points_camera[..., 2] < float(clip_end_m))
+        & (tracks[..., 0] >= 0.0)
+        & (tracks[..., 0] < width)
+        & (tracks[..., 1] >= 0.0)
+        & (tracks[..., 1] < height)
+    )
+    return tracks, valid
+
+
 def validate_point_trajectory(payload: dict[str, np.ndarray]) -> None:
     required = {
         "time_s",
@@ -229,23 +293,14 @@ def validate_point_trajectory(payload: dict[str, np.ndarray]) -> None:
                 "points_camera_m does not match camera_from_world and points_world_m"
             )
 
-        intrinsic_sequence = camera_intrinsics
-        if intrinsic_sequence.ndim == 2:
-            intrinsic_sequence = np.broadcast_to(
-                intrinsic_sequence, (frame_count, 3, 3)
-            )
-        projection_points = points_camera.astype(np.float64, copy=True)
-        projection_points[..., 1] *= -1.0
-        projected = np.einsum(
-            "tij,tonj->toni", intrinsic_sequence, projection_points, optimize=True
-        )
-        expected_tracks = np.zeros_like(tracks, dtype=np.float64)
-        nonzero_projection = np.abs(projected[..., 2]) > 1.0e-12
-        np.divide(
-            projected[..., :2],
-            projected[..., 2:3],
-            out=expected_tracks,
-            where=nonzero_projection[..., None],
+        clip_start = float(metadata.get("clip_start_m", 0.03))
+        clip_end = float(metadata.get("clip_end_m", 100.0))
+        expected_tracks, expected_valid = project_camera_points(
+            points_camera,
+            camera_intrinsics,
+            image_size,
+            clip_start,
+            clip_end,
         )
         positive_depth = points_camera[..., 2] > 1.0e-6
         if np.any(positive_depth) and not np.allclose(
@@ -257,21 +312,6 @@ def validate_point_trajectory(payload: dict[str, np.ndarray]) -> None:
             raise ValueError(
                 "tracks_xy_px does not match PhysSweep camera projection"
             )
-        clip_start = float(metadata.get("clip_start_m", 0.03))
-        clip_end = float(metadata.get("clip_end_m", 100.0))
-        if not 0.0 <= clip_start < clip_end:
-            raise ValueError("metadata_json camera clip range is invalid")
-        width, height = [int(value) for value in image_size]
-        expected_valid = (
-            np.isfinite(expected_tracks).all(axis=-1)
-            & np.isfinite(points_camera).all(axis=-1)
-            & (points_camera[..., 2] > clip_start)
-            & (points_camera[..., 2] < clip_end)
-            & (expected_tracks[..., 0] >= 0.0)
-            & (expected_tracks[..., 0] < width)
-            & (expected_tracks[..., 1] >= 0.0)
-            & (expected_tracks[..., 1] < height)
-        )
         if not np.array_equal(valid.astype(bool), expected_valid):
             raise ValueError(
                 "valid does not match PhysSweep in-frame and clip validity"

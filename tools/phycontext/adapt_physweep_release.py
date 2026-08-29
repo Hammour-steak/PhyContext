@@ -38,6 +38,7 @@ from point_trajectory import (
     POINT_TRACK_DEFINITION,
     POINT_TRAJECTORY_SCHEMA,
     POINT_VISIBILITY_DEFINITION,
+    project_camera_points,
     validate_point_trajectory,
 )
 from schema import MANIFEST_SCHEMA, SAMPLE_SCHEMA, SWEEP_AXES, validate_manifest
@@ -293,7 +294,19 @@ def _primitive_spec(record: dict[str, Any]) -> tuple[str, tuple[float, ...]] | N
             raise ValueError("box dimensions must be positive xyz values")
         return "box", tuple(float(value) for value in extents)
     if shape == "sphere":
-        radius = float(record.get("radius_m", 0.0))
+        if "radius_m" in record:
+            radius = float(record["radius_m"])
+        elif "size_m" in record:
+            size = np.asarray(record["size_m"], dtype=np.float64)
+            if size.shape != (3,) or np.any(size <= 0.0):
+                raise ValueError(
+                    "sphere size_m must contain positive xyz diameters"
+                )
+            if float(size.max() - size.min()) > 1.0e-9:
+                raise ValueError("sphere size_m must be isotropic")
+            radius = float(size[0] * 0.5)
+        else:
+            return None
         return ("sphere", (radius,)) if radius > 0.0 else None
     if shape == "cylinder":
         if "radius_m" in record:
@@ -1089,21 +1102,8 @@ def build_point_trajectory_payload(
             rotations[frame, object_index] = quaternion_matrix_wxyz(quaternion[frame, object_index])
     points_world = np.einsum("toij,onj->toni", rotations, local_points_m, optimize=True) + position[:, :, None, :]
     points_camera = _camera_points(points_world, camera_from_world)
-    tracks = _project_camera(points_camera, intrinsics)
-    depth = points_camera[..., 2]
-    width, height = IMAGE_SIZE_PX
     clip_start = float(camera["clip_start_m"])
     clip_end = float(camera["clip_end_m"])
-    valid = (
-        np.isfinite(tracks).all(axis=-1)
-        & np.isfinite(points_camera).all(axis=-1)
-        & (depth > clip_start)
-        & (depth < clip_end)
-        & (tracks[..., 0] >= 0.0)
-        & (tracks[..., 0] < width)
-        & (tracks[..., 1] >= 0.0)
-        & (tracks[..., 1] < height)
-    )
     recovered_local = np.einsum(
         "toij,toni->tonj",
         rotations,
@@ -1135,17 +1135,26 @@ def build_point_trajectory_payload(
         "rigid_roundtrip_max_abs_error_m": rigid_roundtrip_error,
         "camera_roundtrip_max_abs_error_m": camera_roundtrip_error,
     }
+    serialized_points_camera = points_camera.astype(np.float32)
+    serialized_intrinsics = intrinsics.astype(np.float32)
+    serialized_tracks, valid = project_camera_points(
+        serialized_points_camera,
+        serialized_intrinsics,
+        IMAGE_SIZE_PX,
+        clip_start,
+        clip_end,
+    )
     payload = {
         "time_s": time_s.astype(np.float32),
         "object_ids": object_ids,
         "points_world_m": points_world.astype(np.float32),
-        "points_camera_m": points_camera.astype(np.float32),
-        "tracks_xy_px": tracks.astype(np.float32),
-        "depth_m": depth.astype(np.float32),
+        "points_camera_m": serialized_points_camera,
+        "tracks_xy_px": serialized_tracks.astype(np.float32),
+        "depth_m": serialized_points_camera[..., 2],
         "valid": valid,
-        "initial_points_camera_m": points_camera[0].astype(np.float32),
+        "initial_points_camera_m": serialized_points_camera[0],
         "camera_from_world": camera_from_world.astype(np.float32),
-        "camera_intrinsics": intrinsics.astype(np.float32),
+        "camera_intrinsics": serialized_intrinsics,
         "image_size_px": np.asarray(IMAGE_SIZE_PX, dtype=np.int32),
         "metadata_json": np.asarray(json.dumps(metadata, sort_keys=True)),
     }

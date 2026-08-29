@@ -127,7 +127,7 @@ class PhysSweepReleaseAdapterTest(unittest.TestCase):
                     },
                     {
                         "shape": "sphere",
-                        "radius_m": 0.05,
+                        "size_m": [0.1, 0.1, 0.1],
                         "position_m": [-0.1, 0.0, 0.0],
                     },
                 ],
@@ -148,6 +148,20 @@ class PhysSweepReleaseAdapterTest(unittest.TestCase):
                     rtol=0.0,
                     atol=1.0e-12,
                 )
+
+    def test_compound_sphere_requires_isotropic_diameter(self) -> None:
+        proxy = {
+            "type": "compound",
+            "colliders": [
+                {
+                    "shape": "sphere",
+                    "size_m": [0.1, 0.1, 0.2],
+                    "position_m": [0.0, 0.0, 0.0],
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "isotropic"):
+            sample_dynamic_proxy(proxy, np.random.default_rng(0))
 
     def test_rigid_track_export_and_inverse_audits_preserve_point_identity(self) -> None:
         camera = {
