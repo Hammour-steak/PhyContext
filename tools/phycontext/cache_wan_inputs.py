@@ -7,7 +7,6 @@ import os
 import sys
 from pathlib import Path
 
-import cv2
 import numpy as np
 import torch
 from decord import VideoReader, cpu
@@ -35,6 +34,7 @@ from project_defaults import (
     VIDEO_WIDTH,
 )
 from schema import SWEEP_AXES, iter_jsonl
+from video_preprocess import cover_center_crop_frames
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -249,33 +249,6 @@ def select_records(records: list[dict], args: argparse.Namespace) -> list[dict]:
     return selected
 
 
-def cover_center_crop(
-    frames: np.ndarray,
-    width: int,
-    height: int,
-    interpolation: int,
-) -> np.ndarray:
-    source_height, source_width = frames.shape[1:3]
-    scale = max(width / source_width, height / source_height)
-    resized_width = max(width, round(source_width * scale))
-    resized_height = max(height, round(source_height * scale))
-    resized = np.stack(
-        [
-            cv2.resize(
-                frame,
-                (resized_width, resized_height),
-                interpolation=interpolation,
-            )
-            for frame in frames
-        ]
-    )
-    x0 = (resized_width - width) // 2
-    y0 = (resized_height - height) // 2
-    return np.ascontiguousarray(
-        resized[:, y0 : y0 + height, x0 : x0 + width]
-    )
-
-
 def load_video(path: Path, width: int, height: int, frame_count: int) -> torch.Tensor:
     reader = VideoReader(str(path), ctx=cpu(0), num_threads=4)
     if len(reader) == 0:
@@ -284,7 +257,7 @@ def load_video(path: Path, width: int, height: int, frame_count: int) -> torch.T
         evenly_spaced_frame_indices(len(reader), frame_count), dtype=np.int64
     )
     frames = reader.get_batch(indices).asnumpy()
-    cropped = cover_center_crop(frames, width, height, cv2.INTER_AREA)
+    cropped = cover_center_crop_frames(frames, width, height)
     return torch.from_numpy(cropped).permute(3, 0, 1, 2).float().div_(127.5).sub_(1.0)
 
 

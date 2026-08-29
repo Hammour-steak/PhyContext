@@ -10,6 +10,8 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
@@ -17,6 +19,7 @@ sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 import cache_wan_inputs  # noqa: E402
 import infer_wan_conditioned  # noqa: E402
 import train_wan_formal  # noqa: E402
+from video_preprocess import cover_center_crop_frames  # noqa: E402
 from project_defaults import (  # noqa: E402
     CACHE_MANIFEST,
     DATASET_MANIFEST,
@@ -29,6 +32,20 @@ from project_defaults import (  # noqa: E402
 
 
 class TrainingDefaultTests(unittest.TestCase):
+    def test_inference_uses_the_exact_training_resolution(self) -> None:
+        with patch.object(sys, "argv", ["infer_wan_conditioned.py"]):
+            args = infer_wan_conditioned.parse_args()
+        self.assertEqual((args.width, args.height, args.frames), (832, 480, 97))
+        self.assertEqual(args.width % 32, 0)
+        self.assertEqual(args.height % 32, 0)
+
+    def test_first_frame_and_video_share_cover_center_crop(self) -> None:
+        frame = np.zeros((1, 720, 1280, 3), dtype=np.uint8)
+        frame[:, :, :, 0] = np.arange(1280, dtype=np.uint16) % 256
+        processed = cover_center_crop_frames(frame, 832, 480)
+        self.assertEqual(processed.shape, (1, 480, 832, 3))
+        self.assertTrue(processed.flags.c_contiguous)
+
     def test_cache_defaults_are_formal_high_resolution_inputs(self) -> None:
         with patch.object(
             sys,
@@ -240,7 +257,16 @@ class TrainingDefaultTests(unittest.TestCase):
             contract = json.loads(
                 (checkpoint / "input_contract.json").read_text(encoding="utf-8")
             )
+            self.assertEqual(contract["schema"], "phycontext.inference_input_contract.v4")
+            self.assertEqual(
+                (contract["sampling"]["width"], contract["sampling"]["height"]),
+                (832, 480),
+            )
             self.assertEqual(contract["sampling"]["max_area"], 832 * 480)
+            self.assertEqual(
+                contract["sampling"]["spatial_preprocess"],
+                "cover_then_center_crop",
+            )
             self.assertEqual(contract["trajectory"]["protocol"], "target")
             self.assertEqual(
                 contract["trajectory"]["condition_shape"], [12, 97, 30, 52]

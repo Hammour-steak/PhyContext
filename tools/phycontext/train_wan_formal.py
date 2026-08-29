@@ -1101,14 +1101,17 @@ def write_input_contract(checkpoint_root: Path, metadata: dict) -> None:
     cache = json.loads(Path(metadata["cache_manifest"]).read_text(encoding="utf-8"))
     preprocess = cache["preprocess"]
     input_contract = {
-        "schema": "phycontext.inference_input_contract.v3",
+        "schema": "phycontext.inference_input_contract.v4",
         "adapter_sha256": sha256(checkpoint_root / "adapter.safetensors"),
         "base_model_index_sha256": metadata["base_model_index_sha256"],
         "cache_manifest_sha256": metadata["cache_manifest_sha256"],
         "scene_tokens": metadata["scene_tokens"],
         "sampling": {
             "frames": int(preprocess["frames"]),
+            "width": int(preprocess["width"]),
+            "height": int(preprocess["height"]),
             "max_area": int(preprocess["width"]) * int(preprocess["height"]),
+            "spatial_preprocess": "cover_then_center_crop",
             "flow_shift": float(metadata["flow_shift"]),
             "guidance_scale": INFERENCE_GUIDANCE_SCALE,
             "steps": INFERENCE_SAMPLING_STEPS,

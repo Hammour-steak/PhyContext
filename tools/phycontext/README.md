@@ -12,6 +12,11 @@ resolution    832 x 480 x 97 frames
 scene tokens  128
 ```
 
+Training videos and inference first frames use the same shared
+`cover_then_center_crop` transform. Checkpoint input contracts bind the exact
+`832 x 480 x 97` shape; inference rejects any output that resolves to a
+different width, height, or frame count.
+
 The maintained chain is: adapt the immutable release when needed, validate the
 model-ready manifest, cache Wan inputs, merge and audit cache shards, train with
 `train_wan_formal.py`, then infer under the saved run contract. Dataset sampling,

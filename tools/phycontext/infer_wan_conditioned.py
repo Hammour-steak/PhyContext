@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
 from PIL import Image
 from safetensors.torch import load_file
@@ -32,8 +33,10 @@ from project_defaults import (
     INFERENCE_GUIDANCE_SCALE,
     INFERENCE_SAMPLING_STEPS,
     VIDEO_FRAMES,
-    VIDEO_MAX_AREA,
+    VIDEO_HEIGHT,
+    VIDEO_WIDTH,
 )
+from video_preprocess import cover_center_crop_frames
 from wan_training import (
     index_nominal_trajectory_records,
     load_condition_checkpoint,
@@ -107,7 +110,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--angular-velocity-camera", type=float, nargs=3)
     parser.add_argument("--gravity-camera", type=float, nargs=3)
     parser.add_argument("--frames", type=int, default=VIDEO_FRAMES)
-    parser.add_argument("--max-area", type=int, default=VIDEO_MAX_AREA)
+    parser.add_argument("--width", type=int, default=VIDEO_WIDTH)
+    parser.add_argument("--height", type=int, default=VIDEO_HEIGHT)
     parser.add_argument(
         "--sampling-steps", type=int, default=INFERENCE_SAMPLING_STEPS
     )
@@ -145,6 +149,7 @@ def load_and_validate_input_contract(
     if contract.get("schema") not in {
         "phycontext.inference_input_contract.v2",
         "phycontext.inference_input_contract.v3",
+        "phycontext.inference_input_contract.v4",
     }:
         raise ValueError("adapter input contract schema is unsupported")
     contract_trajectory = contract.get("trajectory", {})
@@ -171,7 +176,10 @@ def load_and_validate_input_contract(
     expected_sampling = contract.get("sampling", {})
     requested_sampling = {
         "frames": args.frames,
-        "max_area": args.max_area,
+        "width": args.width,
+        "height": args.height,
+        "max_area": args.width * args.height,
+        "spatial_preprocess": "cover_then_center_crop",
         "flow_shift": args.flow_shift,
         "guidance_scale": args.guide_scale,
         "steps": args.sampling_steps,
@@ -295,8 +303,10 @@ def main() -> None:
     external = validate_external_inputs(args)
     if args.frames < 5 or (args.frames - 1) % 4:
         raise ValueError("frames must have the form 4n+1")
-    if args.max_area <= 0 or args.sampling_steps <= 0:
-        raise ValueError("max-area and sampling-steps must be positive")
+    if args.width <= 0 or args.height <= 0 or args.sampling_steps <= 0:
+        raise ValueError("width, height, and sampling-steps must be positive")
+    if args.width % 32 or args.height % 32:
+        raise ValueError("Wan2.2 TI2V-5B inference width and height must divide by 32")
     root = args.project_root.resolve()
     adapter_root = (root / args.adapter).resolve()
     adapter_metadata = json.loads(
@@ -610,11 +620,16 @@ def main() -> None:
             pipeline.text_encoder, condition_tokens, max_tokens=pipeline.model.text_len
         )
 
-    first_frame = Image.open(first_frame_path).convert("RGB")
+    with Image.open(first_frame_path) as source_first_frame:
+        source_rgb = np.asarray(source_first_frame.convert("RGB"))[None]
+    first_frame = Image.fromarray(
+        cover_center_crop_frames(source_rgb, args.width, args.height)[0],
+        mode="RGB",
+    )
     video = pipeline.generate(
         prompt,
         img=first_frame,
-        max_area=args.max_area,
+        max_area=args.width * args.height,
         frame_num=args.frames,
         shift=args.flow_shift,
         sampling_steps=args.sampling_steps,
@@ -635,8 +650,14 @@ def main() -> None:
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     capture.release()
-    if frame_count != args.frames or width <= 0 or height <= 0:
-        raise RuntimeError("saved inference video failed structural validation")
+    if (
+        frame_count != args.frames
+        or width != args.width
+        or height != args.height
+    ):
+        raise RuntimeError(
+            "saved inference video does not match the exact training resolution"
+        )
     if controls.ndim == 1:
         controls_report = {
             "mass_kg": float(controls[0].cpu()),
@@ -684,7 +705,7 @@ def main() -> None:
             ],
         }
     report = {
-        "schema": "phycontext.conditioned_inference.v2",
+        "schema": "phycontext.conditioned_inference.v3",
         "sample_id": sample_id,
         "input_source": input_source,
         "first_frame": report_path(first_frame_path, root),
@@ -727,6 +748,7 @@ def main() -> None:
         "frames": frame_count,
         "width": width,
         "height": height,
+        "spatial_preprocess": "cover_then_center_crop",
         "sampling_steps": args.sampling_steps,
         "seed": args.seed,
         "video": report_path(output, root),
