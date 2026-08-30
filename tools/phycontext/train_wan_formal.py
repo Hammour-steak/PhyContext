@@ -27,8 +27,10 @@ from cache_contract import (
     resolve_cache_artifact_root,
     resolve_cache_dataset_root,
     validate_cache_artifact,
+    validate_cache_record_coverage,
     validate_cache_source_manifest,
 )
+from schema import iter_jsonl
 from project_defaults import CACHE_MANIFEST, SCENE_TOKEN_COUNT
 from project_defaults import INFERENCE_GUIDANCE_SCALE, INFERENCE_SAMPLING_STEPS
 from conditioning_model import (
@@ -1116,7 +1118,7 @@ def adapter_metadata(
         },
         "motion_supervision": {
             "enabled": True,
-            "mask_source": "trajectory_visibility_derived_transport_envelope",
+            "mask_source": "trajectory_visibility_derived_current_occupancy",
             "foreground_share": args.motion_foreground_share,
             "reconstruction_region": "source_plus_per_frame_target_transport_envelope",
             "pair_region": "low_high_source_target_transport_union",
@@ -1436,6 +1438,18 @@ def validate_resume_contract(
         )
 
 
+def validate_adapter_base_model(metadata: dict, checkpoint: Path) -> None:
+    """Bind an initialized or resumed adapter to the exact Wan checkpoint."""
+    expected = metadata.get("base_model_index_sha256")
+    if not expected:
+        raise ValueError("source adapter is missing its base-model identity")
+    model_index = checkpoint / "diffusion_pytorch_model.safetensors.index.json"
+    if not model_index.is_file():
+        raise FileNotFoundError(f"missing base-model index: {model_index}")
+    if sha256(model_index) != expected:
+        raise ValueError("source adapter belongs to a different Wan base model")
+
+
 def main() -> None:
     args = parse_args()
     if args.resume is not None and args.initialize_adapter is not None:
@@ -1541,7 +1555,12 @@ def main() -> None:
                 "full-rate das_3d_tracks training requires the current Wan cache "
                 f"schema {CURRENT_CACHE_SCHEMA}"
             )
-        validate_cache_source_manifest(root, cache)
+        source_manifest = validate_cache_source_manifest(root, cache)
+        validate_cache_record_coverage(
+            cache,
+            list(iter_jsonl(source_manifest)),
+            label="formal training cache",
+        )
         dataset_root = resolve_cache_dataset_root(root, cache)
         artifact_root = resolve_cache_artifact_root(root, cache)
         scene_size_px = (
@@ -1643,6 +1662,10 @@ def main() -> None:
         previous = None
         if adapter_source is not None:
             source = (root / adapter_source).resolve()
+            source_metadata = json.loads(
+                (source / "adapter.json").read_text(encoding="utf-8")
+            )
+            validate_adapter_base_model(source_metadata, checkpoint)
             previous = load_condition_checkpoint(source, model, condition_encoder)
             if (
                 int(previous["scene_tokens"]) != args.scene_tokens

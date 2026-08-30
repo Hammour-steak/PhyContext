@@ -243,7 +243,62 @@ def validate_external_inputs(args: argparse.Namespace) -> bool:
         raise ValueError(f"external inference is missing: {', '.join(missing)}")
     if not args.text.strip():
         raise ValueError("external inference text must not be empty")
+    validate_external_physics(args)
     return True
+
+
+def validate_external_physics(args: argparse.Namespace) -> None:
+    """Validate external physical inputs before loading the 5B model."""
+    inertia = np.asarray(
+        args.inertia_tensor_camera_kg_m2, dtype=np.float64
+    ).reshape(3, 3)
+    vectors = np.asarray(
+        [
+            *args.linear_velocity_camera,
+            *args.angular_velocity_camera,
+            *args.gravity_camera,
+        ],
+        dtype=np.float64,
+    )
+    scalars = np.asarray(
+        [
+            args.mass_kg,
+            args.contact_friction,
+            args.restitution,
+            args.rolling_friction,
+            args.spinning_friction,
+            args.linear_damping,
+            args.angular_damping,
+        ],
+        dtype=np.float64,
+    )
+    if (
+        not np.isfinite(inertia).all()
+        or not np.isfinite(vectors).all()
+        or not np.isfinite(scalars).all()
+    ):
+        raise ValueError("external physical inputs must be finite")
+    if (
+        args.mass_kg <= 0
+        or args.contact_friction < 0
+        or not 0 <= args.restitution <= 1
+    ):
+        raise ValueError(
+            "controls require mass > 0, friction >= 0, restitution in [0, 1]"
+        )
+    dissipative = (
+        args.rolling_friction,
+        args.spinning_friction,
+        args.linear_damping,
+        args.angular_damping,
+    )
+    if any(value < 0 for value in dissipative):
+        raise ValueError("friction and damping terms must be nonnegative")
+    scale = max(float(np.abs(inertia).max()), 1.0e-15)
+    if not np.allclose(inertia, inertia.T, rtol=0.0, atol=scale * 1.0e-7):
+        raise ValueError("inertia tensor must be symmetric")
+    if float(np.linalg.eigvalsh(inertia).min()) <= 0.0:
+        raise ValueError("inertia tensor must be positive definite")
 
 
 def validate_parameter_trajectory_consistency(
@@ -496,15 +551,17 @@ def main() -> None:
     overrides = (args.mass_kg, args.contact_friction, args.restitution)
     if external:
         controls = torch.tensor(overrides, dtype=torch.float32, device=device)
-        inertia = args.inertia_tensor_camera_kg_m2
+        inertia = np.asarray(
+            args.inertia_tensor_camera_kg_m2, dtype=np.float64
+        ).reshape(3, 3)
         dynamics = torch.tensor(
             [
-                inertia[0],
-                inertia[4],
-                inertia[8],
-                inertia[1],
-                inertia[2],
-                inertia[5],
+                inertia[0, 0],
+                inertia[1, 1],
+                inertia[2, 2],
+                inertia[0, 1],
+                inertia[0, 2],
+                inertia[1, 2],
                 args.rolling_friction,
                 args.spinning_friction,
                 args.linear_damping,

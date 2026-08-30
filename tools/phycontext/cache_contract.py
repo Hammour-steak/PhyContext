@@ -40,6 +40,134 @@ SUPPORTED_CACHE_SCHEMAS = frozenset(
 )
 
 
+def select_cache_source_records(
+    source_records: list[dict], selection: dict | None
+) -> list[dict]:
+    """Reproduce the source-record selection recorded by cache generation."""
+    records = list(source_records)
+    source_ids = [record.get("sample_id") for record in records]
+    if any(not sample_id for sample_id in source_ids):
+        raise ValueError("source manifest contains an empty sample_id")
+    if len(set(source_ids)) != len(source_ids):
+        raise ValueError("source manifest contains duplicate sample_ids")
+    if selection is None:
+        return records
+    if not isinstance(selection, dict):
+        raise ValueError("Wan cache selection must be an object")
+    if selection.get("mode") == "merged_shards":
+        shard_selections = selection.get("shard_selections")
+        if not isinstance(shard_selections, list) or not shard_selections:
+            # Older merged manifests did not preserve the individual shard
+            # selections. They were intended to cover the full source manifest.
+            return records
+        expected_ids = {
+            record["sample_id"]
+            for shard_selection in shard_selections
+            for record in select_cache_source_records(records, shard_selection)
+        }
+        return [record for record in records if record["sample_id"] in expected_ids]
+
+    selected = records
+    split = selection.get("split")
+    if split:
+        selected = [record for record in selected if record["split"] == split]
+    requested_scene_ids = set(selection.get("base_scene_ids") or [])
+    if requested_scene_ids:
+        known_scene_ids = {record["base_scene_id"] for record in selected}
+        missing_scene_ids = sorted(requested_scene_ids - known_scene_ids)
+        if missing_scene_ids:
+            raise ValueError(
+                f"cache selection contains unknown base scenes: {missing_scene_ids[:5]}"
+            )
+        selected = [
+            record
+            for record in selected
+            if record["base_scene_id"] in requested_scene_ids
+        ]
+    sweep_axis = selection.get("sweep_axis")
+    if sweep_axis:
+        selected = [
+            record
+            for record in selected
+            if record["sweep"]["mode"] == "base"
+            or record["sweep"]["axis"] == sweep_axis
+        ]
+    limit_base_scenes = selection.get("limit_base_scenes")
+    if limit_base_scenes is not None:
+        limit_base_scenes = int(limit_base_scenes)
+        if limit_base_scenes <= 0:
+            raise ValueError("cache selection limit_base_scenes must be positive")
+        scene_ids = list(
+            dict.fromkeys(record["base_scene_id"] for record in selected)
+        )[:limit_base_scenes]
+        allowed_scene_ids = set(scene_ids)
+        selected = [
+            record
+            for record in selected
+            if record["base_scene_id"] in allowed_scene_ids
+        ]
+
+    shard_count = int(selection.get("shard_count", 1))
+    shard_index = int(selection.get("shard_index", 0))
+    if shard_count <= 0 or not 0 <= shard_index < shard_count:
+        raise ValueError("cache selection has an invalid shard index/count")
+    scene_ids = list(dict.fromkeys(record["base_scene_id"] for record in selected))
+    shard_scene_ids = {
+        scene_id
+        for index, scene_id in enumerate(scene_ids)
+        if index % shard_count == shard_index
+    }
+    selected = [
+        record for record in selected if record["base_scene_id"] in shard_scene_ids
+    ]
+    limit = selection.get("limit")
+    if limit is not None:
+        limit = int(limit)
+        if limit <= 0:
+            raise ValueError("cache selection limit must be positive")
+        selected = selected[:limit]
+    return selected
+
+
+def validate_cache_record_coverage(
+    cache: dict,
+    source_records: list[dict],
+    *,
+    label: str = "Wan cache",
+) -> None:
+    """Require exactly one cached record for every selected source record."""
+    cache_records = cache.get("records")
+    if not isinstance(cache_records, list):
+        raise ValueError(f"{label} records must be a list")
+    actual_ids = [item.get("sample_id") for item in cache_records]
+    if any(not sample_id for sample_id in actual_ids):
+        raise ValueError(f"{label} contains an empty sample_id")
+    if len(set(actual_ids)) != len(actual_ids):
+        raise ValueError(f"{label} contains duplicate sample_ids")
+    expected_records = select_cache_source_records(
+        source_records, cache.get("selection")
+    )
+    expected_ids = [record["sample_id"] for record in expected_records]
+    missing = sorted(set(expected_ids) - set(actual_ids))
+    unexpected = sorted(set(actual_ids) - set(expected_ids))
+    if missing or unexpected:
+        raise ValueError(
+            f"{label} record coverage mismatch: expected={len(expected_ids)}, "
+            f"actual={len(actual_ids)}, missing={missing[:5]}, "
+            f"unexpected={unexpected[:5]}"
+        )
+    expected_by_id = {
+        record["sample_id"]: record for record in expected_records
+    }
+    changed = [
+        item["sample_id"]
+        for item in cache_records
+        if item.get("record") != expected_by_id[item["sample_id"]]
+    ]
+    if changed:
+        raise ValueError(f"{label} embeds changed source records: {changed[:5]}")
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:

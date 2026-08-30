@@ -19,6 +19,7 @@ from cache_contract import (
     SUPPORTED_CACHE_SCHEMAS,
     resolve_cache_artifact_root,
     resolve_cache_dataset_root,
+    validate_cache_record_coverage,
     validate_cache_source_manifest,
 )
 
@@ -109,9 +110,14 @@ def main() -> None:
             or sha256(reused_cache) != cache["reused_cache_manifest_sha256"]
         ):
             errors.append("reused cache manifest hash mismatch")
+    source_record_list = list(iter_jsonl(source_manifest))
     source_records = {
-        record["sample_id"]: record for record in iter_jsonl(source_manifest)
+        record["sample_id"]: record for record in source_record_list
     }
+    try:
+        validate_cache_record_coverage(cache, source_record_list)
+    except ValueError as error:
+        errors.append(str(error))
     expected_shape = (
         48,
         (int(cache["preprocess"]["frames"]) - 1) // 4 + 1,

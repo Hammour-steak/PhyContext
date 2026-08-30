@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -155,8 +156,12 @@ class TrainingDefaultTests(unittest.TestCase):
             dataset_root = root / "dataset"
             dataset_root.mkdir()
             source_manifest = dataset_root / "manifest.jsonl"
+            source_records = [
+                {"sample_id": "sample_a", "base_scene_id": "scene_a"},
+                {"sample_id": "sample_b", "base_scene_id": "scene_b"},
+            ]
             source_manifest.write_text(
-                '{"sample_id":"sample_a"}\n{"sample_id":"sample_b"}\n',
+                "".join(json.dumps(record) + "\n" for record in source_records),
                 encoding="utf-8",
             )
             common = {
@@ -164,16 +169,33 @@ class TrainingDefaultTests(unittest.TestCase):
                 "dataset_root": str(dataset_root),
                 "source_manifest": "manifest.jsonl",
             }
-            shard_paths = []
-            for index, sample_id in enumerate(("sample_b", "sample_a")):
-                path = root / f"shard-{index}.json"
+            source_by_id = {
+                record["sample_id"]: record for record in source_records
+            }
+            shard_paths = {}
+            for file_index, (shard_index, sample_id) in enumerate(
+                ((1, "sample_b"), (0, "sample_a"))
+            ):
+                path = root / f"shard-{file_index}.json"
                 path.write_text(
                     json.dumps(
                         {
                             **common,
+                            "selection": {
+                                "split": None,
+                                "base_scene_ids": [],
+                                "sweep_axis": None,
+                                "limit_base_scenes": None,
+                                "limit": None,
+                                "shard_count": 2,
+                                "shard_index": shard_index,
+                            },
                             "records": [
                                 {
                                     "sample_id": sample_id,
+                                    "record": source_by_id[sample_id],
+                                    "latent": {"path": f"latent/{sample_id}"},
+                                    "text_context": {"path": f"text/{sample_id}"},
                                     "point_track": {"path": f"{sample_id}.safetensors"},
                                 }
                             ],
@@ -181,16 +203,16 @@ class TrainingDefaultTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                shard_paths.append(path)
+                shard_paths[shard_index] = path
             output = root / "manifest.json"
             argv = [
                 "merge_wan_cache_manifests.py",
                 "--project-root",
                 str(root),
                 "--shard",
-                str(shard_paths[0]),
-                "--shard",
                 str(shard_paths[1]),
+                "--shard",
+                str(shard_paths[0]),
                 "--output",
                 str(output),
             ]
@@ -201,6 +223,28 @@ class TrainingDefaultTests(unittest.TestCase):
                 [item["sample_id"] for item in merged["records"]],
                 ["sample_a", "sample_b"],
             )
+            self.assertEqual(
+                merged["selection"]["expected_sample_count"], 2
+            )
+
+            incomplete_path = root / "incomplete-shard-1.json"
+            incomplete = json.loads(shard_paths[1].read_text(encoding="utf-8"))
+            incomplete["records"] = []
+            incomplete_path.write_text(json.dumps(incomplete), encoding="utf-8")
+            incomplete_argv = [
+                "merge_wan_cache_manifests.py",
+                "--project-root",
+                str(root),
+                "--shard",
+                str(shard_paths[0]),
+                "--shard",
+                str(incomplete_path),
+                "--output",
+                str(root / "incomplete.json"),
+            ]
+            with patch.object(sys, "argv", incomplete_argv):
+                with self.assertRaisesRegex(ValueError, "coverage mismatch"):
+                    merge_wan_cache_manifests.main()
 
     def test_das_cache_keeps_all_frames_until_the_conditioner(self) -> None:
         indices = cache_wan_inputs.trajectory_frame_indices(
@@ -463,6 +507,83 @@ class TrainingDefaultTests(unittest.TestCase):
         infer_wan_conditioned.validate_parameter_trajectory_consistency(
             args, external=False, trajectory_requested=False
         )
+
+    def test_external_physics_rejects_invalid_inertia_and_damping(self) -> None:
+        valid = SimpleNamespace(
+            inertia_tensor_camera_kg_m2=[
+                1.0,
+                0.1,
+                0.0,
+                0.1,
+                1.2,
+                0.0,
+                0.0,
+                0.0,
+                0.8,
+            ],
+            linear_velocity_camera=[0.0, 0.0, 0.0],
+            angular_velocity_camera=[0.0, 0.0, 0.0],
+            gravity_camera=[0.0, -9.81, 0.0],
+            mass_kg=1.0,
+            contact_friction=0.5,
+            restitution=0.2,
+            rolling_friction=0.01,
+            spinning_friction=0.01,
+            linear_damping=0.02,
+            angular_damping=0.02,
+        )
+        infer_wan_conditioned.validate_external_physics(valid)
+
+        nonsymmetric = SimpleNamespace(**vars(valid))
+        nonsymmetric.inertia_tensor_camera_kg_m2 = [
+            1.0,
+            0.2,
+            0.0,
+            0.1,
+            1.2,
+            0.0,
+            0.0,
+            0.0,
+            0.8,
+        ]
+        with self.assertRaisesRegex(ValueError, "symmetric"):
+            infer_wan_conditioned.validate_external_physics(nonsymmetric)
+
+        indefinite = SimpleNamespace(**vars(valid))
+        indefinite.inertia_tensor_camera_kg_m2 = [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            -0.1,
+        ]
+        with self.assertRaisesRegex(ValueError, "positive definite"):
+            infer_wan_conditioned.validate_external_physics(indefinite)
+
+        negative_damping = SimpleNamespace(**vars(valid))
+        negative_damping.angular_damping = -0.01
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            infer_wan_conditioned.validate_external_physics(negative_damping)
+
+    def test_initialized_adapter_is_bound_to_the_wan_base_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory)
+            model_index = (
+                checkpoint
+                / "diffusion_pytorch_model.safetensors.index.json"
+            )
+            model_index.write_bytes(b"base-model-index")
+            metadata = {
+                "base_model_index_sha256": train_wan_formal.sha256(model_index)
+            }
+            train_wan_formal.validate_adapter_base_model(metadata, checkpoint)
+            metadata["base_model_index_sha256"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "different Wan base model"):
+                train_wan_formal.validate_adapter_base_model(metadata, checkpoint)
 
     def test_checkpoint_input_contract_records_high_resolution_protocol(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

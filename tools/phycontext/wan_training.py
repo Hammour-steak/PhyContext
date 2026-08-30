@@ -354,11 +354,12 @@ def motion_mask_from_point_track_map(
     point_track_map: torch.Tensor,
     representation: str | None = None,
 ) -> torch.Tensor:
-    """Build a training-only motion envelope from point-track occupancy.
+    """Build latent-rate current occupancy from point-track visibility.
 
-    Point-track maps are the model condition.  This derived mask is used only
-    by auxiliary reconstruction/motion losses, so point-track training does
-    not need a second Blender-rendered mask artifact.
+    The trajectory auxiliary losses need the object's position at each target
+    frame, not the union of that position with frame zero.  Reconstruction and
+    response losses expand this mask with ``source_target_motion_envelope`` at
+    their call sites when they need to cover both removal and arrival regions.
     """
     if point_track_map.ndim != 4:
         raise ValueError("point-track map must have shape C x F x H x W")
@@ -380,7 +381,6 @@ def motion_mask_from_point_track_map(
         [point_track_map], representation
     )[0]
     if representation == "dense_point_tracks":
-        source = point_track_map[0::6].amax(dim=0)
         current = point_track_map[1::6].amax(dim=0)
     else:
         visibility = point_track_map[3::4]
@@ -402,9 +402,7 @@ def motion_mask_from_point_track_map(
                 ),
                 dim=0,
             )
-        source = full_current[:1].expand_as(current)
-    envelope = torch.maximum(source, current).gt(0)
-    return envelope.unsqueeze(0).to(dtype=point_track_map.dtype)
+    return current.gt(0).unsqueeze(0).to(dtype=point_track_map.dtype)
 
 
 class TrajectoryPatchConditioner(nn.Module):

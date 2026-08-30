@@ -7,7 +7,10 @@ import argparse
 import json
 from pathlib import Path
 
-from cache_contract import SUPPORTED_CACHE_SCHEMAS
+from cache_contract import (
+    SUPPORTED_CACHE_SCHEMAS,
+    validate_cache_record_coverage,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +34,30 @@ def portable_path(path: Path, root: Path) -> str:
         return path.relative_to(root).as_posix()
     except ValueError:
         return path.as_posix()
+
+
+def validated_shard_selections(payloads: list[dict]) -> list[dict] | None:
+    selections = [payload.get("selection") for payload in payloads]
+    if all(selection is None for selection in selections):
+        return None
+    if any(not isinstance(selection, dict) for selection in selections):
+        raise ValueError("cache shards must all record their selection settings")
+    counts = {int(selection["shard_count"]) for selection in selections}
+    if counts != {len(payloads)}:
+        raise ValueError("cache shard_count does not match the supplied shard set")
+    indices = [int(selection["shard_index"]) for selection in selections]
+    if sorted(indices) != list(range(len(payloads))):
+        raise ValueError("cache shards must contain every shard index exactly once")
+    common = {
+        key: value for key, value in selections[0].items() if key != "shard_index"
+    }
+    for selection in selections[1:]:
+        candidate = {
+            key: value for key, value in selection.items() if key != "shard_index"
+        }
+        if candidate != common:
+            raise ValueError("cache shards use different source selection filters")
+    return sorted(selections, key=lambda item: int(item["shard_index"]))
 
 
 def main() -> None:
@@ -67,6 +94,7 @@ def main() -> None:
         for path, payload in zip(shards[1:], payloads[1:]):
             if payload.get(key) != expected:
                 raise ValueError(f"cache shard invariant mismatch for {key}: {path}")
+    shard_selections = validated_shard_selections(payloads)
     records = {}
     for path, payload in zip(shards, payloads):
         for record in payload.get("records", []):
@@ -75,8 +103,15 @@ def main() -> None:
                 raise ValueError(f"record without sample_id: {path}")
             if sample_id in records:
                 raise ValueError(f"duplicate sample_id across shards: {sample_id}")
-            if "point_track" not in record:
-                raise ValueError(f"incomplete point-track record: {sample_id}")
+            required_descriptors = ("record", "latent", "text_context", "point_track")
+            missing_descriptors = [
+                key for key in required_descriptors if key not in record
+            ]
+            if missing_descriptors:
+                raise ValueError(
+                    f"incomplete cache record {sample_id}: "
+                    f"missing {missing_descriptors}"
+                )
             records[sample_id] = record
 
     dataset_root = Path(first["dataset_root"])
@@ -92,6 +127,11 @@ def main() -> None:
     unknown = sorted(set(records) - set(source_order))
     if unknown:
         raise ValueError(f"cache contains samples absent from source manifest: {unknown[:5]}")
+    if shard_selections is not None:
+        for path, payload in zip(shards, payloads):
+            validate_cache_record_coverage(
+                payload, source_records, label=f"cache shard {path}"
+            )
 
     merged = dict(first)
     merged["selection"] = {
@@ -99,7 +139,11 @@ def main() -> None:
         "shard_count": len(shards),
         "shards": [portable_path(path, root) for path in shards],
     }
+    if shard_selections is not None:
+        merged["selection"]["shard_selections"] = shard_selections
     merged["records"] = sorted(records.values(), key=lambda item: source_order[item["sample_id"]])
+    validate_cache_record_coverage(merged, source_records, label="merged Wan cache")
+    merged["selection"]["expected_sample_count"] = len(merged["records"])
     output = args.output if args.output.is_absolute() else root / args.output
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)

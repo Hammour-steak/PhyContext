@@ -11,7 +11,9 @@ sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 from conditioning_model import PhyContextConditionEncoder  # noqa: E402
 from wan_training import (  # noqa: E402
     TrajectoryPatchConditioner,
+    latent_correspondence_motion,
     motion_mask_from_point_track_map,
+    source_target_motion_envelope,
     validate_point_track_object_slots,
     structured_direct_condition,
 )
@@ -134,16 +136,30 @@ class MultiObjectConditioningTest(unittest.TestCase):
         self.assertAlmostEqual(float(first.abs().sum().detach()), 0.0, places=6)
         self.assertGreater(float(second.abs().sum().detach()), 0.0)
 
-    def test_point_tracks_can_supply_training_only_motion_envelope(self):
+    def test_point_tracks_supply_current_occupancy_before_envelope_expansion(self):
         point_track_map = torch.zeros(12, 5, 3, 4)
         point_track_map[3, 0, 1, 2] = 1.0
         point_track_map[3, 2, 2, 3] = 1.0
         mask = motion_mask_from_point_track_map(point_track_map)
         self.assertEqual(mask.shape, (1, 2, 3, 4))
         self.assertEqual(float(mask[0, 0, 1, 2]), 1.0)
-        self.assertEqual(float(mask[0, 1, 1, 2]), 1.0)
+        self.assertEqual(float(mask[0, 1, 1, 2]), 0.0)
         self.assertEqual(float(mask[0, 1, 2, 3]), 1.0)
-        self.assertEqual(float(mask.sum()), 3.0)
+        self.assertEqual(float(mask.sum()), 2.0)
+
+        envelope = source_target_motion_envelope(mask)
+        self.assertEqual(float(envelope[0, 1, 1, 2]), 1.0)
+        self.assertEqual(float(envelope.sum()), 3.0)
+
+        _, target_centers, _, _, valid = latent_correspondence_motion(
+            torch.zeros(2, 2, 3, 4),
+            torch.zeros(2, 2, 3, 4),
+            mask,
+        )
+        self.assertTrue(bool(valid[1]))
+        self.assertTrue(
+            torch.allclose(target_centers[1], torch.tensor([1.0, 1.0]))
+        )
 
     def test_das_condition_rejects_nonbinary_visibility_and_background_rgb(self):
         nonbinary = torch.zeros(12, 5, 3, 4)
@@ -155,6 +171,20 @@ class MultiObjectConditioningTest(unittest.TestCase):
         background_rgb[0, 0, 0, 0] = 0.25
         with self.assertRaisesRegex(ValueError, "zero outside visible"):
             motion_mask_from_point_track_map(background_rgb, "das_3d_tracks")
+
+    def test_dense_ablation_also_keeps_current_and_source_regions_separate(self):
+        point_track_map = torch.zeros(18, 2, 2, 4)
+        point_track_map[0, :, 0, 1] = 1.0
+        point_track_map[1, 0, 0, 1] = 1.0
+        point_track_map[1, 1, 1, 3] = 1.0
+        mask = motion_mask_from_point_track_map(
+            point_track_map, "dense_point_tracks"
+        )
+        self.assertEqual(float(mask[0, 1, 0, 1]), 0.0)
+        self.assertEqual(float(mask[0, 1, 1, 3]), 1.0)
+        envelope = source_target_motion_envelope(mask)
+        self.assertEqual(float(envelope[0, 1, 0, 1]), 1.0)
+        self.assertEqual(float(envelope[0, 1, 1, 3]), 1.0)
 
     def test_point_track_padding_must_match_object_count(self):
         point_map = torch.zeros(12, 5, 3, 4)
