@@ -617,7 +617,7 @@ class WanTrainingTest(unittest.TestCase):
             self.assertEqual(len(selected[axis]), pair_count)
             self.assertEqual(len(set(selected[axis])), pair_count)
 
-    def test_validation_mirrors_the_formal_sixty_forty_mixture(self) -> None:
+    def test_validation_mirrors_mode_and_response_axis_weights(self) -> None:
         records = [
             {"sample_id": f"record-{index}", "base_scene_id": f"base-{index}"}
             for index in range(20)
@@ -631,13 +631,20 @@ class WanTrainingTest(unittest.TestCase):
             for axis in ("mass_kg", "contact_friction", "contact_restitution")
         ]
         args = SimpleNamespace(
-            validation_batches=5,
+            validation_batches=25,
             seed=13,
             trajectory_input=False,
             trajectory_input_source="target",
             trajectory_representation="das_3d_tracks",
         )
         response_flags = []
+        validation_axes = []
+
+        def fake_load_microbatch(*call_args, **unused_kwargs):
+            sample_ids = [item["sample_id"] for item in call_args[2]]
+            if sample_ids[0].endswith("-low"):
+                validation_axes.append(sample_ids[0].removesuffix("-low"))
+            return {}
 
         def fake_forward_losses(*unused_args, response_enabled, **unused_kwargs):
             response_flags.append(response_enabled)
@@ -655,7 +662,10 @@ class WanTrainingTest(unittest.TestCase):
 
         model = nn.Linear(1, 1)
         condition_encoder = nn.Linear(1, 1)
-        with patch("train_wan_formal.load_microbatch", return_value={}), patch(
+        with patch(
+            "train_wan_formal.load_microbatch",
+            side_effect=fake_load_microbatch,
+        ), patch(
             "train_wan_formal.forward_losses", side_effect=fake_forward_losses
         ):
             metrics = validate(
@@ -672,10 +682,14 @@ class WanTrainingTest(unittest.TestCase):
                 world_size=1,
                 scene_size_px=(832, 480),
             )
-        self.assertEqual(response_flags, [True, True, False, False, False])
+        self.assertEqual(response_flags.count(True), 10)
+        self.assertEqual(response_flags.count(False), 15)
+        self.assertEqual(validation_axes.count("contact_friction"), 4)
+        self.assertEqual(validation_axes.count("contact_restitution"), 4)
+        self.assertEqual(validation_axes.count("mass_kg"), 2)
         self.assertEqual(metrics["response"], 2.0)
-        self.assertEqual(metrics["response_batches"], 2.0)
-        self.assertEqual(metrics["ordinary_batches"], 3.0)
+        self.assertEqual(metrics["response_batches"], 10.0)
+        self.assertEqual(metrics["ordinary_batches"], 15.0)
         self.assertTrue(model.training)
         self.assertTrue(condition_encoder.training)
 

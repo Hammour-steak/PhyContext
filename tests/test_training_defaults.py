@@ -432,11 +432,28 @@ class TrainingDefaultTests(unittest.TestCase):
         self.assertEqual(args.trajectory_input_source, "target")
         self.assertEqual(args.trajectory_representation, "das_3d_tracks")
         self.assertFalse(args.ordinary_only)
-        self.assertEqual(args.validation_batches, 15)
-        self.assertEqual(args.validation_batches % 5, 0)
+        self.assertEqual(args.steps, 9000)
+        self.assertEqual(args.validation_batches, 25)
+        self.assertEqual(args.validation_batches % 25, 0)
+        formal_config = json.loads(
+            (ROOT / "configs/training/one_object.json").read_text(encoding="utf-8")
+        )["training"]
+        self.assertEqual(formal_config["steps"], args.steps)
+        self.assertEqual(
+            formal_config["validation_batches"], args.validation_batches
+        )
         self.assertEqual(
             (VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FRAMES), (832, 480, 97)
         )
+
+    def test_formal_validation_requires_a_complete_axis_cycle(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["train_wan_formal.py", "--validation-batches", "15"],
+        ):
+            with self.assertRaisesRegex(ValueError, "multiple of 25"):
+                train_wan_formal.main()
 
     def test_resume_rejects_changed_optimization_contract(self) -> None:
         with patch.object(sys, "argv", ["train_wan_formal.py"]):

@@ -125,7 +125,7 @@ def parse_args() -> argparse.Namespace:
             "conditions and freezes every physics-specific module"
         ),
     )
-    parser.add_argument("--steps", type=int, default=8000)
+    parser.add_argument("--steps", type=int, default=9000)
     parser.add_argument(
         "--ordinary-only",
         action="store_true",
@@ -202,10 +202,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--validation-batches",
         type=int,
-        default=15,
+        default=25,
         help=(
             "deterministic mixed validation microbatches per distributed rank; "
-            "formal training requires a positive multiple of five"
+            "formal training requires a positive multiple of 25 so both the "
+            "60/40 mode split and 2:2:1 response-axis weights are exact"
         ),
     )
     parser.add_argument("--save-every", type=int, default=512)
@@ -897,7 +898,7 @@ def validate(
     vae=None,
     perceptual_model=None,
 ) -> dict[str, float]:
-    """Evaluate the same 60/40 ordinary-response mixture used for training."""
+    """Evaluate the training 60/40 mixture and 2:2:1 response-axis cycle."""
     model.eval()
     condition_encoder.eval()
     totals = {
@@ -1494,11 +1495,11 @@ def main() -> None:
     ):
         raise ValueError("validation and save intervals must be positive")
     if not args.ordinary_only and (
-        args.validation_batches < 5 or args.validation_batches % 5 != 0
+        args.validation_batches < 25 or args.validation_batches % 25 != 0
     ):
         raise ValueError(
-            "formal validation batches must be a positive multiple of five "
-            "to preserve the 60/40 mixture"
+            "formal validation batches must be a positive multiple of 25 "
+            "to preserve both the 60/40 mixture and 2:2:1 response-axis weights"
         )
     if not 0 < args.motion_foreground_share < 1:
         raise ValueError("motion foreground share must be between zero and one")

@@ -8,7 +8,7 @@
   "gpus": 4,
   "training": {
     "training_stage": "joint",
-    "steps": 8000,
+    "steps": 9000,
     "scene_tokens": 128,
     "lora_rank": 16,
     "lora_alpha": 16.0,
@@ -22,7 +22,7 @@
     "lpips_loss_weight": 0.1,
     "lpips_frame_count": 2,
     "validation_every": 512,
-    "validation_batches": 15,
+    "validation_batches": 25,
     "save_every": 512,
     "seed": 20260820
   }

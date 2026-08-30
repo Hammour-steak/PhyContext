@@ -128,6 +128,13 @@ mode. Do not use the flag for an ablation or full PhysSweep training run: the
 default remains the 60/40 ordinary/paired-response schedule and requires complete
 low/base/high sweep groups.
 
+For the current 41,600-sample release, the formal one-object run uses 9,000
+optimizer steps. With four ranks, this visits every training sample and every
+mass endpoint pair at least once. Validation uses 25 microbatches per rank: this
+is one complete schedule window, so it preserves both the 60/40
+ordinary/response split and the 2:2:1 friction/restitution/mass response-axis
+weights. Other formal validation sizes must be positive multiples of 25.
+
 The default trajectory source is the target sample. `nominal_base` remains an
 explicit fixed-trajectory physics-response ablation. The scene encoder and direct
 physical modulation branches retain their three object slots, so point-track
