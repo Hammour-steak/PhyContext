@@ -433,6 +433,7 @@ class TrainingDefaultTests(unittest.TestCase):
                 train_wan_formal.validate_resume_contract(
                     root, Path("run/latest"), cache, args
                 )
+
             contract["training_code_sha256"] = (
                 train_wan_formal.training_code_sha256()
             )
@@ -442,6 +443,11 @@ class TrainingDefaultTests(unittest.TestCase):
                 train_wan_formal.validate_resume_contract(
                     root, Path("run/latest"), cache, args
                 )
+
+    def test_training_code_fingerprint_covers_runtime_geometry_modules(self) -> None:
+        fingerprints = train_wan_formal.training_code_sha256()
+        self.assertIn("tools/phycontext/video_preprocess.py", fingerprints)
+        self.assertIn("tools/phycontext/point_trajectory.py", fingerprints)
 
     def test_dataset_override_cannot_reuse_the_original_trajectory(self) -> None:
         with patch.object(

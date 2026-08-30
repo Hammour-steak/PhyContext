@@ -142,6 +142,32 @@ def _cyclic_permuted_item(items: list, index: int, seed: int):
     return items[permutation[offset]]
 
 
+def formal_response_axis_occurrence_index(
+    response_micro_index: int,
+    axis: str,
+) -> int:
+    """Return the axis-local index for one response microbatch.
+
+    The global response schedule interleaves axes with unequal frequencies.
+    Pair permutations must therefore advance by the number of prior occurrences
+    of the selected axis, rather than by the global response index; otherwise
+    each axis skips offsets and repeats pairs before covering its own dataset.
+    """
+    if response_micro_index < 0:
+        raise ValueError("response microbatch index must be non-negative")
+    if axis not in SWEEP_AXES:
+        raise ValueError(f"unsupported response axis: {axis}")
+    cycle_count, cycle_offset = divmod(
+        response_micro_index, len(FORMAL_RESPONSE_AXIS_CYCLE)
+    )
+    if FORMAL_RESPONSE_AXIS_CYCLE[cycle_offset] != axis:
+        raise ValueError("response axis does not match the formal axis cycle")
+    return (
+        cycle_count * FORMAL_RESPONSE_AXIS_CYCLE.count(axis)
+        + FORMAL_RESPONSE_AXIS_CYCLE[:cycle_offset].count(axis)
+    )
+
+
 def make_formal_training_batch(
     records: list[dict],
     endpoint_pairs: list[dict],
@@ -168,7 +194,10 @@ def make_formal_training_batch(
             response_micro_index % len(FORMAL_RESPONSE_AXIS_CYCLE)
         ]
         axis_pairs = [pair for pair in endpoint_pairs if pair["axis"] == axis]
-        draw_index = response_micro_index * world_size + rank
+        axis_index = formal_response_axis_occurrence_index(
+            response_micro_index, axis
+        )
+        draw_index = axis_index * world_size + rank
         pair = _cyclic_permuted_item(
             axis_pairs,
             draw_index,

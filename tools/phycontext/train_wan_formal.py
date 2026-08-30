@@ -98,6 +98,8 @@ TRAINING_CODE_PATHS = (
     Path("tools/phycontext/train_wan_formal.py"),
     Path("tools/phycontext/wan_training.py"),
     Path("tools/phycontext/conditioning_model.py"),
+    Path("tools/phycontext/video_preprocess.py"),
+    Path("tools/phycontext/point_trajectory.py"),
     Path("tools/phycontext/cache_contract.py"),
 )
 

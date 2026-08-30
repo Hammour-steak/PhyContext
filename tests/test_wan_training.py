@@ -584,6 +584,39 @@ class WanTrainingTest(unittest.TestCase):
         ]
         self.assertNotEqual(rank_batches[2], rank_one)
 
+    def test_response_axes_cover_their_pair_permutations_before_repeating(self) -> None:
+        pair_count = 10
+        axes = ("mass_kg", "contact_friction", "contact_restitution")
+        records = [{"sample_id": "ordinary"}]
+        pairs = [
+            {
+                "axis": axis,
+                "low": {"sample_id": f"{axis}-low-{index}"},
+                "high": {"sample_id": f"{axis}-high-{index}"},
+            }
+            for axis in axes
+            for index in range(pair_count)
+        ]
+        selected = {axis: [] for axis in axes}
+        for step in range(150):
+            batch, mode, axis = make_formal_training_batch(
+                records,
+                pairs,
+                step=step,
+                accumulation_index=0,
+                gradient_accumulation=1,
+                rank=0,
+                world_size=1,
+                seed=13,
+            )
+            if mode == "response" and len(selected[axis]) < pair_count:
+                selected[axis].append(batch[0]["sample_id"])
+            if all(len(items) == pair_count for items in selected.values()):
+                break
+        for axis in axes:
+            self.assertEqual(len(selected[axis]), pair_count)
+            self.assertEqual(len(set(selected[axis])), pair_count)
+
     def test_validation_mirrors_the_formal_sixty_forty_mixture(self) -> None:
         records = [
             {"sample_id": f"record-{index}", "base_scene_id": f"base-{index}"}
