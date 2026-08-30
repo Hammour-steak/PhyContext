@@ -106,12 +106,15 @@ class TrainingDefaultTests(unittest.TestCase):
             np.savez_compressed(
                 path,
                 object_xyz_camera_m=np.zeros((1, 3), dtype=np.float32),
-                object_initial_velocity_camera_mps=np.zeros((1, 3), dtype=np.float32),
-                object_mass_kg=np.ones(1, dtype=np.float32),
-                object_friction=np.ones(1, dtype=np.float32),
-                object_restitution=np.ones(1, dtype=np.float32),
-                environment_friction=np.float32(0.5),
-                environment_restitution=np.float32(0.1),
+                object_normal_camera=np.asarray(
+                    [[0.0, 1.0, 0.0]], dtype=np.float32
+                ),
+                environment_xyz_camera_m=np.zeros((2, 3), dtype=np.float32),
+                environment_normal_camera=np.asarray(
+                    [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+                ),
+                environment_friction=np.full(2, 0.5, dtype=np.float32),
+                environment_restitution=np.full(2, 0.1, dtype=np.float32),
                 camera_intrinsics=np.asarray(
                     [[1760.0, 0.0, 640.0], [0.0, 1760.0, 360.0], [0.0, 0.0, 1.0]],
                     dtype=np.float32,
