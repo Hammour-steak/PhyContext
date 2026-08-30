@@ -11,6 +11,9 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
+from cache_contract import resolve_cache_artifact_root, resolve_cache_dataset_root
+from cache_wan_inputs import load_canonical_first_frame
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -27,6 +30,8 @@ def main() -> None:
     project_root = args.project_root.resolve()
     cache_manifest = args.cache_manifest.resolve()
     cache = json.loads(cache_manifest.read_text(encoding="utf-8"))
+    artifact_root = resolve_cache_artifact_root(project_root, cache)
+    dataset_root = resolve_cache_dataset_root(project_root, cache)
     records = cache["records"]
     item = next(
         (
@@ -38,7 +43,7 @@ def main() -> None:
     )
     if item is None:
         raise ValueError(f"sample is not present in cache: {args.sample_id}")
-    latent_path = project_root / item["latent"]["path"]
+    latent_path = artifact_root / item["latent"]["path"]
     latent = load_file(str(latent_path), device="cpu")["latent"]
     if latent.ndim != 4:
         raise ValueError(f"latent must have shape C x F x H x W: {latent.shape}")
@@ -58,6 +63,17 @@ def main() -> None:
     latent = latent.to(device)
     with torch.inference_mode():
         full = vae.decode([latent])[0].float().cpu()
+        if full.ndim != 4 or not torch.isfinite(full).all():
+            raise ValueError("full VAE decode must be a finite C x F x H x W tensor")
+        preprocess = cache["preprocess"]
+        canonical = load_canonical_first_frame(
+            dataset_root / item["record"]["conditioning"]["first_frame"],
+            int(preprocess["width"]),
+            int(preprocess["height"]),
+        ).float()
+        if full[:, :1].shape != canonical.shape:
+            raise ValueError("decoded and canonical first-frame shapes differ")
+        condition_difference = (full[:, :1] - canonical).abs()
         comparisons = []
         for index in args.indices:
             isolated = vae.decode([latent[:, index : index + 1]])[0].float().cpu()
@@ -85,6 +101,13 @@ def main() -> None:
         "schema": "phycontext.vae_temporal_decode_audit.v1",
         "sample_id": item["sample_id"],
         "latent": str(latent_path),
+        "decoded_shape": list(full.shape),
+        "decoded_condition_frame_mean_abs_error": float(
+            condition_difference.mean()
+        ),
+        "decoded_condition_frame_max_abs_error": float(
+            condition_difference.max()
+        ),
         "comparisons": comparisons,
     }
     output = json.dumps(result, indent=2)

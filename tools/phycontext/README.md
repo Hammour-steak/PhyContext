@@ -25,6 +25,13 @@ model-ready manifest, cache Wan inputs, merge and audit cache shards, train with
 `train_wan_formal.py`, then infer under the saved run contract. Dataset sampling,
 simulation, rendering, and publication belong to the separate dataset project.
 
+`audit_wan_cache.py` verifies the complete merged cache and all hash bindings.
+`audit_wan_cache_samples.py` then independently rerasterizes and re-encodes a
+stratified sample (40 by default), requiring tensor-exact point maps and latent
+reconstruction under the canonical first-frame protocol. The complementary
+`audit_vae_temporal_decode.py` verifies that cached latents decode to finite,
+correctly aligned video tensors and reports first-frame reconstruction error.
+
 ## PhysSweep release adapter
 
 `adapt_physweep_release.py` converts `outputs/one_object` without modifying it.
