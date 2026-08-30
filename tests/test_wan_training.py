@@ -637,6 +637,7 @@ class WanTrainingTest(unittest.TestCase):
                 torch.device("cpu"),
                 rank=0,
                 world_size=1,
+                scene_size_px=(832, 480),
             )
         self.assertEqual(response_flags, [True, True, False, False, False])
         self.assertEqual(metrics["response"], 2.0)
