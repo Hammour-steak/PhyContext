@@ -312,6 +312,16 @@ def reusable_latent_protocol_matches(
     raise ValueError("reused cache uses different video preprocessing")
 
 
+def index_reusable_text_contexts(records: dict[str, dict]) -> dict[str, dict]:
+    """Index only descriptors present in a complete or interrupted cache."""
+    result = {}
+    for item in records.values():
+        descriptor = item.get("text_context")
+        if isinstance(descriptor, dict) and descriptor.get("prompt_sha256"):
+            result[descriptor["prompt_sha256"]] = descriptor
+    return result
+
+
 def select_records(records: list[dict], args: argparse.Namespace) -> list[dict]:
     if args.shard_count <= 0:
         raise ValueError("shard-count must be positive")
@@ -603,9 +613,7 @@ def main() -> None:
                 # only when their condition-frame protocol also matches.
             else:
                 reuse_point_tracks = True
-        for item in reuse_records.values():
-            descriptor = item["text_context"]
-            reused_text_by_hash[descriptor["prompt_sha256"]] = descriptor
+        reused_text_by_hash = index_reusable_text_contexts(reuse_records)
 
     selection = {
         "split": args.split,

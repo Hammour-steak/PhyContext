@@ -343,6 +343,20 @@ class TrainingDefaultTests(unittest.TestCase):
                 "phycontext.wan_ti2v_cache.v3", legacy, current
             )
 
+    def test_interrupted_reuse_cache_may_have_only_point_descriptors(self) -> None:
+        descriptor = {
+            "path": "text/prompt.safetensors",
+            "sha256": "a" * 64,
+            "prompt_sha256": "b" * 64,
+        }
+        indexed = cache_wan_inputs.index_reusable_text_contexts(
+            {
+                "point_only": {"point_track": {"path": "point.safetensors"}},
+                "complete": {"text_context": descriptor},
+            }
+        )
+        self.assertEqual(indexed, {"b" * 64: descriptor})
+
     def test_cache_preserves_multi_object_slot_order(self) -> None:
         record = {
             "conditioning": {
