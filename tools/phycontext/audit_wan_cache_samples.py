@@ -67,8 +67,6 @@ def select_audit_records(
     if sample_count <= 0 or shard_count <= 0 or sample_count % shard_count:
         raise ValueError("sample count must be positive and divisible by shard count")
     per_shard = sample_count // shard_count
-    if per_shard < 6:
-        raise ValueError("each audit shard needs at least six samples")
     base_scene_ids = list(dict.fromkeys(item["base_scene_id"] for item in records))
     shard_by_scene = {
         scene_id: index % shard_count
@@ -81,6 +79,12 @@ def select_audit_records(
             for item in records
             if shard_by_scene[item["base_scene_id"]] == shard
         ]
+        if per_shard < 6:
+            selected.extend(
+                {**item, "_audit_shard": shard}
+                for item in pick_evenly(shard_records, per_shard)
+            )
+            continue
         quotas = {
             ("train", "base"): 1,
             ("validation", "base"): 1,
