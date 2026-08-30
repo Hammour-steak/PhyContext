@@ -17,10 +17,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 
 import cache_wan_inputs  # noqa: E402
+import conditioning_model  # noqa: E402
 import infer_wan_conditioned  # noqa: E402
 import merge_wan_cache_manifests  # noqa: E402
 import train_wan_formal  # noqa: E402
-from video_preprocess import cover_center_crop_frames  # noqa: E402
+from cache_contract import CANONICAL_CONDITION_FRAME_PROTOCOL  # noqa: E402
+from video_preprocess import (  # noqa: E402
+    cover_center_crop_frames,
+    cover_center_crop_intrinsics,
+)
 from project_defaults import (  # noqa: E402
     CACHE_MANIFEST,
     DATASET_MANIFEST,
@@ -46,6 +51,88 @@ class TrainingDefaultTests(unittest.TestCase):
         processed = cover_center_crop_frames(frame, 832, 480)
         self.assertEqual(processed.shape, (1, 480, 832, 3))
         self.assertTrue(processed.flags.c_contiguous)
+
+    def test_canonical_first_frame_replaces_only_video_frame_zero(self) -> None:
+        video = cache_wan_inputs.torch.zeros((3, 4, 2, 3))
+        video[:, 1:] = 0.25
+        canonical = cache_wan_inputs.torch.full((3, 1, 2, 3), -0.75)
+        result = cache_wan_inputs.bind_canonical_condition_frame(video, canonical)
+        self.assertIs(result, video)
+        self.assertTrue(cache_wan_inputs.torch.equal(video[:, :1], canonical))
+        self.assertTrue(
+            cache_wan_inputs.torch.equal(
+                video[:, 1:], cache_wan_inputs.torch.full((3, 3, 2, 3), 0.25)
+            )
+        )
+
+    def test_intrinsics_follow_exact_cover_center_crop_geometry(self) -> None:
+        source_size = (1280, 720)
+        target_size = (832, 480)
+        intrinsics = np.asarray(
+            [[1760.0, 0.0, 640.0], [0.0, 1760.0, 360.0], [0.0, 0.0, 1.0]]
+        )
+        transformed = cover_center_crop_intrinsics(
+            intrinsics, source_size, target_size
+        )
+        self.assertTrue(
+            np.allclose(
+                transformed,
+                np.asarray(
+                    [
+                        [1172.875, 0.0, 416.333203125],
+                        [0.0, 1173.3333333333333, 239.83333333333331],
+                        [0.0, 0.0, 1.0],
+                    ]
+                ),
+                atol=1.0e-10,
+            )
+        )
+        point = np.asarray([0.12, -0.08, 1.7])
+        source_pixel = (intrinsics @ point)[:2] / point[2]
+        resize_x = 853 / 1280
+        resize_y = 480 / 720
+        expected_pixel = np.asarray(
+            [
+                (source_pixel[0] + 0.5) * resize_x - 0.5 - 10,
+                (source_pixel[1] + 0.5) * resize_y - 0.5,
+            ]
+        )
+        transformed_pixel = (transformed @ point)[:2] / point[2]
+        self.assertTrue(np.allclose(transformed_pixel, expected_pixel, atol=1.0e-10))
+
+    def test_scene_loader_normalizes_transformed_intrinsics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scene.npz"
+            np.savez_compressed(
+                path,
+                object_xyz_camera_m=np.zeros((1, 3), dtype=np.float32),
+                object_initial_velocity_camera_mps=np.zeros((1, 3), dtype=np.float32),
+                object_mass_kg=np.ones(1, dtype=np.float32),
+                object_friction=np.ones(1, dtype=np.float32),
+                object_restitution=np.ones(1, dtype=np.float32),
+                environment_friction=np.float32(0.5),
+                environment_restitution=np.float32(0.1),
+                camera_intrinsics=np.asarray(
+                    [[1760.0, 0.0, 640.0], [0.0, 1760.0, 360.0], [0.0, 0.0, 1.0]],
+                    dtype=np.float32,
+                ),
+                image_size_px=np.asarray([1280, 720], dtype=np.int32),
+                camera_intrinsics_normalized=np.asarray(
+                    [1.375, 2.4444444, 0.5, 0.5], dtype=np.float32
+                ),
+            )
+            loaded = conditioning_model.load_scene_condition(
+                path, target_size_px=(832, 480)
+            )
+            expected = np.asarray(
+                [1172.875 / 832, 1173.3333333333333 / 480, 416.333203125 / 832, 239.83333333333331 / 480],
+                dtype=np.float32,
+            )
+            self.assertTrue(
+                np.allclose(
+                    loaded["camera_intrinsics_normalized"].numpy(), expected
+                )
+            )
 
     def test_cache_defaults_are_formal_high_resolution_inputs(self) -> None:
         with patch.object(
@@ -227,6 +314,32 @@ class TrainingDefaultTests(unittest.TestCase):
             self.assertFalse(should_build)
             self.assertEqual(target.read_bytes(), source.read_bytes())
 
+    def test_v4_migration_reuses_geometry_but_not_video_latents(self) -> None:
+        current = {
+            "width": 832,
+            "height": 480,
+            "frames": 97,
+            "resize": "cover_then_center_crop",
+            "condition_frame": CANONICAL_CONDITION_FRAME_PROTOCOL,
+        }
+        legacy = {
+            key: value for key, value in current.items() if key != "condition_frame"
+        }
+        self.assertFalse(
+            cache_wan_inputs.reusable_latent_protocol_matches(
+                "phycontext.wan_ti2v_cache.v4", legacy, current
+            )
+        )
+        self.assertTrue(
+            cache_wan_inputs.reusable_latent_protocol_matches(
+                "phycontext.wan_ti2v_cache.v5", current, current
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "video preprocessing"):
+            cache_wan_inputs.reusable_latent_protocol_matches(
+                "phycontext.wan_ti2v_cache.v3", legacy, current
+            )
+
     def test_cache_preserves_multi_object_slot_order(self) -> None:
         record = {
             "conditioning": {
@@ -337,7 +450,14 @@ class TrainingDefaultTests(unittest.TestCase):
             cache = root / "cache.json"
             cache.write_text(
                 json.dumps(
-                    {"preprocess": {"width": 832, "height": 480, "frames": 97}}
+                    {
+                        "preprocess": {
+                            "width": 832,
+                            "height": 480,
+                            "frames": 97,
+                            "condition_frame": CANONICAL_CONDITION_FRAME_PROTOCOL,
+                        }
+                    }
                 ),
                 encoding="utf-8",
             )
@@ -359,7 +479,7 @@ class TrainingDefaultTests(unittest.TestCase):
             contract = json.loads(
                 (checkpoint / "input_contract.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(contract["schema"], "phycontext.inference_input_contract.v4")
+            self.assertEqual(contract["schema"], "phycontext.inference_input_contract.v5")
             self.assertEqual(
                 (contract["sampling"]["width"], contract["sampling"]["height"]),
                 (832, 480),
@@ -368,6 +488,14 @@ class TrainingDefaultTests(unittest.TestCase):
             self.assertEqual(
                 contract["sampling"]["spatial_preprocess"],
                 "cover_then_center_crop",
+            )
+            self.assertEqual(
+                contract["sampling"]["condition_frame"],
+                CANONICAL_CONDITION_FRAME_PROTOCOL,
+            )
+            self.assertEqual(
+                contract["scene"]["camera_intrinsics"],
+                "cover_then_center_crop_adjusted_and_target_normalized",
             )
             self.assertEqual(contract["trajectory"]["protocol"], "target")
             self.assertEqual(

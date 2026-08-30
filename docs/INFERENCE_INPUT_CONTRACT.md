@@ -30,6 +30,10 @@ separate ablations and must disable trajectory input explicitly.
 
 - Resolution: 832 x 480
 - Frames: 97
+- First-frame protocol: the group-shared canonical condition replaces target
+  frame zero before the full causal VAE encode
+- Camera intrinsics: transformed through the exact cover-resize and center-crop,
+  then normalized by 832 x 480
 - Flow shift: 5.0
 - Guidance scale: 5.0
 - Sampling steps: 30

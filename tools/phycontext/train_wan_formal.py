@@ -22,6 +22,7 @@ from safetensors.torch import load_file
 from torch.nn.parallel import DistributedDataParallel
 
 from cache_contract import (
+    CANONICAL_CONDITION_FRAME_PROTOCOL,
     CURRENT_CACHE_SCHEMA,
     resolve_cache_artifact_root,
     resolve_cache_dataset_root,
@@ -266,6 +267,21 @@ def dynamic_object_count(item: dict) -> int:
     return int(item["point_track"]["object_count"])
 
 
+def record_dynamic_object_ids(item: dict) -> list[str]:
+    physics = item["record"]["conditioning"]["physics"]
+    objects = physics.get("objects")
+    if objects is None:
+        objects = [physics["object"]]
+    elif isinstance(objects, dict):
+        objects = [objects[key] for key in sorted(objects)]
+    if not isinstance(objects, list) or not 1 <= len(objects) <= 3:
+        raise ValueError("training record must contain one to three dynamic objects")
+    object_ids = [str(value["object_id"]) for value in objects]
+    if len(set(object_ids)) != len(object_ids):
+        raise ValueError("training record dynamic object ids must be unique")
+    return object_ids
+
+
 def max_dynamic_object_count(records: list[dict]) -> int:
     if not records:
         return 1
@@ -277,6 +293,7 @@ def max_dynamic_object_count(records: list[dict]) -> int:
 
 def require_complete_cache(
     artifact_root: Path,
+    dataset_root: Path,
     records: list[dict],
     split: str,
     trajectory_representation: str,
@@ -290,6 +307,7 @@ def require_complete_cache(
             "point-track training requires cached point trajectories; "
             f"{len(missing)} missing in {split}"
         )
+    verified_scenes: dict[Path, str] = {}
     for item in records:
         sample_id = item["sample_id"]
         for key, label in (
@@ -298,6 +316,41 @@ def require_complete_cache(
             ("point_track", f"point track for {sample_id}"),
         ):
             validate_cache_artifact(artifact_root, item.get(key), label)
+        latent = item["latent"]
+        if (
+            latent.get("condition_frame_protocol")
+            != CANONICAL_CONDITION_FRAME_PROTOCOL
+            or latent.get("condition_frame_sha256")
+            != item.get("source_first_frame_sha256")
+        ):
+            raise ValueError(
+                f"latent condition-frame binding is invalid for {sample_id}"
+            )
+        expected_object_ids = record_dynamic_object_ids(item)
+        point_track = item["point_track"]
+        if (
+            point_track.get("object_ids") != expected_object_ids
+            or int(point_track.get("object_count", -1)) != len(expected_object_ids)
+        ):
+            raise ValueError(f"point-track object binding is invalid for {sample_id}")
+        scene_path = (
+            dataset_root / item["record"]["conditioning"]["scene"]
+        ).resolve()
+        if not scene_path.is_relative_to(dataset_root):
+            raise ValueError(f"scene condition escapes the dataset root: {sample_id}")
+        expected_scene_hash = item.get("source_scene_sha256")
+        previous_hash = verified_scenes.get(scene_path)
+        if previous_hash is not None:
+            if previous_hash != expected_scene_hash:
+                raise ValueError(f"shared scene hash differs across records: {sample_id}")
+        else:
+            if (
+                not expected_scene_hash
+                or not scene_path.is_file()
+                or sha256(scene_path) != expected_scene_hash
+            ):
+                raise ValueError(f"scene condition file/hash mismatch: {sample_id}")
+            verified_scenes[scene_path] = expected_scene_hash
 
 
 def split_condition_parameters(module: torch.nn.Module):
@@ -477,6 +530,7 @@ def load_microbatch(
     device: torch.device,
     trajectory_batch: list[dict] | None = None,
     trajectory_representation: str = "das_3d_tracks",
+    scene_size_px: tuple[int, int] | None = None,
 ) -> dict:
     records = [item["record"] for item in batch]
     trajectory_representation = canonical_trajectory_representation(
@@ -510,16 +564,6 @@ def load_microbatch(
         source["sample_id"] == target["sample_id"]
         for source, target in zip(trajectory_batch, batch)
     ):
-        trajectory_masks = target_motion_masks
-    else:
-        trajectory_masks = [
-            motion_mask_from_point_track_map(load_point_map(item))
-            for item in trajectory_batch
-        ]
-    if all(
-        source["sample_id"] == target["sample_id"]
-        for source, target in zip(trajectory_batch, batch)
-    ):
         trajectory_point_maps = target_point_maps
     else:
         trajectory_point_maps = [load_point_map(item) for item in trajectory_batch]
@@ -539,13 +583,14 @@ def load_microbatch(
             for item in batch
         ],
         "motion_masks": target_motion_masks,
-        "trajectory_masks": trajectory_masks,
         "trajectory_point_maps": trajectory_point_maps,
         "trajectory_sample_ids": [item["sample_id"] for item in trajectory_batch],
         "scene": collate_scene_conditions(
             [
                 load_scene_condition(
-                    dataset_root / record["conditioning"]["scene"], device
+                    dataset_root / record["conditioning"]["scene"],
+                    device,
+                    target_size_px=scene_size_px,
                 )
                 for record in records
             ]
@@ -844,6 +889,7 @@ def validate(
     device: torch.device,
     rank: int,
     world_size: int,
+    scene_size_px: tuple[int, int],
     vae=None,
     perceptual_model=None,
 ) -> dict[str, float]:
@@ -891,6 +937,7 @@ def validate(
             device,
             trajectory_batch=trajectory_batch,
             trajectory_representation=args.trajectory_representation,
+            scene_size_px=scene_size_px,
         )
         generator = torch.Generator(device=device).manual_seed(
             args.seed + 10_000_000 + batch_index * world_size + rank
@@ -1194,7 +1241,7 @@ def write_input_contract(checkpoint_root: Path, metadata: dict) -> None:
     cache = json.loads(Path(metadata["cache_manifest"]).read_text(encoding="utf-8"))
     preprocess = cache["preprocess"]
     input_contract = {
-        "schema": "phycontext.inference_input_contract.v4",
+        "schema": "phycontext.inference_input_contract.v5",
         "adapter_sha256": sha256(checkpoint_root / "adapter.safetensors"),
         "base_model_index_sha256": metadata["base_model_index_sha256"],
         "cache_manifest_sha256": metadata["cache_manifest_sha256"],
@@ -1205,9 +1252,13 @@ def write_input_contract(checkpoint_root: Path, metadata: dict) -> None:
             "height": int(preprocess["height"]),
             "max_area": int(preprocess["width"]) * int(preprocess["height"]),
             "spatial_preprocess": "cover_then_center_crop",
+            "condition_frame": preprocess["condition_frame"],
             "flow_shift": float(metadata["flow_shift"]),
             "guidance_scale": INFERENCE_GUIDANCE_SCALE,
             "steps": INFERENCE_SAMPLING_STEPS,
+        },
+        "scene": {
+            "camera_intrinsics": "cover_then_center_crop_adjusted_and_target_normalized",
         },
         "trajectory": {
             "enabled": metadata["trajectory_conditioning"]["enabled"],
@@ -1491,6 +1542,10 @@ def main() -> None:
         validate_cache_source_manifest(root, cache)
         dataset_root = resolve_cache_dataset_root(root, cache)
         artifact_root = resolve_cache_artifact_root(root, cache)
+        scene_size_px = (
+            int(cache["preprocess"]["width"]),
+            int(cache["preprocess"]["height"]),
+        )
         train_records = filter_base_scenes(
             [item for item in cache["records"] if item["record"]["split"] == "train"],
             args.base_scene_count,
@@ -1509,6 +1564,7 @@ def main() -> None:
             )
         require_complete_cache(
             artifact_root,
+            dataset_root,
             train_records,
             "train",
             args.trajectory_representation,
@@ -1516,6 +1572,7 @@ def main() -> None:
         if validation_records:
             require_complete_cache(
                 artifact_root,
+                dataset_root,
                 validation_records,
                 "validation",
                 args.trajectory_representation,
@@ -1784,6 +1841,7 @@ def main() -> None:
                     device,
                     trajectory_batch=trajectory_batch,
                     trajectory_representation=args.trajectory_representation,
+                    scene_size_px=scene_size_px,
                 )
                 trajectory_sample_ids.extend(loaded["trajectory_sample_ids"])
                 generator = torch.Generator(device=device).manual_seed(
@@ -1868,6 +1926,7 @@ def main() -> None:
                     device,
                     rank,
                     world_size,
+                    scene_size_px,
                     vae=vae,
                     perceptual_model=perceptual_model,
                 )

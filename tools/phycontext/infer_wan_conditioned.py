@@ -22,6 +22,7 @@ from conditioning_model import (
     load_scene_condition,
 )
 from cache_contract import (
+    CANONICAL_CONDITION_FRAME_PROTOCOL,
     CURRENT_CACHE_SCHEMA,
     resolve_cache_artifact_root,
     resolve_cache_dataset_root,
@@ -142,16 +143,14 @@ def load_and_validate_input_contract(
     adapter_root: Path,
     adapter_metadata: dict,
     args: argparse.Namespace,
-) -> dict | None:
+) -> dict:
     contract_path = adapter_root / "input_contract.json"
     if not contract_path.is_file():
-        return None
+        raise FileNotFoundError(
+            f"formal adapter is missing its input contract: {contract_path}"
+        )
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    if contract.get("schema") not in {
-        "phycontext.inference_input_contract.v2",
-        "phycontext.inference_input_contract.v3",
-        "phycontext.inference_input_contract.v4",
-    }:
+    if contract.get("schema") != "phycontext.inference_input_contract.v5":
         raise ValueError("adapter input contract schema is unsupported")
     contract_trajectory = contract.get("trajectory", {})
     metadata_trajectory = adapter_metadata.get("trajectory_conditioning", {})
@@ -181,6 +180,7 @@ def load_and_validate_input_contract(
         "height": args.height,
         "max_area": args.width * args.height,
         "spatial_preprocess": "cover_then_center_crop",
+        "condition_frame": CANONICAL_CONDITION_FRAME_PROTOCOL,
         "flow_shift": args.flow_shift,
         "guidance_scale": args.guide_scale,
         "steps": args.sampling_steps,
@@ -192,6 +192,12 @@ def load_and_validate_input_contract(
     ]
     if mismatches:
         raise ValueError("sampling settings violate adapter input contract: " + "; ".join(mismatches))
+    expected_intrinsics = contract.get("scene", {}).get("camera_intrinsics")
+    actual_intrinsics = "cover_then_center_crop_adjusted_and_target_normalized"
+    if expected_intrinsics != actual_intrinsics:
+        raise ValueError(
+            "adapter input contract has an unsupported camera-intrinsics protocol"
+        )
     return contract
 
 
@@ -446,7 +452,7 @@ def main() -> None:
             raise FileNotFoundError(
                 f"missing trajectory condition: {trajectory_path}"
             )
-        if external and input_contract is not None:
+        if external:
             expected_protocol = input_contract["trajectory"]["protocol"]
             if args.trajectory_protocol != expected_protocol:
                 raise ValueError(
@@ -581,20 +587,19 @@ def main() -> None:
                 point_track_map = load_file(
                     str(trajectory_path), device="cpu"
                 )["point_track_map"]
-                if input_contract is not None:
-                    condition_shape = input_contract.get("trajectory", {}).get(
-                        "condition_shape"
+                condition_shape = input_contract.get("trajectory", {}).get(
+                    "condition_shape"
+                )
+                if condition_shape is not None:
+                    expected_condition_shape = tuple(
+                        int(value) for value in condition_shape
                     )
-                    if condition_shape is not None:
-                        expected_condition_shape = tuple(
-                            int(value) for value in condition_shape
+                    if tuple(point_track_map.shape) != expected_condition_shape:
+                        raise ValueError(
+                            "trajectory condition shape violates the adapter "
+                            f"input contract: {tuple(point_track_map.shape)} != "
+                            f"{expected_condition_shape}"
                         )
-                        if tuple(point_track_map.shape) != expected_condition_shape:
-                            raise ValueError(
-                                "trajectory condition shape violates the adapter "
-                                f"input contract: {tuple(point_track_map.shape)} != "
-                                f"{expected_condition_shape}"
-                            )
                 object_count = 1 if controls.ndim == 1 else int(controls.shape[0])
                 point_track_maps = [
                     validate_point_track_object_slots(
@@ -609,7 +614,11 @@ def main() -> None:
                 enabled=trajectory_requested,
             )
         condition_encoder.to(device).eval()
-        scene = load_scene_condition(scene_path, device)
+        scene = load_scene_condition(
+            scene_path,
+            device,
+            target_size_px=(args.width, args.height),
+        )
         with torch.inference_mode():
             condition_tokens = condition_encoder(
                 scene, controls, dynamics, initial_state
@@ -713,14 +722,8 @@ def main() -> None:
         "first_frame": report_path(first_frame_path, root),
         "adapter": adapter_root.relative_to(root).as_posix(),
         "adapter_sha256": sha256(adapter_root / "adapter.safetensors"),
-        "input_contract": (
-            input_contract.get("schema") if input_contract is not None else None
-        ),
-        "trajectory_protocol": (
-            input_contract.get("trajectory", {}).get("protocol")
-            if input_contract is not None
-            else None
-        ),
+        "input_contract": input_contract.get("schema"),
+        "trajectory_protocol": input_contract.get("trajectory", {}).get("protocol"),
         "mode": args.mode,
         "trajectory_conditioning": {
             "available": trajectory_enabled,

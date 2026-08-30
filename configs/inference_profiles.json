@@ -2,7 +2,7 @@
   "schema": "phycontext.inference_profiles.v2",
   "defaults": {
     "adapter": "outputs/training/formal/final",
-    "cache_manifest": "cache/wan/physweep_training/das_3d_tracks_fullres_v4_832x480x97/manifest.json",
+    "cache_manifest": "cache/wan/physweep_training/das_3d_tracks_canonical_v5_832x480x97/manifest.json",
     "frames": 97,
     "max_area": 399360,
     "sampling_steps": 30,

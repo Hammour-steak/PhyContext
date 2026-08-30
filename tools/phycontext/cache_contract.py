@@ -7,22 +7,35 @@ import hashlib
 import json
 from pathlib import Path
 
-CURRENT_CACHE_SCHEMA = "phycontext.wan_ti2v_cache.v4"
+CURRENT_CACHE_SCHEMA = "phycontext.wan_ti2v_cache.v5"
+CANONICAL_CONDITION_FRAME_PROTOCOL = (
+    "shared_first_frame_overrides_target_video_frame_zero_before_vae_encode"
+)
 FULL_RATE_DAS_CACHE_SCHEMAS = frozenset(
     {
+        "phycontext.wan_ti2v_cache.v4",
         CURRENT_CACHE_SCHEMA,
     }
 )
 GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA = {
+    "phycontext.wan_ti2v_cache.v4": (
+        "float64_after_source_decode_until_integer_rasterization"
+    ),
     CURRENT_CACHE_SCHEMA: (
         "float64_after_source_decode_until_integer_rasterization"
     ),
 }
 FLOAT64_GEOMETRY_CACHE_SCHEMAS = frozenset(GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA)
+SOURCE_FILE_HASH_CACHE_SCHEMAS = frozenset(
+    {
+        "phycontext.wan_ti2v_cache.v4",
+        CURRENT_CACHE_SCHEMA,
+    }
+)
 SUPPORTED_CACHE_SCHEMAS = frozenset(
     {
         "phycontext.wan_ti2v_cache.v3",
-        CURRENT_CACHE_SCHEMA,
+        *FULL_RATE_DAS_CACHE_SCHEMAS,
     }
 )
 

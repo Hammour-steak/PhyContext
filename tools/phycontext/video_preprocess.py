@@ -39,3 +39,43 @@ def cover_center_crop_frames(
     return np.ascontiguousarray(
         resized[:, y0 : y0 + height, x0 : x0 + width]
     )
+
+
+def cover_center_crop_intrinsics(
+    camera_intrinsics: np.ndarray,
+    source_size_px: tuple[int, int] | np.ndarray,
+    target_size_px: tuple[int, int],
+) -> np.ndarray:
+    """Transform a pinhole matrix through the exact RGB resize/crop operation."""
+    intrinsics = np.asarray(camera_intrinsics, dtype=np.float64)
+    if intrinsics.shape != (3, 3) or not np.isfinite(intrinsics).all():
+        raise ValueError("camera intrinsics must be a finite 3 x 3 matrix")
+    source = np.asarray(source_size_px).reshape(-1)
+    if (
+        source.shape != (2,)
+        or not np.isfinite(source).all()
+        or np.any(source <= 0)
+        or not np.allclose(source, np.rint(source))
+    ):
+        raise ValueError("source image size must contain positive integer width/height")
+    source_width, source_height = (int(value) for value in source)
+    target_width, target_height = (int(value) for value in target_size_px)
+    if target_width <= 0 or target_height <= 0:
+        raise ValueError("target image size must be positive")
+
+    scale = max(target_width / source_width, target_height / source_height)
+    resized_width = max(target_width, round(source_width * scale))
+    resized_height = max(target_height, round(source_height * scale))
+    scale_x = resized_width / source_width
+    scale_y = resized_height / source_height
+    crop_x = (resized_width - target_width) // 2
+    crop_y = (resized_height - target_height) // 2
+
+    transformed = intrinsics.copy()
+    transformed[0, :] *= scale_x
+    transformed[1, :] *= scale_y
+    # OpenCV's half-pixel resize convention adds a translation that is not
+    # represented by scaling K alone.
+    transformed[0, 2] += 0.5 * scale_x - 0.5 - crop_x
+    transformed[1, 2] += 0.5 * scale_y - 0.5 - crop_y
+    return transformed

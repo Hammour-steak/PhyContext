@@ -7,15 +7,18 @@ entry point or environment variables:
 
 ```text
 dataset       datasets/physweep_training
-cache         cache/wan/physweep_training/das_3d_tracks_fullres_v4_832x480x97
+cache         cache/wan/physweep_training/das_3d_tracks_canonical_v5_832x480x97
 resolution    832 x 480 x 97 frames
 scene tokens  128
 ```
 
 Training videos and inference first frames use the same shared
-`cover_then_center_crop` transform. Checkpoint input contracts bind the exact
-`832 x 480 x 97` shape; inference rejects any output that resolves to a
-different width, height, or frame count.
+`cover_then_center_crop` transform. Before the full causal VAE encode, every
+target video's frame zero is replaced by its group's published canonical first
+frame, so the clean latent condition exactly matches inference. Raw camera
+intrinsics are transformed through the same resize/crop operation before scene
+encoding. Checkpoint input contracts bind both protocols and the exact
+`832 x 480 x 97` shape; inference rejects incompatible inputs.
 
 The maintained chain is: adapt the immutable release when needed, validate the
 model-ready manifest, cache Wan inputs, merge and audit cache shards, train with

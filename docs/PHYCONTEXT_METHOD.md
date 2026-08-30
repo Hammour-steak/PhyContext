@@ -26,6 +26,8 @@ For one controlled object, the scene contains:
 
 Every quantity uses one documented camera coordinate frame. The same explicit
 `object_id` binds the scene record, physical state, and point trajectory.
+Raw camera intrinsics are transformed through the exact cover-resize and
+center-crop applied to RGB before they are normalized for the scene encoder.
 
 ## Model
 
@@ -47,7 +49,10 @@ conditions provide contact geometry, material context, and interpretable cause.
 
 Training reads only a published PhysSweep manifest, resolved against the
 external PhysSweep project/data root, and its matching audited Wan
-cache. The production path always uses each target sample's own trajectory.
+cache. Before encoding a target with Wan's causal VAE, frame zero is replaced
+by the group's canonical first-frame condition; all later target frames are
+left unchanged. The production path always uses each target sample's own
+trajectory.
 
 The maintained objective combines flow matching, controlled-region
 reconstruction, trajectory alignment, and optional LPIPS supervision. The

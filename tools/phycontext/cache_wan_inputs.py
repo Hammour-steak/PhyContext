@@ -11,9 +11,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from decord import VideoReader, cpu
+from PIL import Image
 from safetensors.torch import save_file
 
 from cache_contract import (
+    CANONICAL_CONDITION_FRAME_PROTOCOL,
     CURRENT_CACHE_SCHEMA,
     GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
     SUPPORTED_CACHE_SCHEMAS,
@@ -216,15 +218,38 @@ def prepare_text_artifact(
 ) -> bool:
     """Materialize a trusted reusable context or request a fresh encoding."""
     target = text_root / f"{prompt_hash}.safetensors"
-    current_matches = descriptor_matches_file(
-        cached_text_by_hash.get(prompt_hash), target, artifact_root
+    return prepare_reusable_artifact(
+        target,
+        artifact_root,
+        reuse_artifact_root,
+        cached_text_by_hash.get(prompt_hash),
+        reused_text_by_hash.get(prompt_hash),
+        overwrite,
     )
-    reusable = reused_text_by_hash.get(prompt_hash)
+
+
+def prepare_reusable_artifact(
+    target: Path,
+    artifact_root: Path,
+    reuse_artifact_root: Path,
+    current: dict | None,
+    reusable: dict | None,
+    overwrite: bool,
+) -> bool:
+    """Materialize one hash-bound artifact or request a fresh build."""
+    current_matches = descriptor_matches_file(
+        current, target, artifact_root
+    )
+    reusable_path = (
+        reuse_artifact_root / reusable["path"]
+        if isinstance(reusable, dict) and reusable.get("path")
+        else None
+    )
     reusable_matches = bool(
-        reusable
-        and (reuse_artifact_root / reusable["path"]).is_file()
-        and sha256(reuse_artifact_root / reusable["path"])
-        == reusable["sha256"]
+        reusable_path is not None
+        and descriptor_matches_file(
+            reusable, reusable_path, reuse_artifact_root
+        )
     )
     if (
         reusable_matches
@@ -232,9 +257,7 @@ def prepare_text_artifact(
         and not current_matches
         and not target.exists()
     ):
-        materialize_reusable_artifact(
-            reuse_artifact_root / reusable["path"], target
-        )
+        materialize_reusable_artifact(reusable_path, target)
         current_matches = descriptor_matches_file(
             {
                 "path": relative(target, artifact_root),
@@ -266,6 +289,27 @@ def should_build_local_artifact(
             and (path.exists() or not reusable_matches)
         )
     )
+
+
+def reusable_latent_protocol_matches(
+    cache_schema: str,
+    reused_preprocess: dict,
+    current_preprocess: dict,
+) -> bool:
+    """Allow v4 migration while forbidding its noncanonical video latents."""
+    if reused_preprocess == current_preprocess:
+        return True
+    legacy_preprocess = {
+        key: value
+        for key, value in current_preprocess.items()
+        if key != "condition_frame"
+    }
+    if (
+        cache_schema == "phycontext.wan_ti2v_cache.v4"
+        and reused_preprocess == legacy_preprocess
+    ):
+        return False
+    raise ValueError("reused cache uses different video preprocessing")
 
 
 def select_records(records: list[dict], args: argparse.Namespace) -> list[dict]:
@@ -329,6 +373,37 @@ def load_video(path: Path, width: int, height: int, frame_count: int) -> torch.T
     frames = reader.get_batch(indices).asnumpy()
     cropped = cover_center_crop_frames(frames, width, height)
     return torch.from_numpy(cropped).permute(3, 0, 1, 2).float().div_(127.5).sub_(1.0)
+
+
+def load_canonical_first_frame(path: Path, width: int, height: int) -> torch.Tensor:
+    """Load the published group-shared TI2V condition frame."""
+    with Image.open(path) as image:
+        frame = np.asarray(image.convert("RGB"))[None]
+    cropped = cover_center_crop_frames(frame, width, height)
+    return (
+        torch.from_numpy(cropped)
+        .permute(3, 0, 1, 2)
+        .float()
+        .div_(127.5)
+        .sub_(1.0)
+    )
+
+
+def bind_canonical_condition_frame(
+    video: torch.Tensor,
+    canonical_first_frame: torch.Tensor,
+) -> torch.Tensor:
+    """Replace frame zero in-place before the full causal VAE encode."""
+    if video.ndim != 4 or video.shape[1] < 1:
+        raise ValueError("video must have shape [C, T, H, W] with T >= 1")
+    if canonical_first_frame.shape != video[:, :1].shape:
+        raise ValueError(
+            "canonical first frame and target video preprocessing differ"
+        )
+    if canonical_first_frame.device != video.device:
+        raise ValueError("canonical first frame and target video must share a device")
+    video[:, :1].copy_(canonical_first_frame)
+    return video
 
 
 def atomic_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
@@ -437,6 +512,7 @@ def main() -> None:
         "height": args.height,
         "frames": args.frames,
         "resize": "cover_then_center_crop",
+        "condition_frame": CANONICAL_CONDITION_FRAME_PROTOCOL,
     }
     expected_latent_shape = (
         48,
@@ -487,6 +563,8 @@ def main() -> None:
     reuse_records = {}
     reused_text_by_hash = {}
     reuse_artifact_root = root
+    reuse_latents = False
+    reuse_point_tracks = False
     if args.reuse_cache_manifest is not None:
         reuse_cache_path = (root / args.reuse_cache_manifest).resolve()
         reuse_cache_hash = sha256(reuse_cache_path)
@@ -502,19 +580,15 @@ def main() -> None:
             raise ValueError("reused cache belongs to a different dataset build")
         if Path(reuse_cache["checkpoint"]).resolve() != checkpoint:
             raise ValueError("reused cache belongs to a different Wan checkpoint")
-        if reuse_cache["preprocess"] != preprocess:
-            raise ValueError("reused cache uses different video preprocessing")
+        reuse_latents = reusable_latent_protocol_matches(
+            reuse_cache.get("schema"),
+            reuse_cache.get("preprocess"),
+            preprocess,
+        )
         reuse_artifact_root = resolve_cache_artifact_root(root, reuse_cache)
         reuse_records = {
             item["sample_id"]: item for item in reuse_cache["records"]
         }
-        missing_reuse = sorted(
-            record["sample_id"]
-            for record in selected
-            if record["sample_id"] not in reuse_records
-        )
-        if missing_reuse:
-            raise ValueError(f"reused cache is missing samples: {missing_reuse}")
         if point_manifest_path is not None:
             if reuse_cache.get("source_point_trajectory_manifest_sha256") != point_manifest_hash:
                 raise ValueError("reused cache belongs to a different point trajectory manifest")
@@ -524,8 +598,11 @@ def main() -> None:
                         "point-track preprocessing changed; use a new cache root "
                         "so old point maps cannot be reused"
                     )
-                # Latents and text are safe to reuse from the old cache.  Point
-                # maps are written into the new cache root with the new transform.
+                # Text is independent of trajectory rasterization. Point maps
+                # are rebuilt under the new transform; video latents are reused
+                # only when their condition-frame protocol also matches.
+            else:
+                reuse_point_tracks = True
         for item in reuse_records.values():
             descriptor = item["text_context"]
             reused_text_by_hash[descriptor["prompt_sha256"]] = descriptor
@@ -598,13 +675,18 @@ def main() -> None:
             cached_descriptor = cached.get(record["sample_id"], {}).get(
                 "point_track"
             )
-            current_matches = descriptor_matches_file(
-                cached_descriptor, point_path, artifact_root
+            reusable_descriptor = (
+                reuse_records.get(record["sample_id"], {}).get("point_track")
+                if reuse_point_tracks
+                else None
             )
-            if should_build_local_artifact(
+            if prepare_reusable_artifact(
                 point_path,
-                current_matches=current_matches,
-                overwrite=args.overwrite,
+                artifact_root,
+                reuse_artifact_root,
+                cached_descriptor,
+                reusable_descriptor,
+                args.overwrite,
             ):
                 point_track_targets.append((record, point_path))
         for index, (record, point_path) in enumerate(point_track_targets, 1):
@@ -688,37 +770,19 @@ def main() -> None:
     latent_targets = []
     for record in selected:
         latent_path = latent_root / f"{record['sample_id']}.safetensors"
-        reusable = reuse_records.get(record["sample_id"], {}).get("latent")
-        current = cached.get(record["sample_id"], {}).get("latent")
-        current_matches = descriptor_matches_file(current, latent_path, artifact_root)
-        reusable_matches = bool(
-            reusable
-            and (reuse_artifact_root / reusable["path"]).is_file()
-            and sha256(reuse_artifact_root / reusable["path"])
-            == reusable["sha256"]
+        reusable = (
+            reuse_records.get(record["sample_id"], {}).get("latent")
+            if reuse_latents
+            else None
         )
-        if (
-            reusable_matches
-            and not args.overwrite
-            and not current_matches
-            and not latent_path.exists()
-        ):
-            materialize_reusable_artifact(
-                reuse_artifact_root / reusable["path"], latent_path
-            )
-            current_matches = descriptor_matches_file(
-                {
-                    "path": relative(latent_path, artifact_root),
-                    "sha256": reusable["sha256"],
-                },
-                latent_path,
-                artifact_root,
-            )
-        if should_build_local_artifact(
+        current = cached.get(record["sample_id"], {}).get("latent")
+        if prepare_reusable_artifact(
             latent_path,
-            current_matches=current_matches,
-            reusable_matches=reusable_matches,
-            overwrite=args.overwrite,
+            artifact_root,
+            reuse_artifact_root,
+            current,
+            reusable,
+            args.overwrite,
         ):
             latent_targets.append((record, latent_path))
 
@@ -732,7 +796,12 @@ def main() -> None:
         )
         for index, (record, latent_path) in enumerate(latent_targets, 1):
             video_path = dataset_root / record["target"]["video"]
+            first_frame_path = dataset_root / record["conditioning"]["first_frame"]
             video = load_video(video_path, args.width, args.height, args.frames).to(device)
+            canonical_first_frame = load_canonical_first_frame(
+                first_frame_path, args.width, args.height
+            ).to(device)
+            bind_canonical_condition_frame(video, canonical_first_frame)
             with torch.inference_mode():
                 latent = vae.encode([video])[0].to(torch.bfloat16).cpu().contiguous()
             if tuple(latent.shape) != expected_latent_shape:
@@ -741,7 +810,7 @@ def main() -> None:
                     f"{tuple(latent.shape)} != {expected_latent_shape}"
                 )
             atomic_safetensors({"latent": latent}, latent_path)
-            del video, latent
+            del video, canonical_first_frame, latent
             if device.type == "cuda":
                 peak_memory = max(peak_memory, int(torch.cuda.max_memory_allocated(device)))
                 torch.cuda.empty_cache()
@@ -807,26 +876,23 @@ def main() -> None:
         video_path = dataset_root / record["target"]["video"]
         first_frame_path = dataset_root / record["conditioning"]["first_frame"]
         scene_path = dataset_root / record["conditioning"]["scene"]
-        reused = reuse_records.get(record["sample_id"], {})
-        latent_descriptor = (
-            {
-                "path": relative(latent_path, artifact_root),
-                "sha256": sha256(latent_path),
-                "shape": list(expected_latent_shape),
-                "dtype": "bfloat16",
-            }
-            if latent_path.is_file()
-            else reused["latent"]
-        )
-        text_descriptor = (
-            {
-                "path": relative(text_path, artifact_root),
-                "sha256": sha256(text_path),
-                "prompt_sha256": prompt_hash,
-            }
-            if text_path.is_file()
-            else reused_text_by_hash[prompt_hash]
-        )
+        if not latent_path.is_file() or not text_path.is_file():
+            raise FileNotFoundError(
+                f"cache artifacts were not materialized for {record['sample_id']}"
+            )
+        latent_descriptor = {
+            "path": relative(latent_path, artifact_root),
+            "sha256": sha256(latent_path),
+            "shape": list(expected_latent_shape),
+            "dtype": "bfloat16",
+            "condition_frame_sha256": sha256(first_frame_path),
+            "condition_frame_protocol": CANONICAL_CONDITION_FRAME_PROTOCOL,
+        }
+        text_descriptor = {
+            "path": relative(text_path, artifact_root),
+            "sha256": sha256(text_path),
+            "prompt_sha256": prompt_hash,
+        }
         cached_record = {
             "sample_id": record["sample_id"],
             "base_scene_id": record["base_scene_id"],

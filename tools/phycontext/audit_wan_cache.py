@@ -10,10 +10,12 @@ from safetensors.torch import load_file
 from schema import iter_jsonl, validate_training_record
 from project_defaults import CACHE_MANIFEST
 from cache_contract import (
+    CANONICAL_CONDITION_FRAME_PROTOCOL,
     CURRENT_CACHE_SCHEMA,
     FLOAT64_GEOMETRY_CACHE_SCHEMAS,
     FULL_RATE_DAS_CACHE_SCHEMAS,
     GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
+    SOURCE_FILE_HASH_CACHE_SCHEMAS,
     SUPPORTED_CACHE_SCHEMAS,
     resolve_cache_artifact_root,
     resolve_cache_dataset_root,
@@ -60,6 +62,12 @@ def main() -> None:
     dataset_root = resolve_cache_dataset_root(root, cache)
     artifact_root = resolve_cache_artifact_root(root, cache)
     errors = []
+    if (
+        cache_schema == CURRENT_CACHE_SCHEMA
+        and cache.get("preprocess", {}).get("condition_frame")
+        != CANONICAL_CONDITION_FRAME_PROTOCOL
+    ):
+        errors.append("cache does not use the canonical TI2V condition-frame protocol")
     try:
         source_manifest = validate_cache_source_manifest(root, cache)
     except (ValueError, FileNotFoundError) as error:
@@ -204,7 +212,7 @@ def main() -> None:
         except ValueError as error:
             errors.append(f"invalid training record {sample_id}: {error}")
 
-        if cache_schema == CURRENT_CACHE_SCHEMA:
+        if cache_schema in SOURCE_FILE_HASH_CACHE_SCHEMAS:
             for record_key, hash_key, label in (
                 ("first_frame", "source_first_frame_sha256", "first frame"),
                 ("scene", "source_scene_sha256", "scene condition"),
@@ -238,6 +246,15 @@ def main() -> None:
                 )
             if latent.dtype != torch.bfloat16 or not torch.isfinite(latent.float()).all():
                 errors.append(f"invalid latent values: {sample_id}")
+        if cache_schema == CURRENT_CACHE_SCHEMA:
+            latent_descriptor = item.get("latent", {})
+            if (
+                latent_descriptor.get("condition_frame_protocol")
+                != CANONICAL_CONDITION_FRAME_PROTOCOL
+                or latent_descriptor.get("condition_frame_sha256")
+                != item.get("source_first_frame_sha256")
+            ):
+                errors.append(f"latent condition-frame binding mismatch: {sample_id}")
         if text_path.is_file():
             context = load_file(str(text_path), device="cpu")["context"]
             if context.ndim != 2 or context.shape[1] != 4096 or context.shape[0] > 512:

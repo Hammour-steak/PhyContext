@@ -5,10 +5,35 @@ import torch
 from torch import nn
 
 from point_trajectory import MAX_OBJECTS
+from video_preprocess import cover_center_crop_intrinsics
 
 
-def load_scene_condition(path: Path, device=None) -> dict[str, torch.Tensor]:
+def load_scene_condition(
+    path: Path,
+    device=None,
+    target_size_px: tuple[int, int] | None = None,
+) -> dict[str, torch.Tensor]:
     with np.load(path, allow_pickle=False) as archive:
+        if target_size_px is None:
+            normalized_intrinsics = archive["camera_intrinsics_normalized"].astype(
+                np.float32
+            )
+        else:
+            intrinsics = cover_center_crop_intrinsics(
+                archive["camera_intrinsics"],
+                archive["image_size_px"],
+                target_size_px,
+            )
+            target_width, target_height = target_size_px
+            normalized_intrinsics = np.asarray(
+                [
+                    intrinsics[0, 0] / target_width,
+                    intrinsics[1, 1] / target_height,
+                    intrinsics[0, 2] / target_width,
+                    intrinsics[1, 2] / target_height,
+                ],
+                dtype=np.float32,
+            )
         result = {
             "object_xyz_camera_m": torch.from_numpy(
                 archive["object_xyz_camera_m"].astype(np.float32)
@@ -29,7 +54,7 @@ def load_scene_condition(path: Path, device=None) -> dict[str, torch.Tensor]:
                 archive["environment_restitution"].astype(np.float32)
             ),
             "camera_intrinsics_normalized": torch.from_numpy(
-                archive["camera_intrinsics_normalized"].astype(np.float32)
+                normalized_intrinsics
             ),
         }
     if device is not None:

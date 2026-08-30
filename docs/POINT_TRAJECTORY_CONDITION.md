@@ -33,8 +33,10 @@ corner-aligned scale.
 After source-array decoding, rasterization geometry stays in float64 through
 projection, resize, and crop, and is converted to integer pixels only at the
 z-buffer; this prevents additional precision loss at a half-pixel rounding
-boundary. Cache schema v4 records this contract together with static-point camera
-clipping, so older point maps cannot be consumed as current DaS conditions.
+boundary. Cache schemas v4 and v5 record this geometry contract together with
+static-point camera clipping; v5 additionally binds the canonical TI2V first
+frame before the full causal VAE encode. Older point maps cannot be consumed as
+current DaS conditions.
 
 `unproject_physweep_tracks` provides the metric-depth inverse of the published
 projection. `tools/phycontext/audit_das_roundtrip.py` uses it to verify a real
@@ -80,7 +82,7 @@ fixed shape is `[18, T_latent, H_latent, W_latent]`.
 Old caches and checkpoints are not overwritten. DaS-style caching uses:
 
 ```text
-cache/wan/physweep_training/das_3d_tracks_fullres_v4_832x480x97/
+cache/wan/physweep_training/das_3d_tracks_canonical_v5_832x480x97/
 ```
 
 The legacy cache remains under `dense_point_tracks_832x480x97/`.
