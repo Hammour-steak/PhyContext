@@ -74,7 +74,7 @@ from wan_training import (
     trajectory_conditioner_parameters,
 )
 from temporal_supervision import (
-    clean_video_temporal_losses,
+    clean_video_flow_residual_loss,
     load_temporal_supervision,
 )
 
@@ -183,10 +183,17 @@ def parse_args() -> argparse.Namespace:
         "--trajectory-distribution-loss-weight", type=float, default=0.05
     )
     parser.add_argument("--trajectory-velocity-loss-weight", type=float, default=0.2)
-    parser.add_argument("--object-temporal-loss-weight", type=float, default=0.1)
-    parser.add_argument("--background-temporal-loss-weight", type=float, default=0.05)
-    parser.add_argument("--object-temporal-beta", type=float, default=0.02)
-    parser.add_argument("--background-temporal-beta", type=float, default=0.02)
+    parser.add_argument("--flow-temporal-loss-weight", type=float, default=0.1)
+    parser.add_argument("--flow-temporal-beta", type=float, default=0.02)
+    parser.add_argument(
+        "--flow-foreground-share",
+        type=float,
+        default=0.5,
+        help=(
+            "share of the single flow residual assigned to visible material "
+            "points; the remainder is assigned to stable zero-flow background"
+        ),
+    )
     parser.add_argument(
         "--temporal-loss-resolution",
         type=int,
@@ -203,7 +210,7 @@ def parse_args() -> argparse.Namespace:
         "--background-mask-dilation-px",
         type=int,
         default=2,
-        help="three-frame object-sweep margin at temporal-loss resolution",
+        help="two-frame object-sweep margin at temporal-loss resolution",
     )
     parser.add_argument(
         "--background-stability-threshold",
@@ -570,11 +577,8 @@ def apply_learning_rate(optimizer, factor: float) -> dict[str, float]:
     return values
 
 
-def temporal_losses_enabled(args: argparse.Namespace) -> bool:
-    return bool(
-        getattr(args, "object_temporal_loss_weight", 0.0) > 0
-        or getattr(args, "background_temporal_loss_weight", 0.0) > 0
-    )
+def temporal_flow_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "flow_temporal_loss_weight", 0.0) > 0)
 
 
 def scheduled_temporal_window(
@@ -583,13 +587,23 @@ def scheduled_temporal_window(
     world_size: int,
     latent_frame_count: int,
 ) -> int:
-    """Cycle adjacent two-chunk windows across steps and distributed ranks."""
+    """Reserve one quarter of flow windows for the condition boundary.
+
+    The remaining distributed slots cycle uniformly over every later
+    two-chunk window.  This keeps the unique frame-0-to-frame-1 anchor from
+    being diluted to one out of all 23 possible windows.
+    """
     if schedule_index < 0 or rank < 0 or world_size <= 0 or rank >= world_size:
         raise ValueError("temporal chunk schedule arguments are invalid")
     window_count = latent_frame_count - 2
     if window_count <= 0:
         raise ValueError("temporal supervision requires two generated latent chunks")
-    return 1 + (schedule_index * world_size + rank) % window_count
+    global_slot = schedule_index * world_size + rank
+    if global_slot % 4 == 0 or window_count == 1:
+        return 1
+    preceding_boundary_slots = global_slot // 4 + 1
+    later_slot = global_slot - preceding_boundary_slots
+    return 2 + later_slot % (window_count - 1)
 
 
 def load_microbatch(
@@ -918,22 +932,28 @@ def forward_losses(
         )
         temporal = {
             key: reconstruction.new_zeros(())
-            for key in ("object", "background", "object_pairs", "background_pixels")
+            for key in (
+                "flow",
+                "object",
+                "background",
+                "object_pairs",
+                "background_pixels",
+            )
         }
-        if temporal_losses_enabled(args):
+        if temporal_flow_enabled(args):
             if vae is None or loaded.get("temporal_supervision") is None:
                 raise RuntimeError(
-                    "decoded temporal losses are enabled but their VAE/data are missing"
+                    "decoded temporal flow is enabled but its VAE/data are missing"
                 )
             with torch.autocast(device_type="cuda", enabled=False):
-                temporal = clean_video_temporal_losses(
+                temporal = clean_video_flow_residual_loss(
                     predicted_clean,
                     loaded["latents"],
                     loaded["temporal_supervision"],
                     vae,
                     decoded_resolution=args.temporal_loss_resolution,
-                    object_beta=args.object_temporal_beta,
-                    background_beta=args.background_temporal_beta,
+                    beta=args.flow_temporal_beta,
+                    foreground_share=args.flow_foreground_share,
                     background_dilation_px=args.background_mask_dilation_px,
                     background_stability_threshold=(
                         args.background_stability_threshold
@@ -956,8 +976,7 @@ def forward_losses(
         total = (
             args.reconstruction_loss_weight * reconstruction
             + args.lpips_loss_weight * lpips_loss
-            + args.object_temporal_loss_weight * temporal["object"]
-            + args.background_temporal_loss_weight * temporal["background"]
+            + args.flow_temporal_loss_weight * temporal["flow"]
             + args.response_loss_weight * response
             + args.trajectory_center_loss_weight * motion["center"]
             + args.trajectory_distribution_loss_weight * motion["distribution"]
@@ -970,10 +989,11 @@ def forward_losses(
         "trajectory_center": motion["center"],
         "trajectory_distribution": motion["distribution"],
         "trajectory_velocity": motion["velocity"],
-        "object_temporal": temporal["object"],
-        "background_temporal": temporal["background"],
-        "object_temporal_pairs": temporal["object_pairs"],
-        "background_temporal_pixels": temporal["background_pixels"],
+        "flow_temporal": temporal["flow"],
+        "flow_object": temporal["object"],
+        "flow_background": temporal["background"],
+        "flow_object_pairs": temporal["object_pairs"],
+        "flow_background_pixels": temporal["background_pixels"],
         "lpips": lpips_loss,
         "sigma": sigmas[0],
     }
@@ -1029,10 +1049,11 @@ def validate(
             "trajectory_center",
             "trajectory_distribution",
             "trajectory_velocity",
-            "object_temporal",
-            "background_temporal",
-            "object_temporal_pairs",
-            "background_temporal_pixels",
+            "flow_temporal",
+            "flow_object",
+            "flow_background",
+            "flow_object_pairs",
+            "flow_background_pixels",
             "lpips",
         )
     }
@@ -1069,7 +1090,7 @@ def validate(
                 scheduled_temporal_window(
                     batch_index, rank, world_size, latent_frame_count
                 )
-                if temporal_losses_enabled(args)
+                if temporal_flow_enabled(args)
                 else None
             ),
             video_frame_count=video_frame_count,
@@ -1280,33 +1301,43 @@ def adapter_metadata(
             "identity_reference": "current_target_frame_features",
         },
         "decoded_temporal_supervision": {
-            "enabled": temporal_losses_enabled(args),
+            "enabled": temporal_flow_enabled(args),
+            "objective": {
+                "type": "flow_aligned_rgb_temporal_residual",
+                "weight": args.flow_temporal_loss_weight,
+                "beta": args.flow_temporal_beta,
+                "aggregation": "foreground_background_convex_combination",
+                "foreground_share": args.flow_foreground_share,
+                "condition_boundary_window_share": 0.25,
+            },
             "decode": {
                 "space": "vae_decoded_rgb",
                 "long_edge": args.temporal_loss_resolution,
                 "spatial_resize": "aspect_preserving_integer_vae_latent_grid",
                 "time_mapping": "latent_k_to_source_frames_4k_minus_3_through_4k",
                 "causal_context": "exact_prefix_no_grad_selected_two_chunks_grad",
-                "window": "two_adjacent_latents_eight_source_frames",
+                "window": (
+                    "two_adjacent_generated_latents_eight_source_frames_with_"
+                    "condition_frame_prefix_for_first_window"
+                ),
                 "cross_chunk_transitions_supervised": True,
-                "condition_frame_excluded": True,
+                "condition_to_first_generated_transition_supervised": True,
             },
-            "object": {
-                "weight": args.object_temporal_loss_weight,
-                "beta": args.object_temporal_beta,
-                "objective": "same_visible_material_point_rgb_delta_matches_target",
+            "object_population": {
+                "correspondence": "projected_3d_material_point_flow",
+                "residual": "predicted_rgb_delta_matches_target_rgb_delta",
                 "visibility": (
-                    "global_dynamic_zbuffer_winner_inside_eroded_renderer_instance_mask"
+                    "visible_in_both_frames_after_global_dynamic_zbuffer_and_"
+                    "eroded_renderer_instance_mask"
                 ),
                 "mask_erosion_px_at_preprocess_resolution": (
                     args.temporal_mask_erosion_px
                 ),
             },
-            "background": {
-                "weight": args.background_temporal_loss_weight,
-                "beta": args.background_temporal_beta,
-                "objective": "rgb_second_temporal_difference_matches_target",
-                "region": "complement_of_three_frame_instance_mask_sweep",
+            "background_population": {
+                "correspondence": "identity_zero_flow",
+                "residual": "predicted_rgb_delta_matches_target_rgb_delta",
+                "region": "complement_of_two_frame_instance_mask_sweep",
                 "mask_dilation_px_at_decoded_resolution": (
                     args.background_mask_dilation_px
                 ),
@@ -1402,11 +1433,14 @@ def adapter_metadata(
         "trajectory_velocity_losses": [
             item["trajectory_velocity"] for item in history
         ],
-        "object_temporal_losses": [
-            item.get("object_temporal", 0.0) for item in history
+        "flow_temporal_losses": [
+            item.get("flow_temporal", 0.0) for item in history
         ],
-        "background_temporal_losses": [
-            item.get("background_temporal", 0.0) for item in history
+        "flow_object_diagnostics": [
+            item.get("flow_object", 0.0) for item in history
+        ],
+        "flow_background_diagnostics": [
+            item.get("flow_background", 0.0) for item in history
         ],
         "peak_cuda_memory_gib": peak_memory,
         "seed": args.seed,
@@ -1553,10 +1587,9 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "trajectory_center_loss_weight",
     "trajectory_distribution_loss_weight",
     "trajectory_velocity_loss_weight",
-    "object_temporal_loss_weight",
-    "background_temporal_loss_weight",
-    "object_temporal_beta",
-    "background_temporal_beta",
+    "flow_temporal_loss_weight",
+    "flow_temporal_beta",
+    "flow_foreground_share",
     "temporal_loss_resolution",
     "temporal_mask_erosion_px",
     "background_mask_dilation_px",
@@ -1686,14 +1719,10 @@ def main() -> None:
         raise ValueError("LPIPS weight and frame count must be nonnegative/positive")
     if args.lpips_temporal_window <= 0:
         raise ValueError("LPIPS temporal window must be positive")
-    temporal_weights = (
-        args.object_temporal_loss_weight,
-        args.background_temporal_loss_weight,
-    )
-    if min(temporal_weights) < 0:
-        raise ValueError("decoded temporal loss weights must be nonnegative")
-    if min(args.object_temporal_beta, args.background_temporal_beta) <= 0:
-        raise ValueError("decoded temporal Smooth-L1 betas must be positive")
+    if args.flow_temporal_loss_weight < 0:
+        raise ValueError("decoded flow loss weight must be nonnegative")
+    if args.flow_temporal_beta <= 0 or not 0 < args.flow_foreground_share < 1:
+        raise ValueError("decoded flow Smooth-L1 beta/share is invalid")
     if (
         args.temporal_loss_resolution < 16
         or args.temporal_loss_resolution % 16
@@ -1957,7 +1986,7 @@ def main() -> None:
         condition_encoder.to(device).train()
         vae = None
         perceptual_model = None
-        if args.lpips_loss_weight > 0 or temporal_losses_enabled(args):
+        if args.lpips_loss_weight > 0 or temporal_flow_enabled(args):
             from wan.modules.vae2_2 import Wan2_2_VAE
 
             vae = Wan2_2_VAE(
@@ -2028,10 +2057,11 @@ def main() -> None:
                     "trajectory_center",
                     "trajectory_distribution",
                     "trajectory_velocity",
-                    "object_temporal",
-                    "background_temporal",
-                    "object_temporal_pairs",
-                    "background_temporal_pixels",
+                    "flow_temporal",
+                    "flow_object",
+                    "flow_background",
+                    "flow_object_pairs",
+                    "flow_background_pixels",
                     "lpips",
                     "sigma",
                 )
@@ -2078,7 +2108,7 @@ def main() -> None:
                             world_size,
                             latent_frame_count,
                         )
-                        if temporal_losses_enabled(args)
+                        if temporal_flow_enabled(args)
                         else None
                     ),
                     video_frame_count=video_frame_count,

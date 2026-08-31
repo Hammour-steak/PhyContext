@@ -1,14 +1,20 @@
-"""Exact-time decoded-video supervision for PhyContext training.
+"""Exact-time decoded-video flow supervision for PhyContext training.
 
 Wan's causal VAE maps latent frame zero to source frame zero and every later
 latent frame ``k`` to source frames ``4k-3 .. 4k``.  The helpers in this module
-decode two adjacent four-frame chunks with their exact causal prefix, then apply
-two residual-matching objectives:
+decode two adjacent four-frame chunks with their exact causal prefix.  The first
+window also retains source frame zero so the condition-to-generation boundary
+is supervised.
 
-* the RGB change of the same visible material point must match the target; and
-* the RGB second difference of stable background pixels must match the target.
+One robust RGB residual objective is evaluated on two flow populations:
 
-Neither objective assumes that a moving object or the background is constant.
+* visible material points are transported by their projected 3D trajectories;
+* stable background pixels use identity (zero-flow) correspondences outside
+  the object sweep and target-dynamic regions.
+
+The two population means are combined into one scalar.  Neither population is
+assumed to have constant appearance; its predicted temporal RGB residual must
+match the corresponding target residual.
 """
 
 from __future__ import annotations
@@ -38,11 +44,14 @@ def source_frames_for_latent_window(
 
     Two chunks are used by formal training so transitions across VAE chunk
     boundaries receive the same supervision as transitions inside a chunk.
+    The first generated window is prefixed by source frame zero so the
+    condition-to-first-generated-frame transition cannot escape supervision.
     """
     if latent_window_start <= 0 or latent_window_chunks <= 0:
-        raise ValueError("temporal supervision must exclude latent frame zero")
+        raise ValueError("temporal supervision requires generated latent chunks")
     first = 4 * latent_window_start - 3
-    return list(range(first, first + 4 * latent_window_chunks))
+    generated = list(range(first, first + 4 * latent_window_chunks))
+    return [0, *generated] if latent_window_start == 1 else generated
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -232,8 +241,8 @@ def load_temporal_supervision(
     latent_window_chunks: int = 2,
     decoded_resolution: int,
     mask_erosion_px: int,
-) -> dict[str, torch.Tensor | int | str]:
-    """Load one exact eight-frame track/mask supervision window from PhysSweep."""
+) -> dict[str, torch.Tensor | int | str | bool]:
+    """Load one exact flow-supervision window from PhysSweep."""
     if decoded_resolution < 16 or decoded_resolution % 16:
         raise ValueError("temporal decoded long edge must be a multiple of 16")
     if mask_erosion_px < 0:
@@ -388,6 +397,7 @@ def load_temporal_supervision(
         "sample_id": str(cached_record["sample_id"]),
         "latent_window_start": int(latent_window_start),
         "latent_window_chunks": int(latent_window_chunks),
+        "includes_condition_frame": bool(latent_window_start == 1),
         "source_frame_indices": torch.tensor(
             selected_source_frames, dtype=torch.int64
         ),
@@ -419,8 +429,10 @@ def decode_wan_causal_window(
     """Decode exact adjacent Wan chunks while bounding the autograd graph.
 
     Prefix chunks populate the frozen causal decoder's feature caches under
-    ``no_grad``.  The selected chunk retains gradients, so its forward values
-    are identical to a full-sequence decode without retaining 97 output frames.
+    ``no_grad``.  The selected generated chunks retain gradients, so their
+    forward values are identical to a full-sequence decode without retaining
+    97 output frames.  For the first generated window, the one-frame condition
+    output is retained without gradients as the temporal boundary anchor.
     """
     if latent.ndim != 4:
         raise ValueError("Wan latent must have shape C x F x H x W")
@@ -476,14 +488,17 @@ def decode_wan_causal_window(
                     feat_idx=model._conv_idx,
                     first_chunk=index == 0,
                 )
-                if index >= latent_window_start:
+                if index >= latent_window_start or (
+                    index == 0 and latent_window_start == 1
+                ):
                     selected_outputs.append(output)
-        if len(selected_outputs) != latent_window_chunks:
+        expected_outputs = latent_window_chunks + int(latent_window_start == 1)
+        if len(selected_outputs) != expected_outputs:
             raise RuntimeError("Wan temporal decoder produced an incomplete window")
         decoded = _unpatchify_2x(torch.cat(selected_outputs, dim=2)).squeeze(0).float()
         expected_shape = (
             3,
-            4 * latent_window_chunks,
+            4 * latent_window_chunks + int(latent_window_start == 1),
             latent_height * 16,
             latent_width * 16,
         )
@@ -514,7 +529,7 @@ def _sample_tracks(video: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     )
 
 
-def object_track_temporal_residual_loss(
+def object_flow_residual_loss(
     predicted_video: torch.Tensor,
     target_video: torch.Tensor,
     track_grid: torch.Tensor,
@@ -524,11 +539,11 @@ def object_track_temporal_residual_loss(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Match RGB changes at the same point when it is visible in both frames."""
     if predicted_video.shape != target_video.shape:
-        raise ValueError("object temporal videos must have equal shapes")
+        raise ValueError("object flow videos must have equal shapes")
     if track_grid.shape[:-1] != track_visible.shape:
         raise ValueError("track coordinates and visibility axes differ")
     if beta <= 0:
-        raise ValueError("object temporal Smooth-L1 beta must be positive")
+        raise ValueError("object flow Smooth-L1 beta must be positive")
     prediction_samples = _sample_tracks(predicted_video.float(), track_grid.float())
     target_samples = _sample_tracks(
         target_video.detach().float(), track_grid.float()
@@ -549,7 +564,7 @@ def object_track_temporal_residual_loss(
     return error[valid_pairs].mean(), pair_count.to(dtype=torch.float32)
 
 
-def background_temporal_residual_loss(
+def background_flow_residual_loss(
     predicted_video: torch.Tensor,
     target_video: torch.Tensor,
     object_masks: torch.Tensor,
@@ -558,26 +573,21 @@ def background_temporal_residual_loss(
     stability_threshold: float,
     beta: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Match second temporal differences outside three-frame object sweeps."""
+    """Match zero-flow RGB residuals on target-stable background pairs."""
     if predicted_video.shape != target_video.shape:
-        raise ValueError("background temporal videos must have equal shapes")
+        raise ValueError("background flow videos must have equal shapes")
     if object_masks.ndim != 4 or object_masks.shape[0] != predicted_video.shape[1]:
         raise ValueError("object masks must have shape F x O x H x W")
     if object_masks.shape[-2:] != predicted_video.shape[-2:]:
         raise ValueError("background masks and decoded video sizes differ")
     if dilation_px < 0 or not 0 < stability_threshold <= 2 or beta <= 0:
-        raise ValueError("background temporal dilation/threshold/beta is invalid")
+        raise ValueError("background flow dilation/threshold/beta is invalid")
     prediction = predicted_video.float()
     target = target_video.detach().float()
-    prediction_second = prediction[:, 2:] - 2.0 * prediction[:, 1:-1] + prediction[:, :-2]
-    target_second = target[:, 2:] - 2.0 * target[:, 1:-1] + target[:, :-2]
+    prediction_delta = prediction[:, 1:] - prediction[:, :-1]
+    target_delta = target[:, 1:] - target[:, :-1]
     object_union = object_masks.bool().any(dim=1)
-    swept = torch.stack(
-        [
-            object_union[index : index + 3].any(dim=0)
-            for index in range(object_union.shape[0] - 2)
-        ]
-    )
+    swept = object_union[1:] | object_union[:-1]
     if dilation_px:
         kernel = dilation_px * 2 + 1
         swept = F.max_pool2d(
@@ -586,14 +596,7 @@ def background_temporal_residual_loss(
             stride=1,
             padding=dilation_px,
         ).squeeze(1).bool()
-    target_pair_change = (target[:, 1:] - target[:, :-1]).abs().amax(dim=0)
-    target_dynamic = torch.stack(
-        [
-            target_pair_change[index : index + 2].amax(dim=0)
-            > stability_threshold
-            for index in range(target_pair_change.shape[0] - 1)
-        ]
-    )
+    target_dynamic = target_delta.abs().amax(dim=0) > stability_threshold
     # The mask is target-only: shadows, reflections, disocclusions, and other
     # genuinely changing regions cannot be mislabeled as stable background,
     # while a bad prediction cannot hide itself by altering the mask.
@@ -603,34 +606,37 @@ def background_temporal_residual_loss(
     if not bool(pixel_count):
         return zero, pixel_count.to(dtype=torch.float32)
     error = F.smooth_l1_loss(
-        prediction_second,
-        target_second,
+        prediction_delta,
+        target_delta,
         beta=beta,
         reduction="none",
     ).mean(dim=0)
     return error[stable_background].mean(), pixel_count.to(dtype=torch.float32)
 
 
-def clean_video_temporal_losses(
+def clean_video_flow_residual_loss(
     predicted_clean: list[torch.Tensor],
     target_clean: list[torch.Tensor],
-    supervision: list[dict[str, torch.Tensor | int | str]],
+    supervision: list[dict[str, torch.Tensor | int | str | bool]],
     vae,
     *,
     decoded_resolution: int,
-    object_beta: float,
-    background_beta: float,
+    beta: float,
+    foreground_share: float,
     background_dilation_px: int,
     background_stability_threshold: float,
 ) -> dict[str, torch.Tensor]:
-    """Decode exact chunks and average the two temporal objectives over a batch."""
+    """Decode exact chunks and return one flow-aligned residual objective."""
     if not (
         len(predicted_clean) == len(target_clean) == len(supervision)
         and predicted_clean
     ):
         raise ValueError("temporal prediction, target, and supervision batches differ")
-    object_losses = []
-    background_losses = []
+    if beta <= 0 or not 0 < foreground_share < 1:
+        raise ValueError("flow beta/share is invalid")
+    flow_losses = []
+    object_diagnostics = []
+    background_diagnostics = []
     object_pair_counts = []
     background_pixel_counts = []
     decoded_targets = {}
@@ -657,45 +663,54 @@ def clean_video_temporal_losses(
                     window_chunks,
                 )
         decoded_target = decoded_targets[target_key]
-        object_loss, object_pairs = object_track_temporal_residual_loss(
+        expected_condition = bool(sample["includes_condition_frame"])
+        if expected_condition != (window_start == 1):
+            raise ValueError("flow supervision condition-boundary flag is invalid")
+        object_loss, object_pairs = object_flow_residual_loss(
             decoded_prediction,
             decoded_target,
             sample["track_grid"],
             sample["track_visible"],
-            beta=object_beta,
+            beta=beta,
         )
-        background_loss, background_pixels = background_temporal_residual_loss(
+        background_loss, background_pixels = background_flow_residual_loss(
             decoded_prediction,
             decoded_target,
             sample["object_masks"],
             dilation_px=background_dilation_px,
             stability_threshold=background_stability_threshold,
-            beta=background_beta,
+            beta=beta,
         )
-        object_losses.append(object_loss)
-        background_losses.append(background_loss)
+        has_object = bool(object_pairs)
+        has_background = bool(background_pixels)
+        if has_object and has_background:
+            flow_losses.append(
+                foreground_share * object_loss
+                + (1.0 - foreground_share) * background_loss
+            )
+        elif has_object:
+            flow_losses.append(object_loss)
+        elif has_background:
+            flow_losses.append(background_loss)
+        else:
+            flow_losses.append(decoded_prediction.sum() * 0.0)
+        if has_object:
+            object_diagnostics.append(object_loss)
+        if has_background:
+            background_diagnostics.append(background_loss)
         object_pair_counts.append(object_pairs)
         background_pixel_counts.append(background_pixels)
-    valid_object_losses = [
-        loss
-        for loss, count in zip(object_losses, object_pair_counts)
-        if bool(count)
-    ]
-    valid_background_losses = [
-        loss
-        for loss, count in zip(background_losses, background_pixel_counts)
-        if bool(count)
-    ]
     zero = predicted_clean[0].sum() * 0.0
     return {
+        "flow": torch.stack(flow_losses).mean(),
         "object": (
-            torch.stack(valid_object_losses).mean()
-            if valid_object_losses
+            torch.stack(object_diagnostics).mean()
+            if object_diagnostics
             else zero
         ),
         "background": (
-            torch.stack(valid_background_losses).mean()
-            if valid_background_losses
+            torch.stack(background_diagnostics).mean()
+            if background_diagnostics
             else zero
         ),
         "object_pairs": torch.stack(object_pair_counts).mean(),

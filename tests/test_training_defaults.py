@@ -458,15 +458,20 @@ class TrainingDefaultTests(unittest.TestCase):
         self.assertEqual(
             formal_config["validation_batches"], args.validation_batches
         )
-        self.assertGreater(args.object_temporal_loss_weight, 0.0)
-        self.assertGreater(args.background_temporal_loss_weight, 0.0)
+        self.assertGreater(args.flow_temporal_loss_weight, 0.0)
+        self.assertGreater(args.flow_temporal_beta, 0.0)
+        self.assertTrue(0.0 < args.flow_foreground_share < 1.0)
         self.assertEqual(
-            formal_config["object_temporal_loss_weight"],
-            args.object_temporal_loss_weight,
+            formal_config["flow_temporal_loss_weight"],
+            args.flow_temporal_loss_weight,
         )
         self.assertEqual(
-            formal_config["background_temporal_loss_weight"],
-            args.background_temporal_loss_weight,
+            formal_config["flow_temporal_beta"],
+            args.flow_temporal_beta,
+        )
+        self.assertEqual(
+            formal_config["flow_foreground_share"],
+            args.flow_foreground_share,
         )
         self.assertEqual(
             (VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FRAMES), (832, 480, 97)

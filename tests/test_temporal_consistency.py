@@ -14,10 +14,10 @@ from train_wan_formal import (  # noqa: E402
     scheduled_temporal_window,
 )
 from temporal_supervision import (  # noqa: E402
-    background_temporal_residual_loss,
+    background_flow_residual_loss,
     decode_wan_causal_window,
     dynamic_zbuffer_visibility_from_masks,
-    object_track_temporal_residual_loss,
+    object_flow_residual_loss,
     source_frames_for_latent_window,
     temporal_decoded_size,
 )
@@ -75,19 +75,23 @@ class FakeCausalVAE:
 
 
 class TemporalConsistencyTest(unittest.TestCase):
-    def test_source_frame_mapping_excludes_condition_frame(self):
-        self.assertEqual(source_frames_for_latent_window(1), list(range(1, 9)))
+    def test_source_frame_mapping_includes_first_condition_boundary(self):
+        self.assertEqual(
+            source_frames_for_latent_window(1),
+            [0, *range(1, 9)],
+        )
         self.assertEqual(source_frames_for_latent_window(23), list(range(89, 97)))
         with self.assertRaises(ValueError):
             source_frames_for_latent_window(0)
 
     def test_distributed_schedule_covers_every_two_chunk_window(self):
-        selected = {
+        selected = [
             scheduled_temporal_window(step, rank, 4, 25)
             for step in range(23)
             for rank in range(4)
-        }
-        self.assertEqual(selected, set(range(1, 24)))
+        ]
+        self.assertEqual(set(selected), set(range(1, 24)))
+        self.assertEqual(selected.count(1), len(selected) // 4)
 
     def test_temporal_decode_preserves_video_aspect_ratio_on_latent_grid(self):
         self.assertEqual(temporal_decoded_size((832, 480), 128), (128, 80))
@@ -102,6 +106,17 @@ class TemporalConsistencyTest(unittest.TestCase):
         self.assertEqual(float(latent.grad[:, :3].abs().sum()), 0.0)
         self.assertGreater(float(latent.grad[:, 3].abs().sum()), 0.0)
         self.assertGreater(float(latent.grad[:, 4].abs().sum()), 0.0)
+
+    def test_first_causal_window_retains_fixed_condition_anchor(self):
+        latent = (0.1 * torch.randn(12, 4, 1, 1)).requires_grad_(True)
+        decoded = decode_wan_causal_window(
+            FakeCausalVAE(), latent, latent_window_start=1, decoded_resolution=16
+        )
+        self.assertEqual(tuple(decoded.shape), (3, 9, 16, 16))
+        decoded.square().mean().backward()
+        self.assertEqual(float(latent.grad[:, 0].abs().sum()), 0.0)
+        self.assertGreater(float(latent.grad[:, 1].abs().sum()), 0.0)
+        self.assertGreater(float(latent.grad[:, 2].abs().sum()), 0.0)
 
     def test_dynamic_zbuffer_keeps_only_nearest_masked_point(self):
         tracks = np.asarray([[[[2.0, 2.0], [2.0, 2.0]]]])
@@ -124,7 +139,7 @@ class TemporalConsistencyTest(unittest.TestCase):
             [pixel_grid(x, y, width, height) for x, y in positions]
         ).view(4, 1, 1, 2)
         visible = torch.ones(4, 1, 1, dtype=torch.bool)
-        loss, pairs = object_track_temporal_residual_loss(
+        loss, pairs = object_flow_residual_loss(
             prediction, target, grid, visible, beta=0.02
         )
         self.assertEqual(float(loss), 0.0)
@@ -139,13 +154,13 @@ class TemporalConsistencyTest(unittest.TestCase):
         prediction.requires_grad_(True)
         grid = pixel_grid(2, 2, 5, 5).view(1, 1, 1, 2).repeat(4, 1, 1, 1)
         visible = torch.ones(4, 1, 1, dtype=torch.bool)
-        loss, _ = object_track_temporal_residual_loss(
+        loss, _ = object_flow_residual_loss(
             prediction, target, grid, visible, beta=0.02
         )
         self.assertGreater(float(loss), 0.0)
         occluded = visible.clone()
         occluded[2] = False
-        ignored, pairs = object_track_temporal_residual_loss(
+        ignored, pairs = object_flow_residual_loss(
             prediction, target, grid, occluded, beta=0.02
         )
         self.assertEqual(float(ignored), 0.0)
@@ -157,20 +172,20 @@ class TemporalConsistencyTest(unittest.TestCase):
         prediction[:, 4, 2, 2] = 1.0
         grid = pixel_grid(2, 2, 5, 5).view(1, 1, 1, 2).repeat(8, 1, 1, 1)
         visible = torch.ones(8, 1, 1, dtype=torch.bool)
-        loss, pairs = object_track_temporal_residual_loss(
+        loss, pairs = object_flow_residual_loss(
             prediction, target, grid, visible, beta=0.02
         )
         self.assertGreater(float(loss), 0.0)
         self.assertEqual(int(pairs), 7)
 
-    def test_background_loss_excludes_three_frame_object_sweep(self):
+    def test_background_loss_excludes_two_frame_object_sweep(self):
         target = torch.zeros(3, 4, 7, 7)
         prediction = target.clone()
         prediction[:, 1, 3, 3] = 1.0
         prediction.requires_grad_(True)
         masks = torch.zeros(4, 1, 7, 7, dtype=torch.bool)
         masks[:, 0, 3, 3] = True
-        loss, pixels = background_temporal_residual_loss(
+        loss, pixels = background_flow_residual_loss(
             prediction,
             target,
             masks,
@@ -186,7 +201,7 @@ class TemporalConsistencyTest(unittest.TestCase):
         target[:, :, 0, 0] = torch.tensor([0.0, 0.2, 0.7, 1.0])
         matching = target.clone().requires_grad_(True)
         masks = torch.zeros(4, 1, 5, 5, dtype=torch.bool)
-        exact, _ = background_temporal_residual_loss(
+        exact, _ = background_flow_residual_loss(
             matching,
             target,
             masks,
@@ -198,7 +213,7 @@ class TemporalConsistencyTest(unittest.TestCase):
         extra = target.clone()
         extra[:, 2, 4, 4] = 1.0
         extra.requires_grad_(True)
-        loss, _ = background_temporal_residual_loss(
+        loss, _ = background_flow_residual_loss(
             extra,
             target,
             masks,
@@ -215,7 +230,7 @@ class TemporalConsistencyTest(unittest.TestCase):
         prediction = target.clone()
         prediction[:, 4, 0, 0] = 1.0
         masks = torch.zeros(8, 1, 5, 5, dtype=torch.bool)
-        loss, _ = background_temporal_residual_loss(
+        loss, _ = background_flow_residual_loss(
             prediction,
             target,
             masks,
@@ -229,7 +244,7 @@ class TemporalConsistencyTest(unittest.TestCase):
         target = torch.zeros(3, 4, 5, 5)
         target[:, :, 0, 0] = torch.tensor([0.0, 0.01, 0.03, 0.04])
         masks = torch.zeros(4, 1, 5, 5, dtype=torch.bool)
-        exact, _ = background_temporal_residual_loss(
+        exact, _ = background_flow_residual_loss(
             target,
             target,
             masks,
@@ -237,7 +252,7 @@ class TemporalConsistencyTest(unittest.TestCase):
             stability_threshold=0.05,
             beta=0.02,
         )
-        stationary, _ = background_temporal_residual_loss(
+        stationary, _ = background_flow_residual_loss(
             torch.zeros_like(target),
             target,
             masks,
@@ -252,7 +267,7 @@ class TemporalConsistencyTest(unittest.TestCase):
         target = torch.zeros(3, 4, 5, 5)
         target[:, 2:, 0, 0] = 1.0
         masks = torch.zeros(4, 1, 5, 5, dtype=torch.bool)
-        loss, _ = background_temporal_residual_loss(
+        loss, _ = background_flow_residual_loss(
             torch.zeros_like(target),
             target,
             masks,
@@ -261,6 +276,37 @@ class TemporalConsistencyTest(unittest.TestCase):
             beta=0.02,
         )
         self.assertEqual(float(loss), 0.0)
+
+    def test_background_flow_detects_condition_boundary_disappearance(self):
+        target = torch.zeros(3, 9, 5, 5)
+        target[:, :, 0, 0] = 1.0
+        prediction = target.clone()
+        prediction[:, 1:, 0, 0] = 0.0
+        masks = torch.zeros(9, 1, 5, 5, dtype=torch.bool)
+        loss, _ = background_flow_residual_loss(
+            prediction,
+            target,
+            masks,
+            dilation_px=0,
+            stability_threshold=0.05,
+            beta=0.02,
+        )
+        self.assertGreater(float(loss), 0.0)
+
+    def test_background_flow_rejects_linear_drift(self):
+        target = torch.zeros(3, 5, 5, 5)
+        prediction = target.clone()
+        prediction[:, :, 0, 0] = torch.linspace(0.0, 0.8, 5)
+        masks = torch.zeros(5, 1, 5, 5, dtype=torch.bool)
+        loss, _ = background_flow_residual_loss(
+            prediction,
+            target,
+            masks,
+            dilation_px=0,
+            stability_threshold=0.05,
+            beta=0.02,
+        )
+        self.assertGreater(float(loss), 0.0)
 
     def test_lpips_decodes_contiguous_temporal_windows(self):
         predicted = torch.randn(3, 7, 8, 8, requires_grad=True)
