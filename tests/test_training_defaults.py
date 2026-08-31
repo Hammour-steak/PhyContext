@@ -457,6 +457,16 @@ class TrainingDefaultTests(unittest.TestCase):
         self.assertEqual(
             formal_config["validation_batches"], args.validation_batches
         )
+        self.assertGreater(args.object_temporal_loss_weight, 0.0)
+        self.assertGreater(args.background_temporal_loss_weight, 0.0)
+        self.assertEqual(
+            formal_config["object_temporal_loss_weight"],
+            args.object_temporal_loss_weight,
+        )
+        self.assertEqual(
+            formal_config["background_temporal_loss_weight"],
+            args.background_temporal_loss_weight,
+        )
         self.assertEqual(
             (VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FRAMES), (832, 480, 97)
         )
@@ -524,6 +534,7 @@ class TrainingDefaultTests(unittest.TestCase):
         fingerprints = train_wan_formal.training_code_sha256()
         self.assertIn("tools/phycontext/video_preprocess.py", fingerprints)
         self.assertIn("tools/phycontext/point_trajectory.py", fingerprints)
+        self.assertIn("tools/phycontext/temporal_supervision.py", fingerprints)
 
     def test_dataset_override_cannot_reuse_the_original_trajectory(self) -> None:
         with patch.object(

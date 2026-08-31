@@ -55,8 +55,28 @@ left unchanged. The production path always uses each target sample's own
 trajectory.
 
 The maintained objective combines flow matching, controlled-region
-reconstruction, trajectory alignment, and optional LPIPS supervision. The
-formal configuration is the single source of truth for weights and schedules.
+reconstruction, trajectory alignment, LPIPS, and two decoded-video temporal
+residual objectives:
+
+- Object appearance is sampled at the same simulator material point in
+  consecutive frames. Only points that win the dynamic z-buffer in both frames
+  and lie inside an eroded renderer instance mask are used. The predicted RGB
+  change must match the target RGB change, so real translation, rotation, and
+  lighting change are not incorrectly forced to zero.
+- Background supervision uses second temporal differences. It excludes the
+  three-frame union of all instance masks (with dilation) and target regions
+  that change enough to indicate shadows, reflections, occlusion, or
+  disocclusion. The predicted second difference matches the target rather than
+  assuming a static value.
+
+Wan latent zero is the condition frame; latent `k >= 1` maps to source frames
+`4k-3 .. 4k`. Training decodes two adjacent generated latents at a time with
+their exact causal prefix. Prefix cache construction is detached, while both
+selected latents retain gradients. The resulting eight-frame window includes
+the VAE four-frame boundary, so no periodic transition is left unsupervised.
+Spatial resizing preserves aspect ratio on the integer VAE grid. The formal
+configuration is the single source of truth for weights, thresholds, and
+schedules.
 
 Required ablations are:
 

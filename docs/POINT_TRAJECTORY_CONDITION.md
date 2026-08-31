@@ -59,9 +59,18 @@ The trajectory conditioner preserves frame zero and applies a learned causal
 four-frame window to frames 1-96, producing the Wan-aligned temporal grid
 `[12, 25, 30, 52]` before patch projection. Empty slots are zero-filled. The explicit
 visibility channel avoids confusing black background with a valid point whose
-normalized coordinate color is near zero. Visibility also supplies a temporary
-source/current motion envelope for auxiliary training losses; it is not a second
-model condition.
+normalized coordinate color is near zero. Visibility also supplies the latent
+motion envelope used by reconstruction and coarse trajectory losses; it is not
+a second model condition.
+
+The decoded-video object temporal loss does not try to invert the many-to-one
+RGB condition map. It reloads the hash-bound raw 2,048-point trajectory and the
+renderer instance masks for an eight-frame training window, reruns a global
+dynamic z-buffer, and retains only double-visible points inside eroded masks.
+This avoids treating an averaged 30 x 52 identity color as an exact point ID.
+Static occlusion is supplied by the renderer mask; dynamic objects still
+compete in one depth buffer. The paired background objective excludes the
+dilated three-frame object sweep and target-dynamic non-background regions.
 
 Static occlusion uses the 8,192 environment points in the scene condition,
 transformed through the published camera transform or camera sequence. A single

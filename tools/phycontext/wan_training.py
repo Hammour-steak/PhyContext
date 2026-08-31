@@ -1351,41 +1351,6 @@ def latent_motion_supervision_losses(
     }
 
 
-def latent_temporal_consistency_loss(
-    predicted_clean: list[torch.Tensor],
-    target_clean: list[torch.Tensor],
-    beta: float = 0.05,
-) -> torch.Tensor:
-    """Match adjacent clean-latent changes without assuming zero motion.
-
-    This is an appearance/temporal loss rather than a trajectory-center loss:
-    the target delta preserves real object motion while discouraging unrelated
-    frame-to-frame changes in the background and object appearance.
-    """
-    if len(predicted_clean) != len(target_clean) or not predicted_clean:
-        raise ValueError("temporal loss inputs have different or empty batches")
-    if beta <= 0:
-        raise ValueError("temporal loss Smooth-L1 beta must be positive")
-    losses = []
-    for predicted, target in zip(predicted_clean, target_clean):
-        if predicted.ndim != 4 or target.ndim != 4 or predicted.shape != target.shape:
-            raise ValueError("temporal loss latents must share C x F x H x W")
-        if predicted.shape[1] < 2:
-            continue
-        predicted_delta = predicted.float()[:, 1:] - predicted.float()[:, :-1]
-        target_delta = target.detach().float()[:, 1:] - target.detach().float()[:, :-1]
-        losses.append(
-            F.smooth_l1_loss(
-                predicted_delta,
-                target_delta,
-                beta=beta,
-                reduction="mean",
-            )
-        )
-    zero = predicted_clean[0].sum() * 0.0
-    return torch.stack(losses).mean() if losses else zero
-
-
 def masked_flow_loss(
     predictions: list[torch.Tensor],
     targets: list[torch.Tensor],

@@ -31,6 +31,13 @@ stratified sample (40 by default), requiring tensor-exact point maps and latent
 reconstruction under the canonical first-frame protocol. The complementary
 `audit_vae_temporal_decode.py` verifies that cached latents decode to finite,
 correctly aligned video tensors and reports first-frame reconstruction error.
+`temporal_supervision.py` implements the formal anti-flicker objectives. It
+decodes exact eight-frame causal windows, uses hash-bound raw tracks plus
+renderer masks for double-visible object correspondences, and restricts the
+background objective to stable pixels outside the three-frame object sweep.
+It does not add another large cache or modify the published PhysSweep data.
+`audit_wan_adapter.py` fails closed on its decode protocol, positive weights and
+betas, per-step loss histories, and valid-point/background-pixel counters.
 
 ## PhysSweep release adapter
 

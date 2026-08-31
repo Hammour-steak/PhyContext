@@ -656,7 +656,10 @@ class WanTrainingTest(unittest.TestCase):
                 "trajectory_center": one,
                 "trajectory_distribution": one,
                 "trajectory_velocity": one,
-                "temporal_consistency": one,
+                "object_temporal": one,
+                "background_temporal": one,
+                "object_temporal_pairs": torch.tensor(3.0),
+                "background_temporal_pixels": torch.tensor(4.0),
                 "lpips": one,
             }
 

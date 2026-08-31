@@ -12,6 +12,7 @@ from safetensors.torch import load_file
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ADAPTER = Path("outputs/training/formal/final")
 TRAJECTORY_COMPONENTS = ("center", "distribution", "velocity")
+DECODED_TEMPORAL_COMPONENTS = ("object", "background")
 TRAJECTORY_REPRESENTATION_CONTRACTS = {
     "dense_point_tracks": {
         "input_channels": 18,
@@ -242,6 +243,65 @@ def main() -> None:
             parsed_weights
         ):
             errors.append("trajectory weights are all zero")
+    decoded_temporal_config = metadata.get("decoded_temporal_supervision")
+    decoded_temporal_histories = {
+        name: [
+            float(value)
+            for value in metadata.get(f"{name}_temporal_losses", [])
+        ]
+        for name in DECODED_TEMPORAL_COMPONENTS
+    }
+    if decoded_temporal_config is not None:
+        decoded_temporal_enabled = bool(
+            decoded_temporal_config.get("enabled")
+        )
+        decode_config = decoded_temporal_config.get("decode", {})
+        if (
+            decode_config.get("time_mapping")
+            != "latent_k_to_source_frames_4k_minus_3_through_4k"
+            or decode_config.get("window")
+            != "two_adjacent_latents_eight_source_frames"
+            or not decode_config.get("cross_chunk_transitions_supervised")
+            or not decode_config.get("condition_frame_excluded")
+        ):
+            errors.append("decoded temporal time/window contract is invalid")
+        if (
+            int(decode_config.get("long_edge", 0)) < 16
+            or int(decode_config.get("long_edge", 0)) % 16
+            or decode_config.get("spatial_resize")
+            != "aspect_preserving_integer_vae_latent_grid"
+        ):
+            errors.append("decoded temporal spatial contract is invalid")
+        decoded_temporal_weights = []
+        for name in DECODED_TEMPORAL_COMPONENTS:
+            component = decoded_temporal_config.get(name, {})
+            weight = component.get("weight")
+            beta = component.get("beta")
+            if (
+                weight is None
+                or not math.isfinite(float(weight))
+                or float(weight) < 0
+                or beta is None
+                or not math.isfinite(float(beta))
+                or float(beta) <= 0
+            ):
+                errors.append(f"decoded temporal {name} weight/beta is invalid")
+            else:
+                decoded_temporal_weights.append(float(weight))
+            history = decoded_temporal_histories[name]
+            if len(history) != int(metadata["steps"]):
+                errors.append(f"decoded temporal {name} history length mismatch")
+            elif not all(math.isfinite(value) and value >= 0 for value in history):
+                errors.append(f"decoded temporal {name} history is invalid")
+        for step in metadata.get("history", []):
+            for key in ("object_temporal_pairs", "background_temporal_pixels"):
+                value = step.get(key)
+                if value is None or not math.isfinite(float(value)) or float(value) < 0:
+                    errors.append(f"decoded temporal {key} history is invalid")
+                    break
+        if len(decoded_temporal_weights) == len(DECODED_TEMPORAL_COMPONENTS):
+            if decoded_temporal_enabled != any(decoded_temporal_weights):
+                errors.append("decoded temporal enabled flag disagrees with weights")
     report = {
         "passed": not errors,
         "adapter": str(adapter_root),
@@ -275,6 +335,24 @@ def main() -> None:
                     "max_loss": max(history) if history else None,
                 }
                 for name, history in trajectory_histories.items()
+            },
+        },
+        "decoded_temporal_supervision": {
+            "enabled": bool(
+                decoded_temporal_config
+                and decoded_temporal_config.get("enabled")
+            ),
+            "components": {
+                name: {
+                    "weight": (
+                        decoded_temporal_config.get(name, {}).get("weight")
+                        if decoded_temporal_config
+                        else None
+                    ),
+                    "final_loss": history[-1] if history else None,
+                    "max_loss": max(history) if history else None,
+                }
+                for name, history in decoded_temporal_histories.items()
             },
         },
         "errors": errors,

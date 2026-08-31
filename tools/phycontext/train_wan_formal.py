@@ -53,7 +53,6 @@ from wan_training import (
     inject_trajectory_conditioning,
     index_nominal_trajectory_records,
     latent_motion_supervision_losses,
-    latent_temporal_consistency_loss,
     load_condition_checkpoint,
     lora_parameters,
     make_formal_training_batch,
@@ -73,6 +72,10 @@ from wan_training import (
     trajectory_channel_names,
     validate_point_track_object_slots,
     trajectory_conditioner_parameters,
+)
+from temporal_supervision import (
+    clean_video_temporal_losses,
+    load_temporal_supervision,
 )
 
 
@@ -103,6 +106,7 @@ TRAINING_CODE_PATHS = (
     Path("tools/phycontext/video_preprocess.py"),
     Path("tools/phycontext/point_trajectory.py"),
     Path("tools/phycontext/cache_contract.py"),
+    Path("tools/phycontext/temporal_supervision.py"),
 )
 
 
@@ -170,10 +174,34 @@ def parse_args() -> argparse.Namespace:
         "--trajectory-distribution-loss-weight", type=float, default=0.05
     )
     parser.add_argument("--trajectory-velocity-loss-weight", type=float, default=0.2)
+    parser.add_argument("--object-temporal-loss-weight", type=float, default=0.1)
+    parser.add_argument("--background-temporal-loss-weight", type=float, default=0.05)
+    parser.add_argument("--object-temporal-beta", type=float, default=0.02)
+    parser.add_argument("--background-temporal-beta", type=float, default=0.02)
     parser.add_argument(
-        "--temporal-consistency-loss-weight", type=float, default=0.0
+        "--temporal-loss-resolution",
+        type=int,
+        default=128,
+        help="RGB long edge for aspect-preserving exact-time VAE supervision",
     )
-    parser.add_argument("--temporal-consistency-beta", type=float, default=0.05)
+    parser.add_argument(
+        "--temporal-mask-erosion-px",
+        type=int,
+        default=2,
+        help="instance-mask interior margin at the 832x480 preprocess resolution",
+    )
+    parser.add_argument(
+        "--background-mask-dilation-px",
+        type=int,
+        default=2,
+        help="three-frame object-sweep margin at temporal-loss resolution",
+    )
+    parser.add_argument(
+        "--background-stability-threshold",
+        type=float,
+        default=0.05,
+        help="maximum target RGB pair change for a stable background pixel",
+    )
     parser.add_argument("--trajectory-temperature", type=float, default=0.03)
     parser.add_argument("--trajectory-beta", type=float, default=0.05)
     parser.add_argument(
@@ -528,6 +556,28 @@ def apply_learning_rate(optimizer, factor: float) -> dict[str, float]:
     return values
 
 
+def temporal_losses_enabled(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "object_temporal_loss_weight", 0.0) > 0
+        or getattr(args, "background_temporal_loss_weight", 0.0) > 0
+    )
+
+
+def scheduled_temporal_window(
+    schedule_index: int,
+    rank: int,
+    world_size: int,
+    latent_frame_count: int,
+) -> int:
+    """Cycle adjacent two-chunk windows across steps and distributed ranks."""
+    if schedule_index < 0 or rank < 0 or world_size <= 0 or rank >= world_size:
+        raise ValueError("temporal chunk schedule arguments are invalid")
+    window_count = latent_frame_count - 2
+    if window_count <= 0:
+        raise ValueError("temporal supervision requires two generated latent chunks")
+    return 1 + (schedule_index * world_size + rank) % window_count
+
+
 def load_microbatch(
     artifact_root: Path,
     dataset_root: Path,
@@ -536,6 +586,10 @@ def load_microbatch(
     trajectory_batch: list[dict] | None = None,
     trajectory_representation: str = "das_3d_tracks",
     scene_size_px: tuple[int, int] | None = None,
+    temporal_window_start: int | None = None,
+    video_frame_count: int | None = None,
+    temporal_loss_resolution: int = 128,
+    temporal_mask_erosion_px: int = 2,
 ) -> dict:
     records = [item["record"] for item in batch]
     trajectory_representation = canonical_trajectory_representation(
@@ -572,6 +626,34 @@ def load_microbatch(
         trajectory_point_maps = target_point_maps
     else:
         trajectory_point_maps = [load_point_map(item) for item in trajectory_batch]
+    temporal_batch = None
+    if temporal_window_start is not None:
+        if scene_size_px is None or video_frame_count is None:
+            raise ValueError(
+                "temporal supervision requires video size and frame count"
+            )
+        temporal_batch = []
+        temporal_by_sample = {}
+        for item in batch:
+            sample_id = item["sample_id"]
+            if sample_id not in temporal_by_sample:
+                sample = load_temporal_supervision(
+                    item,
+                    dataset_root,
+                    preprocess_size_px=scene_size_px,
+                    output_frame_count=video_frame_count,
+                    latent_window_start=temporal_window_start,
+                    latent_window_chunks=2,
+                    decoded_resolution=temporal_loss_resolution,
+                    mask_erosion_px=temporal_mask_erosion_px,
+                )
+                temporal_by_sample[sample_id] = {
+                    key: (
+                        value.to(device) if isinstance(value, torch.Tensor) else value
+                    )
+                    for key, value in sample.items()
+                }
+            temporal_batch.append(temporal_by_sample[sample_id])
     return {
         "records": records,
         "latents": [
@@ -590,6 +672,7 @@ def load_microbatch(
         "motion_masks": target_motion_masks,
         "trajectory_point_maps": trajectory_point_maps,
         "trajectory_sample_ids": [item["sample_id"] for item in trajectory_batch],
+        "temporal_supervision": temporal_batch,
         "scene": collate_scene_conditions(
             [
                 load_scene_condition(
@@ -819,13 +902,29 @@ def forward_losses(
             temperature=args.trajectory_temperature,
             beta=args.trajectory_beta,
         )
-        temporal_consistency = reconstruction.new_zeros(())
-        if args.temporal_consistency_loss_weight > 0:
-            temporal_consistency = latent_temporal_consistency_loss(
-                predicted_clean,
-                loaded["latents"],
-                beta=args.temporal_consistency_beta,
-            )
+        temporal = {
+            key: reconstruction.new_zeros(())
+            for key in ("object", "background", "object_pairs", "background_pixels")
+        }
+        if temporal_losses_enabled(args):
+            if vae is None or loaded.get("temporal_supervision") is None:
+                raise RuntimeError(
+                    "decoded temporal losses are enabled but their VAE/data are missing"
+                )
+            with torch.autocast(device_type="cuda", enabled=False):
+                temporal = clean_video_temporal_losses(
+                    predicted_clean,
+                    loaded["latents"],
+                    loaded["temporal_supervision"],
+                    vae,
+                    decoded_resolution=args.temporal_loss_resolution,
+                    object_beta=args.object_temporal_beta,
+                    background_beta=args.background_temporal_beta,
+                    background_dilation_px=args.background_mask_dilation_px,
+                    background_stability_threshold=(
+                        args.background_stability_threshold
+                    ),
+                )
         lpips_loss = reconstruction.new_zeros(())
         if args.lpips_loss_weight > 0:
             if vae is None or perceptual_model is None:
@@ -843,7 +942,8 @@ def forward_losses(
         total = (
             args.reconstruction_loss_weight * reconstruction
             + args.lpips_loss_weight * lpips_loss
-            + args.temporal_consistency_loss_weight * temporal_consistency
+            + args.object_temporal_loss_weight * temporal["object"]
+            + args.background_temporal_loss_weight * temporal["background"]
             + args.response_loss_weight * response
             + args.trajectory_center_loss_weight * motion["center"]
             + args.trajectory_distribution_loss_weight * motion["distribution"]
@@ -856,7 +956,10 @@ def forward_losses(
         "trajectory_center": motion["center"],
         "trajectory_distribution": motion["distribution"],
         "trajectory_velocity": motion["velocity"],
-        "temporal_consistency": temporal_consistency,
+        "object_temporal": temporal["object"],
+        "background_temporal": temporal["background"],
+        "object_temporal_pairs": temporal["object_pairs"],
+        "background_temporal_pixels": temporal["background_pixels"],
         "lpips": lpips_loss,
         "sigma": sigmas[0],
     }
@@ -895,6 +998,8 @@ def validate(
     rank: int,
     world_size: int,
     scene_size_px: tuple[int, int],
+    video_frame_count: int = 97,
+    latent_frame_count: int = 25,
     vae=None,
     perceptual_model=None,
 ) -> dict[str, float]:
@@ -910,7 +1015,10 @@ def validate(
             "trajectory_center",
             "trajectory_distribution",
             "trajectory_velocity",
-            "temporal_consistency",
+            "object_temporal",
+            "background_temporal",
+            "object_temporal_pairs",
+            "background_temporal_pixels",
             "lpips",
         )
     }
@@ -943,6 +1051,20 @@ def validate(
             trajectory_batch=trajectory_batch,
             trajectory_representation=args.trajectory_representation,
             scene_size_px=scene_size_px,
+            temporal_window_start=(
+                scheduled_temporal_window(
+                    batch_index, rank, world_size, latent_frame_count
+                )
+                if temporal_losses_enabled(args)
+                else None
+            ),
+            video_frame_count=video_frame_count,
+            temporal_loss_resolution=getattr(
+                args, "temporal_loss_resolution", 128
+            ),
+            temporal_mask_erosion_px=getattr(
+                args, "temporal_mask_erosion_px", 2
+            ),
         )
         generator = torch.Generator(device=device).manual_seed(
             args.seed + 10_000_000 + batch_index * world_size + rank
@@ -1143,12 +1265,44 @@ def adapter_metadata(
             "coordinate_frame": "normalized_image_xy",
             "identity_reference": "current_target_frame_features",
         },
-        "temporal_consistency": {
-            "enabled": args.temporal_consistency_loss_weight > 0,
-            "weight": args.temporal_consistency_loss_weight,
-            "beta": args.temporal_consistency_beta,
-            "space": "clean_latent_adjacent_delta",
-            "target": "current_target_clean_latent_adjacent_delta",
+        "decoded_temporal_supervision": {
+            "enabled": temporal_losses_enabled(args),
+            "decode": {
+                "space": "vae_decoded_rgb",
+                "long_edge": args.temporal_loss_resolution,
+                "spatial_resize": "aspect_preserving_integer_vae_latent_grid",
+                "time_mapping": "latent_k_to_source_frames_4k_minus_3_through_4k",
+                "causal_context": "exact_prefix_no_grad_selected_two_chunks_grad",
+                "window": "two_adjacent_latents_eight_source_frames",
+                "cross_chunk_transitions_supervised": True,
+                "condition_frame_excluded": True,
+            },
+            "object": {
+                "weight": args.object_temporal_loss_weight,
+                "beta": args.object_temporal_beta,
+                "objective": "same_visible_material_point_rgb_delta_matches_target",
+                "visibility": (
+                    "global_dynamic_zbuffer_winner_inside_eroded_renderer_instance_mask"
+                ),
+                "mask_erosion_px_at_preprocess_resolution": (
+                    args.temporal_mask_erosion_px
+                ),
+            },
+            "background": {
+                "weight": args.background_temporal_loss_weight,
+                "beta": args.background_temporal_beta,
+                "objective": "rgb_second_temporal_difference_matches_target",
+                "region": "complement_of_three_frame_instance_mask_sweep",
+                "mask_dilation_px_at_decoded_resolution": (
+                    args.background_mask_dilation_px
+                ),
+                "target_rgb_pair_stability_threshold": (
+                    args.background_stability_threshold
+                ),
+                "excluded_target_dynamic_regions": (
+                    "shadows_reflections_occlusions_disocclusions"
+                ),
+            },
         },
         "trajectory_conditioning": {
             "enabled": args.trajectory_input,
@@ -1234,8 +1388,11 @@ def adapter_metadata(
         "trajectory_velocity_losses": [
             item["trajectory_velocity"] for item in history
         ],
-        "temporal_consistency_losses": [
-            item.get("temporal_consistency", 0.0) for item in history
+        "object_temporal_losses": [
+            item.get("object_temporal", 0.0) for item in history
+        ],
+        "background_temporal_losses": [
+            item.get("background_temporal", 0.0) for item in history
         ],
         "peak_cuda_memory_gib": peak_memory,
         "seed": args.seed,
@@ -1382,8 +1539,14 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "trajectory_center_loss_weight",
     "trajectory_distribution_loss_weight",
     "trajectory_velocity_loss_weight",
-    "temporal_consistency_loss_weight",
-    "temporal_consistency_beta",
+    "object_temporal_loss_weight",
+    "background_temporal_loss_weight",
+    "object_temporal_beta",
+    "background_temporal_beta",
+    "temporal_loss_resolution",
+    "temporal_mask_erosion_px",
+    "background_mask_dilation_px",
+    "background_stability_threshold",
     "trajectory_temperature",
     "trajectory_beta",
     "trajectory_input",
@@ -1509,10 +1672,22 @@ def main() -> None:
         raise ValueError("LPIPS weight and frame count must be nonnegative/positive")
     if args.lpips_temporal_window <= 0:
         raise ValueError("LPIPS temporal window must be positive")
-    if args.temporal_consistency_loss_weight < 0:
-        raise ValueError("temporal consistency loss weight must be nonnegative")
-    if args.temporal_consistency_beta <= 0:
-        raise ValueError("temporal consistency Smooth-L1 beta must be positive")
+    temporal_weights = (
+        args.object_temporal_loss_weight,
+        args.background_temporal_loss_weight,
+    )
+    if min(temporal_weights) < 0:
+        raise ValueError("decoded temporal loss weights must be nonnegative")
+    if min(args.object_temporal_beta, args.background_temporal_beta) <= 0:
+        raise ValueError("decoded temporal Smooth-L1 betas must be positive")
+    if (
+        args.temporal_loss_resolution < 16
+        or args.temporal_loss_resolution % 16
+        or args.temporal_mask_erosion_px < 0
+        or args.background_mask_dilation_px < 0
+        or not 0 < args.background_stability_threshold <= 2
+    ):
+        raise ValueError("decoded temporal resolution/mask margins are invalid")
     if args.lpips_loss_weight > 0 and args.lpips_resolution < 32:
         raise ValueError("LPIPS resolution must be at least 32 when enabled")
     if min(
@@ -1568,6 +1743,10 @@ def main() -> None:
             int(cache["preprocess"]["width"]),
             int(cache["preprocess"]["height"]),
         )
+        video_frame_count = int(cache["preprocess"]["frames"])
+        latent_frame_count = (video_frame_count - 1) // 4 + 1
+        if video_frame_count < 5 or (video_frame_count - 1) % 4:
+            raise ValueError("temporal supervision requires a 4n+1 video length")
         train_records = filter_base_scenes(
             [item for item in cache["records"] if item["record"]["split"] == "train"],
             args.base_scene_count,
@@ -1759,8 +1938,7 @@ def main() -> None:
         condition_encoder.to(device).train()
         vae = None
         perceptual_model = None
-        if args.lpips_loss_weight > 0:
-            import lpips
+        if args.lpips_loss_weight > 0 or temporal_losses_enabled(args):
             from wan.modules.vae2_2 import Wan2_2_VAE
 
             vae = Wan2_2_VAE(
@@ -1769,6 +1947,9 @@ def main() -> None:
                 device=device,
             )
             vae.model.to(dtype=torch.bfloat16).requires_grad_(False).eval()
+        if args.lpips_loss_weight > 0:
+            import lpips
+
             perceptual_model = lpips.LPIPS(net=args.lpips_net).to(device).eval()
             for parameter in perceptual_model.parameters():
                 parameter.requires_grad_(False)
@@ -1828,7 +2009,10 @@ def main() -> None:
                     "trajectory_center",
                     "trajectory_distribution",
                     "trajectory_velocity",
-                    "temporal_consistency",
+                    "object_temporal",
+                    "background_temporal",
+                    "object_temporal_pairs",
+                    "background_temporal_pixels",
                     "lpips",
                     "sigma",
                 )
@@ -1868,6 +2052,19 @@ def main() -> None:
                     trajectory_batch=trajectory_batch,
                     trajectory_representation=args.trajectory_representation,
                     scene_size_px=scene_size_px,
+                    temporal_window_start=(
+                        scheduled_temporal_window(
+                            step * args.gradient_accumulation + accumulation_index,
+                            rank,
+                            world_size,
+                            latent_frame_count,
+                        )
+                        if temporal_losses_enabled(args)
+                        else None
+                    ),
+                    video_frame_count=video_frame_count,
+                    temporal_loss_resolution=args.temporal_loss_resolution,
+                    temporal_mask_erosion_px=args.temporal_mask_erosion_px,
                 )
                 trajectory_sample_ids.extend(loaded["trajectory_sample_ids"])
                 generator = torch.Generator(device=device).manual_seed(
@@ -1953,6 +2150,8 @@ def main() -> None:
                     rank,
                     world_size,
                     scene_size_px,
+                    video_frame_count=video_frame_count,
+                    latent_frame_count=latent_frame_count,
                     vae=vae,
                     perceptual_model=perceptual_model,
                 )
