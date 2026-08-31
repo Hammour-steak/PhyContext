@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 from safetensors.torch import load_file
 
+from cache_contract import resolve_cache_artifact_root, validate_cache_artifact
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -125,14 +127,18 @@ def validate_decoded_video(
 
 
 def load_point_mask(
-    project_root: Path,
+    artifact_root: Path,
     item: dict,
     frame_count: int,
     height: int,
     width: int,
     dilation_px: int,
 ) -> np.ndarray:
-    point_path = project_root / item["point_track"]["path"]
+    point_path = validate_cache_artifact(
+        artifact_root,
+        item["point_track"],
+        f"point track for {item['sample_id']}",
+    )
     point_map = load_file(str(point_path), device="cpu")["point_track_map"].numpy()
     if point_map.ndim != 4 or point_map.shape[0] not in {12, 18}:
         raise ValueError(f"invalid point-track map: {point_path}")
@@ -217,6 +223,7 @@ def main() -> None:
     evaluation_root = args.evaluation_root.resolve()
     cache_manifest = args.cache_manifest.resolve()
     cache = json.loads(cache_manifest.read_text(encoding="utf-8"))
+    artifact_root = resolve_cache_artifact_root(project_root, cache)
     records = {item["sample_id"]: item for item in cache["records"]}
     results = []
     for video_path in sorted(evaluation_root.rglob("*.mp4")):
@@ -236,7 +243,7 @@ def main() -> None:
             ]
         )
         object_mask = load_point_mask(
-            project_root,
+            artifact_root,
             records[sample_id],
             video.shape[0],
             video.shape[1],
