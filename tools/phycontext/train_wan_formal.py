@@ -114,6 +114,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--cache-manifest", type=Path, default=DEFAULT_CACHE)
+    parser.add_argument(
+        "--verify-cache-content-hashes",
+        action="store_true",
+        help=(
+            "on rank zero, recompute SHA-256 for every cached latent, text "
+            "context, point track, and source scene before training; disabled "
+            "by default because formal caches are audited separately"
+        ),
+    )
     parser.add_argument("--wan-repo", type=Path, default=DEFAULT_WAN_REPO)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -330,6 +339,8 @@ def require_complete_cache(
     records: list[dict],
     split: str,
     trajectory_representation: str,
+    *,
+    verify_content_hashes: bool = False,
 ) -> None:
     if not records:
         raise ValueError(f"cache has no {split} records")
@@ -348,7 +359,12 @@ def require_complete_cache(
             ("text_context", f"text context for {sample_id}"),
             ("point_track", f"point track for {sample_id}"),
         ):
-            validate_cache_artifact(artifact_root, item.get(key), label)
+            validate_cache_artifact(
+                artifact_root,
+                item.get(key),
+                label,
+                verify_hash=verify_content_hashes,
+            )
         latent = item["latent"]
         if (
             latent.get("condition_frame_protocol")
@@ -377,11 +393,9 @@ def require_complete_cache(
             if previous_hash != expected_scene_hash:
                 raise ValueError(f"shared scene hash differs across records: {sample_id}")
         else:
-            if (
-                not expected_scene_hash
-                or not scene_path.is_file()
-                or sha256(scene_path) != expected_scene_hash
-            ):
+            if not expected_scene_hash or not scene_path.is_file():
+                raise ValueError(f"scene condition file/hash mismatch: {sample_id}")
+            if verify_content_hashes and sha256(scene_path) != expected_scene_hash:
                 raise ValueError(f"scene condition file/hash mismatch: {sample_id}")
             verified_scenes[scene_path] = expected_scene_hash
 
@@ -1763,21 +1777,26 @@ def main() -> None:
             raise ValueError(
                 "formal response training requires a non-empty validation split"
             )
-        require_complete_cache(
-            artifact_root,
-            dataset_root,
-            train_records,
-            "train",
-            args.trajectory_representation,
-        )
-        if validation_records:
+        if rank == 0:
             require_complete_cache(
                 artifact_root,
                 dataset_root,
-                validation_records,
-                "validation",
+                train_records,
+                "train",
                 args.trajectory_representation,
+                verify_content_hashes=args.verify_cache_content_hashes,
             )
+            if validation_records:
+                require_complete_cache(
+                    artifact_root,
+                    dataset_root,
+                    validation_records,
+                    "validation",
+                    args.trajectory_representation,
+                    verify_content_hashes=args.verify_cache_content_hashes,
+                )
+        if world_size > 1:
+            torch.distributed.barrier()
         max_dynamic_object_count(train_records)
         max_dynamic_object_count(validation_records)
         if args.resume is not None:

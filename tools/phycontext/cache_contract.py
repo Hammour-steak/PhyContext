@@ -219,8 +219,16 @@ def validate_cache_artifact(
     artifact_root: Path,
     descriptor: dict,
     label: str,
+    *,
+    verify_hash: bool = True,
 ) -> Path:
-    """Resolve and hash-check one artifact below its declared cache root."""
+    """Resolve one artifact below its declared cache root.
+
+    ``verify_hash=False`` is intended for training startup after an offline cache
+    audit has already completed.  Descriptor completeness, path confinement and
+    file existence remain mandatory; inference and audit callers retain the
+    strict SHA-256 check by default.
+    """
     if not isinstance(descriptor, dict):
         raise ValueError(f"Wan cache is missing its {label} descriptor")
     relative_value = descriptor.get("path")
@@ -234,7 +242,7 @@ def validate_cache_artifact(
     path = (root / relative_path).resolve()
     if not path.is_relative_to(root) or not path.is_file():
         raise FileNotFoundError(f"Wan cache {label} artifact is missing: {path}")
-    if _sha256(path) != expected_hash:
+    if verify_hash and _sha256(path) != expected_hash:
         raise ValueError(f"Wan cache {label} artifact hash mismatch: {path}")
     return path
 

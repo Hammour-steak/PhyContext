@@ -110,6 +110,33 @@ class ExternalDatasetBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cache-root-relative"):
             validate_cache_artifact(self.method_root, descriptor, "test")
 
+    def test_training_startup_can_skip_only_the_artifact_hash_read(self) -> None:
+        artifact = self.method_root / "cache" / "sample.safetensors"
+        artifact.parent.mkdir()
+        artifact.write_bytes(b"already-audited-artifact")
+        descriptor = {
+            "path": "cache/sample.safetensors",
+            "sha256": "0" * 64,
+        }
+        self.assertEqual(
+            validate_cache_artifact(
+                self.method_root,
+                descriptor,
+                "test",
+                verify_hash=False,
+            ),
+            artifact.resolve(),
+        )
+
+        artifact.unlink()
+        with self.assertRaisesRegex(FileNotFoundError, "artifact is missing"):
+            validate_cache_artifact(
+                self.method_root,
+                descriptor,
+                "test",
+                verify_hash=False,
+            )
+
     def test_cache_artifact_can_use_an_external_cache_root(self) -> None:
         artifact_root = self.method_root.parent / "external_cache"
         artifact = artifact_root / "point_tracks" / "sample.safetensors"

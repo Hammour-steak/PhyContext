@@ -446,6 +446,7 @@ class TrainingDefaultTests(unittest.TestCase):
         self.assertTrue(args.trajectory_input)
         self.assertEqual(args.trajectory_input_source, "target")
         self.assertEqual(args.trajectory_representation, "das_3d_tracks")
+        self.assertFalse(args.verify_cache_content_hashes)
         self.assertFalse(args.ordinary_only)
         self.assertEqual(args.steps, 9000)
         self.assertEqual(args.validation_batches, 25)
