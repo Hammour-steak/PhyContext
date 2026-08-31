@@ -39,6 +39,21 @@ from project_defaults import (  # noqa: E402
 
 
 class TrainingDefaultTests(unittest.TestCase):
+    def test_inference_report_path_supports_external_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory).resolve()
+            root = temporary / "project"
+            internal = root / "outputs" / "sample.mp4"
+            external = temporary / "external" / "adapter"
+            self.assertEqual(
+                infer_wan_conditioned.report_path(internal, root),
+                "outputs/sample.mp4",
+            )
+            self.assertEqual(
+                infer_wan_conditioned.report_path(external, root),
+                str(external),
+            )
+
     def test_inference_uses_the_exact_training_resolution(self) -> None:
         with patch.object(sys, "argv", ["infer_wan_conditioned.py"]):
             args = infer_wan_conditioned.parse_args()

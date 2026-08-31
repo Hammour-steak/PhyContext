@@ -777,7 +777,7 @@ def main() -> None:
         "sample_id": sample_id,
         "input_source": input_source,
         "first_frame": report_path(first_frame_path, root),
-        "adapter": adapter_root.relative_to(root).as_posix(),
+        "adapter": report_path(adapter_root, root),
         "adapter_sha256": sha256(adapter_root / "adapter.safetensors"),
         "input_contract": input_contract.get("schema"),
         "trajectory_protocol": input_contract.get("trajectory", {}).get("protocol"),
