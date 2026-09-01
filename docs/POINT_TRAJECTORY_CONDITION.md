@@ -33,7 +33,7 @@ corner-aligned scale.
 After source-array decoding, rasterization geometry stays in float64 through
 projection, resize, and crop, and is converted to integer pixels only at the
 z-buffer; this prevents additional precision loss at a half-pixel rounding
-boundary. Cache schemas v4-v8 record this geometry contract together with
+boundary. Cache schemas v4-v9 record this geometry contract together with
 static-point camera clipping; v5 adds the canonical TI2V first-frame binding,
 v6 adds exact material-point correspondence targets, and v7 preserves each
 float64 visible raster decision when its coordinate is serialized as float32.
@@ -41,6 +41,10 @@ Version 8 gives loss-only correspondence a separate zero-radius point-center
 z-buffer. This avoids treating a visible neighboring splat pixel as evidence
 that the point center is visible, while also preventing 3 x 3 control-map
 dilation from falsely hiding an adjacent material point.
+Version 9 additionally stores up to 256 spatially balanced, frame-zero-visible
+static scene identities and their per-frame point-center visibility. Training
+balances foreground and background queries so static walls and floors receive
+the same correspondence objective as moving objects.
 Older point maps remain
 readable for legacy adapters but cannot train the current correspondence path.
 
@@ -69,9 +73,10 @@ normalized coordinate color is near zero. Visibility also supplies the latent
 motion envelope used by reconstruction and the coarse center guard; it is not
 a second model condition.
 
-The v8 cache writes a separate loss-only correspondence artifact with
+The v9 cache writes a separate loss-only correspondence artifact with
 `track_xy_px [97,O,2048,2]`, `track_depth_m [97,O,2048]`, and
-`track_visible [97,O,2048]`. The condition map and this artifact are emitted by
+`track_visible [97,O,2048]`, plus `background_track_xy_px [97,S,2]`, depth,
+and visibility for `1 <= S <= 256`. The condition map and this artifact are emitted by
 the same float64 projection geometry. The condition map uses 3 x 3 splats for
 coverage, while correspondence uses zero-radius dynamic/static point centers.
 Thus splat dilation cannot create or suppress an exact material-point feature
@@ -101,7 +106,7 @@ fixed shape is `[18, T_latent, H_latent, W_latent]`.
 Old caches and checkpoints are not overwritten. DaS-style caching uses:
 
 ```text
-cache/wan/physweep_training/das_3d_tracks_track4gen_v8_center_visibility_832x480x97/
+cache/wan/physweep_training/das_3d_tracks_track4gen_v9_bg_balanced_832x480x97/
 ```
 
 The legacy cache remains under `dense_point_tracks_832x480x97/`.
@@ -139,6 +144,15 @@ python tools/phycontext/train_wan_formal.py \
   --trajectory-input \
   --trajectory-representation das_3d_tracks
 ```
+
+Correspondence supervision is a separate low-noise forward pass. That pass
+uses only text and video latents: the target trajectory branch, scene/physics
+tokens, and direct physics modulation are all disabled. The resulting
+intermediate Wan feature grid is refined at 2x spatial resolution, then trained
+with Track4Gen's soft-argmax coordinate Huber objective. The target trajectory
+is therefore a label only and cannot be read as an input shortcut. Self-attention
+LoRA is trained across all Wan blocks; the zero-initialized feedback bridge is
+trained only by generation losses.
 
 For a one-record, one-step integration smoke test, add `--ordinary-only`. This
 disables paired physics-response updates and validation and records zero response

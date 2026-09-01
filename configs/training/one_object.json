@@ -30,7 +30,6 @@
     "track_correspondence_temperature": 0.07,
     "track_correspondence_gaussian_sigma": 0.75,
     "track_correspondence_sigma": 0.2,
-    "trajectory_identity_dropout": 0.1,
     "reconstruction_loss_weight": 2.0,
     "lpips_loss_weight": 0.1,
     "lpips_frame_count": 2,

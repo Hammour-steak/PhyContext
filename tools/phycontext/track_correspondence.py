@@ -76,8 +76,8 @@ def validate_track_correspondence(
         raise ValueError("background_track_xy_px must have shape F x S x 2")
     if background_depth.shape != background_xy.shape[:-1] or background_visible.shape != background_depth.shape:
         raise ValueError("background track depth and visibility must match F x S")
-    if has_background and not 1 <= background_xy.shape[1] <= 512:
-        raise ValueError("track correspondence must contain 1-512 background points")
+    if has_background and not 1 <= background_xy.shape[1] <= 256:
+        raise ValueError("track correspondence must contain 1-256 background points")
     if has_background and not bool(background_visible[0].all()):
         raise ValueError("every cached background query must be visible in frame zero")
     if xy.dtype != torch.float32 or depth.dtype != torch.float32 or background_xy.dtype != torch.float32 or background_depth.dtype != torch.float32:

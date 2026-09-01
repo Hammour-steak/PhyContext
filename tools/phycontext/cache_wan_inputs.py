@@ -599,7 +599,7 @@ def main() -> None:
         "visibility_query": "projected_material_point_center_pixel",
         "foreground_background_sampling": "balanced_during_training",
         "background_query_selection": (
-            "up_to_512_first_frame_visible_static_points_spatially_balanced"
+            "up_to_256_first_frame_visible_static_points_spatially_balanced"
         ),
         "cached_tensors": [
             "track_xy_px",

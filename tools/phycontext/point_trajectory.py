@@ -907,7 +907,7 @@ def build_das_track_correspondence(
     spatial_transform: str = "cover_center_crop",
     static_points_camera0_m: np.ndarray | None = None,
     point_radius_px: int = 0,
-    background_point_count: int = 512,
+    background_point_count: int = 256,
 ) -> dict[str, np.ndarray]:
     """Preserve point identities visible in the point-center z-buffer."""
     object_count = int(np.asarray(payload["tracks_xy_px"]).shape[1])
@@ -938,7 +938,7 @@ def rasterize_das_3d_tracks(
     static_points_camera0_m: np.ndarray | None = None,
     point_radius_px: int = 1,
     correspondence_point_radius_px: int = 0,
-    background_point_count: int = 512,
+    background_point_count: int = 256,
     return_correspondence: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Render DaS-style identity-preserving 3D tracking maps for Wan.

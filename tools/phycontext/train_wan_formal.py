@@ -47,7 +47,6 @@ from wan_training import (
     LoRALinear,
     balanced_motion_loss_mask,
     direct_modulation_parameters,
-    drop_trajectory_point_identities,
     enable_block_checkpointing,
     inject_cross_attention_lora,
     inject_self_attention_lora,
@@ -217,15 +216,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="fixed low-noise sigma for the trajectory-disabled correspondence pass",
-    )
-    parser.add_argument(
-        "--trajectory-identity-dropout",
-        type=float,
-        default=0.1,
-        help=(
-            "training-only probability of removing DaS RGB point IDs while "
-            "retaining every per-object occupancy trajectory"
-        ),
     )
     parser.add_argument("--trajectory-temperature", type=float, default=0.03)
     parser.add_argument("--trajectory-beta", type=float, default=0.05)
@@ -923,7 +913,6 @@ def forward_generation_losses(
     vae=None,
     perceptual_model=None,
     fixed_sigma: float | None = None,
-    apply_identity_dropout: bool = False,
 ) -> dict[str, torch.Tensor]:
     raw_model = unwrap(model)
     condition_tokens = condition_encoder(
@@ -951,15 +940,6 @@ def forward_generation_losses(
         raise RuntimeError("formal training requires direct condition modulation")
     canonical_trajectory_representation(args.trajectory_representation)
     trajectory_point_maps = loaded["trajectory_point_maps"]
-    identity_dropout_count = 0
-    if args.trajectory_input and apply_identity_dropout:
-        trajectory_point_maps, identity_dropout_count = (
-            drop_trajectory_point_identities(
-                trajectory_point_maps,
-                args.trajectory_identity_dropout,
-                generator=generator,
-            )
-        )
     if args.trajectory_input and not set_trajectory_condition(
         raw_model,
         trajectory_point_maps,
@@ -1064,9 +1044,6 @@ def forward_generation_losses(
         "reconstruction": reconstruction,
         "response": response,
         "trajectory_center": center,
-        "trajectory_identity_dropout_fraction": reconstruction.new_tensor(
-            float(identity_dropout_count) / len(trajectory_point_maps)
-        ),
         "lpips": lpips_loss,
         "sigma": sigmas[0],
     }
@@ -1169,11 +1146,15 @@ def forward_losses(
     vae=None,
     perceptual_model=None,
     fixed_sigma: float | None = None,
-    apply_identity_dropout: bool = False,
+    correspondence_generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
     """Validation/integration wrapper for the two semantically isolated passes."""
     correspondence = forward_correspondence_losses(
-        model, loaded, args, device, generator
+        model,
+        loaded,
+        args,
+        device,
+        generator if correspondence_generator is None else correspondence_generator,
     )
     generation = forward_generation_losses(
         model,
@@ -1186,7 +1167,6 @@ def forward_losses(
         vae=vae,
         perceptual_model=perceptual_model,
         fixed_sigma=fixed_sigma,
-        apply_identity_dropout=apply_identity_dropout,
     )
     return {
         **generation,
@@ -1314,7 +1294,6 @@ def validate(
             "track_correspondence_background_pck_1",
             "track_correspondence_fast_epe_tokens",
             "track_correspondence_fast_pck_1",
-            "trajectory_identity_dropout_fraction",
             "lpips",
         )
     }
@@ -1352,6 +1331,9 @@ def validate(
         generator = torch.Generator(device=device).manual_seed(
             args.seed + 10_000_000 + batch_index * world_size + rank
         )
+        correspondence_generator = torch.Generator(device=device).manual_seed(
+            args.seed + 20_000_000 + batch_index * world_size + rank
+        )
         response_enabled = mode == "response"
         losses = forward_losses(
             model,
@@ -1364,6 +1346,7 @@ def validate(
             vae=vae,
             perceptual_model=perceptual_model,
             fixed_sigma=0.7,
+            correspondence_generator=correspondence_generator,
         )
         mode_counts[mode] += 1.0
         accumulate_loss_metrics(
@@ -1594,7 +1577,6 @@ def adapter_metadata(
             "feature_objective_normalization": "equal_video_weight_then_ddp_rank_mean",
             "conditioning_during_correspondence": "text_only_no_scene_physics_or_trajectory",
             "identity_shortcut_mitigation": "trajectory_branch_fully_disabled",
-            "identity_dropout_probability": args.trajectory_identity_dropout,
             "diagnostics": [
                 "kl_above_soft_target_entropy",
                 "expected_coordinate_epe_tokens",
@@ -1722,9 +1704,6 @@ def adapter_metadata(
         ],
         "track_correspondence_background_pck_1": [
             item["track_correspondence_background_pck_1"] for item in history
-        ],
-        "trajectory_identity_dropout_fractions": [
-            item["trajectory_identity_dropout_fraction"] for item in history
         ],
         "peak_cuda_memory_gib": peak_memory,
         "seed": args.seed,
@@ -1887,7 +1866,6 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "track_correspondence_temperature",
     "track_correspondence_gaussian_sigma",
     "track_correspondence_sigma",
-    "trajectory_identity_dropout",
     "trajectory_temperature",
     "trajectory_beta",
     "trajectory_input",
@@ -2043,13 +2021,6 @@ def main() -> None:
         float(args.trajectory_condition_rank),
     ) <= 0:
         raise ValueError("formal optimization settings must be positive")
-    if not 0.0 <= args.trajectory_identity_dropout <= 1.0:
-        raise ValueError("trajectory identity dropout must be between zero and one")
-    if (
-        args.trajectory_identity_dropout > 0
-        and args.trajectory_representation != "das_3d_tracks"
-    ):
-        raise ValueError("trajectory identity dropout is only defined for DaS tracks")
     if args.trajectory_center_loss_weight <= 0:
         raise ValueError("trajectory center weight must be positive")
 
@@ -2426,7 +2397,6 @@ def main() -> None:
                     "track_correspondence_background_pck_1",
                     "track_correspondence_fast_epe_tokens",
                     "track_correspondence_fast_pck_1",
-                    "trajectory_identity_dropout_fraction",
                     "lpips",
                     "sigma",
                 )
@@ -2475,6 +2445,15 @@ def main() -> None:
                     + accumulation_index * 1_000
                     + rank
                 )
+                correspondence_generator = torch.Generator(
+                    device=device
+                ).manual_seed(
+                    args.seed
+                    + 50_000_000
+                    + step * 100_000
+                    + accumulation_index * 1_000
+                    + rank
+                )
                 synchronize = accumulation_index + 1 == args.gradient_accumulation
                 # The correspondence pass never sees target trajectory maps,
                 # scene tokens, or direct physics modulation. It is backwarded
@@ -2489,7 +2468,7 @@ def main() -> None:
                         loaded,
                         args,
                         device,
-                        generator,
+                        correspondence_generator,
                     )
                     correspondence_objective = (
                         args.track_correspondence_loss_weight
@@ -2517,7 +2496,6 @@ def main() -> None:
                         response_enabled=mode == "response",
                         vae=vae,
                         perceptual_model=perceptual_model,
-                        apply_identity_dropout=True,
                     )
                     if not torch.isfinite(generation_losses["total"]):
                         raise RuntimeError("formal generation loss is non-finite")

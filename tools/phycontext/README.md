@@ -35,10 +35,14 @@ correctly aligned video tensors and reports first-frame reconstruction error.
 `track_correspondence.py` implements the formal Track4Gen-style feature
 objective. It supervises exact first-frame-visible simulator material points
 against their swept, z-buffer-visible positions in every four-RGB-frame Wan
-latent window. The trainer averages correspondence per video, uses a lower
-learning rate for the generation feedback bridge, and drops only RGB point IDs
-on 10% of samples while preserving occupancy trajectories. It reports KL, EPE,
-PCK@1 and fast-motion EPE/PCK@1. Paired response uses a separate sigma-1
+latent window, balanced equally with static-background correspondences. The
+correspondence forward runs at fixed low noise with trajectory, scene/physics
+tokens, and direct physics modulation disabled; labels cannot leak through the
+DaS control map. A 2x-resolution 256-channel, four-block refiner uses the
+soft-argmax coordinate Huber objective, while all Wan self-attention blocks gain
+LoRA capacity. The trainer averages correspondence per video and uses a lower
+learning rate for the generation feedback bridge. It reports KL, EPE, foreground
+and background PCK@1, plus fast-motion EPE/PCK@1. Paired response uses a separate sigma-1
 forward with common noise, text, first frame, and trajectory so only structured
 physics conditions vary. `audit_wan_adapter.py` fails closed on the selected
 block, refiner and feedback tensors, objective settings, per-step loss history,

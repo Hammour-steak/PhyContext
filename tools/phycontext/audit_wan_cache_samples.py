@@ -209,6 +209,10 @@ def validate_point_map(
         preprocess_size_px=(width, height),
         expected_frames=frames,
     )
+    if set(cached_correspondence) != set(recomputed_correspondence):
+        raise ValueError(
+            f"track-correspondence tensor set mismatch: {sample_id}"
+        )
     correspondence_max_abs = 0.0
     for key, expected_array in recomputed_correspondence.items():
         expected_tensor = torch.from_numpy(expected_array)

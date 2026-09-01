@@ -367,12 +367,17 @@ def main() -> None:
         if track_config.get("identity_shortcut_mitigation") != expected_shortcut_mitigation:
             errors.append("track correspondence identity-shortcut mitigation is invalid")
         identity_dropout = track_config.get("identity_dropout_probability")
-        if (
+        if schema != "phycontext.wan_condition_adapter.v5" and (
             identity_dropout is None
             or not math.isfinite(float(identity_dropout))
             or not 0.0 < float(identity_dropout) < 1.0
         ):
             errors.append("track correspondence identity dropout is invalid")
+        if schema == "phycontext.wan_condition_adapter.v5" and (
+            "identity_dropout_probability" in track_config
+            or "trajectory_identity_dropout_fractions" in metadata
+        ):
+            errors.append("v5 adapter contains obsolete trajectory identity dropout")
         positive_track_fields = (
             "feature_dim",
             "refiner_blocks",
@@ -491,15 +496,18 @@ def main() -> None:
             and not all(value <= 1.0 for value in track_fast_pck)
         ):
             errors.append("track correspondence pck@1 history is outside [0, 1]")
-        dropout_history = [
-            float(value)
-            for value in metadata.get("trajectory_identity_dropout_fractions", [])
-        ]
-        if len(dropout_history) != int(metadata["steps"]) or not all(
-            math.isfinite(value) and 0.0 <= value <= 1.0
-            for value in dropout_history
-        ):
-            errors.append("trajectory identity dropout history is invalid")
+        if schema != "phycontext.wan_condition_adapter.v5":
+            dropout_history = [
+                float(value)
+                for value in metadata.get(
+                    "trajectory_identity_dropout_fractions", []
+                )
+            ]
+            if len(dropout_history) != int(metadata["steps"]) or not all(
+                math.isfinite(value) and 0.0 <= value <= 1.0
+                for value in dropout_history
+            ):
+                errors.append("trajectory identity dropout history is invalid")
         for step in metadata.get("history", []):
             for key in (
                 "track_correspondence_pairs",
