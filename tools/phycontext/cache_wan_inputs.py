@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from decord import VideoReader, cpu
 from PIL import Image
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from cache_contract import (
@@ -596,10 +597,17 @@ def main() -> None:
         "coordinate_serialization": "float32_with_float64_visible_raster_pixel_preserved",
         "point_splat_radius_px": 0,
         "visibility_query": "projected_material_point_center_pixel",
+        "foreground_background_sampling": "balanced_during_training",
+        "background_query_selection": (
+            "up_to_512_first_frame_visible_static_points_spatially_balanced"
+        ),
         "cached_tensors": [
             "track_xy_px",
             "track_depth_m",
             "track_visible",
+            "background_track_xy_px",
+            "background_track_depth_m",
+            "background_track_visible",
             "source_frame_indices",
         ],
     }
@@ -905,6 +913,14 @@ def main() -> None:
                     != expected_geometry_shape
                     or tuple(correspondence["source_frame_indices"].shape)
                     != (args.frames,)
+                    or correspondence["background_track_xy_px"].shape[0]
+                    != args.frames
+                    or correspondence["background_track_xy_px"].shape[-1]
+                    != 2
+                    or tuple(correspondence["background_track_depth_m"].shape)
+                    != tuple(correspondence["background_track_xy_px"].shape[:-1])
+                    or tuple(correspondence["background_track_visible"].shape)
+                    != tuple(correspondence["background_track_xy_px"].shape[:-1])
                 ):
                     raise ValueError(
                         f"unexpected point-correspondence shape for {sample_id}"
@@ -912,12 +928,7 @@ def main() -> None:
                 correspondence_tensors = validate_track_correspondence(
                     {
                         key: torch.from_numpy(correspondence[key])
-                        for key in (
-                            "track_xy_px",
-                            "track_depth_m",
-                            "track_visible",
-                            "source_frame_indices",
-                        )
+                        for key in correspondence
                     },
                     preprocess_size_px=(args.width, args.height),
                     expected_frames=args.frames,
@@ -1093,16 +1104,28 @@ def main() -> None:
                     f"{record['sample_id']}"
                 )
             object_count = int(source["object_count"])
+            with safe_open(
+                str(correspondence_path), framework="pt", device="cpu"
+            ) as archive:
+                background_shape = list(
+                    archive.get_slice("background_track_xy_px").get_shape()
+                )
             cached_record["track_correspondence"] = {
                 "path": relative(correspondence_path, artifact_root),
                 "sha256": sha256(correspondence_path),
                 "xy_shape": [args.frames, object_count, 2048, 2],
                 "depth_shape": [args.frames, object_count, 2048],
                 "visible_shape": [args.frames, object_count, 2048],
+                "background_xy_shape": background_shape,
+                "background_depth_shape": background_shape[:-1],
+                "background_visible_shape": background_shape[:-1],
                 "source_frame_indices_shape": [args.frames],
                 "xy_dtype": "float32",
                 "depth_dtype": "float32",
                 "visible_dtype": "bool",
+                "background_xy_dtype": "float32",
+                "background_depth_dtype": "float32",
+                "background_visible_dtype": "bool",
                 "source_frame_indices_dtype": "int64",
                 "object_count": object_count,
                 "object_ids": source["object_ids"],

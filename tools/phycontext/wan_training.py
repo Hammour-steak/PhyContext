@@ -915,6 +915,35 @@ def inject_cross_attention_lora(
     return replaced
 
 
+def inject_self_attention_lora(
+    model: nn.Module,
+    rank: int = 16,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    *,
+    block_start: int = 0,
+    block_end: int | None = None,
+) -> list[str]:
+    """Add LoRA to Wan's joint spatiotemporal attention projections."""
+    end = len(model.blocks) if block_end is None else int(block_end)
+    if not 0 <= block_start < end <= len(model.blocks):
+        raise ValueError("self-attention LoRA block range is invalid")
+    replaced = []
+    for block_index in range(int(block_start), end):
+        attention = model.blocks[block_index].self_attn
+        for name in ("q", "k", "v", "o"):
+            layer = getattr(attention, name)
+            if isinstance(layer, LoRALinear):
+                raise ValueError(
+                    f"self-attention LoRA already injected at block {block_index}.{name}"
+                )
+            if not isinstance(layer, nn.Linear):
+                raise TypeError(f"self-attention {name} is not a linear layer")
+            setattr(attention, name, LoRALinear(layer, rank, alpha, dropout))
+            replaced.append(f"blocks.{block_index}.self_attn.{name}")
+    return replaced
+
+
 def lora_parameters(model: nn.Module):
     for module in model.modules():
         if isinstance(module, LoRALinear):
@@ -990,6 +1019,7 @@ def load_condition_checkpoint(
         "phycontext.wan_condition_adapter.v2",
         "phycontext.wan_condition_adapter.v3",
         "phycontext.wan_condition_adapter.v4",
+        "phycontext.wan_condition_adapter.v5",
     }:
         raise ValueError("adapter uses an unsupported conditioning schema")
     lora = metadata["lora"]
@@ -1000,10 +1030,26 @@ def load_condition_checkpoint(
     )
     if len(replaced) != int(lora["module_count"]):
         raise ValueError("adapter LoRA module count does not match the Wan model")
+    self_attention_config = metadata.get("self_attention_lora", {})
+    self_attention_replaced = []
+    if self_attention_config.get("enabled", False):
+        self_attention_replaced = inject_self_attention_lora(
+            model,
+            rank=int(self_attention_config["rank"]),
+            alpha=float(self_attention_config["alpha"]),
+            block_start=int(self_attention_config["block_start"]),
+            block_end=int(self_attention_config["block_end"]),
+        )
+        if len(self_attention_replaced) != int(
+            self_attention_config["module_count"]
+        ):
+            raise ValueError(
+                "adapter self-attention LoRA module count does not match Wan"
+            )
     tensors = load_file(str(adapter_dir / "adapter.safetensors"), device="cpu")
     modules = dict(model.named_modules())
     consumed = set()
-    for name in replaced:
+    for name in replaced + self_attention_replaced:
         module = modules[name]
         for projection in ("down", "up"):
             key = f"wan_lora.{name}.{projection}.weight"

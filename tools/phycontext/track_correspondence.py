@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-TRACK_CORRESPONDENCE_ARCHITECTURE = "track4gen_swept_latent_v1"
+TRACK_CORRESPONDENCE_ARCHITECTURE = "track4gen_swept_latent_v2"
 
 
 def latent_rgb_windows(rgb_frames: int, latent_frames: int) -> list[tuple[int, int]]:
@@ -26,6 +26,7 @@ def validate_track_correspondence(
     *,
     preprocess_size_px: tuple[int, int] | None = None,
     expected_frames: int | None = None,
+    require_background: bool = True,
 ) -> dict[str, torch.Tensor]:
     required = {
         "track_xy_px",
@@ -33,12 +34,33 @@ def validate_track_correspondence(
         "track_visible",
         "source_frame_indices",
     }
+    background_keys = {
+        "background_track_xy_px",
+        "background_track_depth_m",
+        "background_track_visible",
+    }
+    if require_background:
+        required.update(background_keys)
     missing = sorted(required - set(value))
     if missing:
         raise ValueError(f"track correspondence is missing tensors: {missing}")
     xy = value["track_xy_px"]
     depth = value["track_depth_m"]
     visible = value["track_visible"]
+    present_background_keys = background_keys & set(value)
+    if present_background_keys and present_background_keys != background_keys:
+        raise ValueError("background track tensors are incomplete")
+    has_background = present_background_keys == background_keys
+    background_xy = value.get(
+        "background_track_xy_px", xy.new_empty((xy.shape[0], 0, 2))
+    )
+    background_depth = value.get(
+        "background_track_depth_m", depth.new_empty((depth.shape[0], 0))
+    )
+    background_visible = value.get(
+        "background_track_visible",
+        visible.new_empty((visible.shape[0], 0)),
+    )
     source_frames = value["source_frame_indices"]
     if xy.ndim != 4 or xy.shape[-1] != 2:
         raise ValueError("track_xy_px must have shape F x O x P x 2")
@@ -50,23 +72,33 @@ def validate_track_correspondence(
         raise ValueError("track correspondence frame count differs from the video")
     if xy.shape[1] < 1 or xy.shape[1] > 3 or xy.shape[2] != 2048:
         raise ValueError("track correspondence must contain 1-3 objects and 2048 points")
-    if xy.dtype != torch.float32 or depth.dtype != torch.float32:
+    if background_xy.ndim != 3 or background_xy.shape[0] != xy.shape[0] or background_xy.shape[-1] != 2:
+        raise ValueError("background_track_xy_px must have shape F x S x 2")
+    if background_depth.shape != background_xy.shape[:-1] or background_visible.shape != background_depth.shape:
+        raise ValueError("background track depth and visibility must match F x S")
+    if has_background and not 1 <= background_xy.shape[1] <= 512:
+        raise ValueError("track correspondence must contain 1-512 background points")
+    if has_background and not bool(background_visible[0].all()):
+        raise ValueError("every cached background query must be visible in frame zero")
+    if xy.dtype != torch.float32 or depth.dtype != torch.float32 or background_xy.dtype != torch.float32 or background_depth.dtype != torch.float32:
         raise ValueError("track coordinates and depth must be float32")
-    if visible.dtype != torch.bool:
+    if visible.dtype != torch.bool or background_visible.dtype != torch.bool:
         raise ValueError("track visibility must be boolean")
     if source_frames.dtype != torch.int64:
         raise ValueError("source frame indices must be int64")
-    if not bool(torch.isfinite(xy).all()) or not bool(torch.isfinite(depth).all()):
+    if not bool(torch.isfinite(xy).all()) or not bool(torch.isfinite(depth).all()) or not bool(torch.isfinite(background_xy).all()) or not bool(torch.isfinite(background_depth).all()):
         raise ValueError("track correspondence contains non-finite geometry")
     if bool((visible & (depth <= 0)).any()):
         raise ValueError("visible correspondence points must have positive depth")
+    if bool((background_visible & (background_depth <= 0)).any()):
+        raise ValueError("visible background correspondence points must have positive depth")
     if source_frames.numel() > 1 and not bool((source_frames[1:] > source_frames[:-1]).all()):
         raise ValueError("source frame indices must be strictly increasing")
     if preprocess_size_px is not None:
         width, height = [int(item) for item in preprocess_size_px]
         if width <= 0 or height <= 0:
             raise ValueError("preprocess size must be positive")
-        visible_xy = xy[visible]
+        visible_xy = torch.cat((xy[visible], background_xy[background_visible]), dim=0)
         # DaS visibility is resolved after projecting continuous pixel-center
         # coordinates to raster pixels with np.rint.  A center such as -0.49
         # therefore belongs to boundary pixel 0 and must not be rejected here.
@@ -96,6 +128,10 @@ class _SpatialRefinerBlock(nn.Module):
             channels, channels, kernel_size=3, padding=1, groups=channels
         )
         self.pointwise = nn.Conv2d(channels, channels, kernel_size=1)
+        # Track4Gen's spatial refiner starts as an identity map. The branch can
+        # learn correspondence without perturbing pretrained Wan features.
+        nn.init.zeros_(self.pointwise.weight)
+        nn.init.zeros_(self.pointwise.bias)
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         residual = self.pointwise(F.silu(self.depthwise(F.silu(self.norm(value)))))
@@ -105,13 +141,14 @@ class _SpatialRefinerBlock(nn.Module):
 class TrackCorrespondenceAdapter(nn.Module):
     """Refine one Wan block's features and feed them back through a zero bridge."""
 
-    def __init__(self, hidden_dim: int, feature_dim: int = 128, refiner_blocks: int = 2):
+    def __init__(self, hidden_dim: int, feature_dim: int = 256, refiner_blocks: int = 4):
         super().__init__()
         if hidden_dim <= 0 or feature_dim <= 0 or refiner_blocks <= 0:
             raise ValueError("track correspondence dimensions must be positive")
         self.hidden_dim = int(hidden_dim)
         self.feature_dim = int(feature_dim)
         self.refiner_blocks = int(refiner_blocks)
+        self.spatial_upsample_factor = 2
         self.architecture = TRACK_CORRESPONDENCE_ARCHITECTURE
         self.input_norm = nn.LayerNorm(hidden_dim)
         self.input_projection = nn.Linear(hidden_dim, feature_dim)
@@ -143,10 +180,23 @@ class TrackCorrespondenceAdapter(nn.Module):
                 .permute(0, 3, 1, 2)
                 .contiguous()
             )
-            frame_maps = self.refiner(frame_maps)
-            refined = frame_maps.permute(0, 2, 3, 1).reshape(token_count, self.feature_dim)
+            high_resolution_maps = F.interpolate(
+                frame_maps,
+                scale_factor=self.spatial_upsample_factor,
+                mode="bilinear",
+                align_corners=False,
+            )
+            high_resolution_maps = self.refiner(high_resolution_maps)
+            feedback_maps = F.interpolate(
+                high_resolution_maps,
+                size=(height, width),
+                mode="area",
+            )
+            refined = feedback_maps.permute(0, 2, 3, 1).reshape(token_count, self.feature_dim)
             refined_tokens[batch_index, :token_count] = refined
-            feature_maps.append(frame_maps.permute(1, 0, 2, 3).contiguous())
+            feature_maps.append(
+                high_resolution_maps.permute(1, 0, 2, 3).contiguous()
+            )
         return refined_tokens, feature_maps
 
     def forward(self, tokens: torch.Tensor, grid_sizes: torch.Tensor) -> torch.Tensor:
@@ -168,8 +218,8 @@ def inject_track_correspondence(
     model: nn.Module,
     *,
     block_index: int,
-    feature_dim: int = 128,
-    refiner_blocks: int = 2,
+    feature_dim: int = 256,
+    refiner_blocks: int = 4,
 ) -> TrackCorrespondenceAdapter:
     if hasattr(model, "phycontext_track_correspondence"):
         raise ValueError("track correspondence is already injected")
@@ -260,28 +310,29 @@ def _sample_speed_balanced_candidates(
     preprocess_size_px: tuple[int, int],
     maximum_pairs: int,
     generator: torch.Generator,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if xy.ndim != 3 or xy.shape[-1] != 2 or visible.shape != xy.shape[:-1]:
+        raise ValueError("candidate tracks must have shape F x P x 2")
     windows = latent_rgb_windows(int(xy.shape[0]), latent_frames)
     anchor_visible = visible[0]
     anchor_xy = xy[0]
     target_frames = []
-    object_indices = []
     point_indices = []
     displacements = []
     for latent_index, (start, end) in enumerate(windows[1:], 1):
         window_visible = visible[start:end]
         shared = anchor_visible & window_visible.any(dim=0)
-        objects, points = torch.where(shared)
-        if not len(objects):
+        points = torch.where(shared)[0]
+        if not len(points):
             continue
-        selected_visible = window_visible[:, objects, points]
-        selected_xy = xy[start:end, objects, points]
+        selected_visible = window_visible[:, points]
+        selected_xy = xy[start:end, points]
         counts = selected_visible.sum(dim=0).clamp_min(1).unsqueeze(-1)
         target_xy = (
             selected_xy * selected_visible.unsqueeze(-1)
         ).sum(dim=0) / counts
         source_feature = _pixel_to_feature(
-            anchor_xy[objects, points],
+            anchor_xy[points],
             preprocess_size_px=preprocess_size_px,
             feature_size=feature_size,
         )
@@ -296,9 +347,8 @@ def _sample_speed_balanced_candidates(
         source_cell = torch.floor(source_feature + 0.5).long()
         source_cell[:, 0].clamp_(0, feature_size[1] - 1)
         source_cell[:, 1].clamp_(0, feature_size[0] - 1)
-        # The Wan query token has no separate object axis. Deduplicate across
-        # all objects, otherwise one source token can receive contradictory
-        # targets. Within a collision retain the fastest material point.
+        # One query per source cell and target chunk avoids contradictory
+        # labels. Within a collision retain the fastest material point.
         keys = (
             latent_index * feature_size[0] * feature_size[1]
             + source_cell[:, 1] * feature_size[1]
@@ -322,14 +372,12 @@ def _sample_speed_balanced_candidates(
         target_frames.append(
             torch.full((count,), latent_index, dtype=torch.long, device=xy.device)
         )
-        object_indices.append(objects[selected])
         point_indices.append(points[selected])
         displacements.append(displacement[selected])
     if not target_frames:
         empty = torch.empty(0, dtype=torch.long, device=xy.device)
-        return empty, empty, empty, empty.float()
+        return empty, empty, empty.float()
     target_frames = torch.cat(target_frames)
-    object_indices = torch.cat(object_indices)
     point_indices = torch.cat(point_indices)
     displacements = torch.cat(displacements)
     bins = (
@@ -359,7 +407,6 @@ def _sample_speed_balanced_candidates(
         selected = selected[:maximum_pairs]
     return (
         target_frames[selected],
-        object_indices[selected],
         point_indices[selected],
         displacements[selected],
     )
@@ -373,16 +420,13 @@ def track4gen_correspondence_loss(
     maximum_pairs: int,
     temperature: float,
     gaussian_sigma: float,
-    coordinate_weight: float,
     generator: torch.Generator,
 ) -> dict[str, torch.Tensor]:
-    """Locate first-frame material features in swept Wan latent windows."""
+    """Track foreground and background material features without trajectory input."""
     if len(feature_maps) != len(correspondences) or not feature_maps:
         raise ValueError("feature and correspondence batches must be equal and nonempty")
     if maximum_pairs <= 0 or temperature <= 0 or gaussian_sigma <= 0:
         raise ValueError("Track4Gen sampling and temperature values must be positive")
-    if coordinate_weight < 0:
-        raise ValueError("Track4Gen coordinate weight must be nonnegative")
     zero = feature_maps[0].sum() * 0.0
     sample_losses = []
     total_pairs = 0
@@ -393,6 +437,10 @@ def track4gen_correspondence_loss(
     fast_pairs = 0
     fast_epe = zero.detach()
     fast_pck_1_hits = 0
+    foreground_pairs = 0
+    background_pairs = 0
+    foreground_pck_1_hits = 0
+    background_pck_1_hits = 0
     for features, correspondence in zip(feature_maps, correspondences):
         if features.ndim != 4:
             raise ValueError("refined feature map must have shape D x F x H x W")
@@ -412,25 +460,84 @@ def track4gen_correspondence_loss(
             raise ValueError(
                 "Track4Gen requires consecutive source frames starting at zero"
             )
-        xy = correspondence["track_xy_px"].to(features.device)
-        visible = correspondence["track_visible"].to(features.device)
-        target_frames, objects, points, displacement = (
-            _sample_speed_balanced_candidates(
-                xy,
-                visible,
-                latent_frames=latent_frames,
-                feature_size=(feature_height, feature_width),
+        dynamic_xy = correspondence["track_xy_px"].to(features.device)
+        dynamic_visible = correspondence["track_visible"].to(features.device)
+        dynamic_xy = dynamic_xy.flatten(1, 2)
+        dynamic_visible = dynamic_visible.flatten(1, 2)
+        background_xy = correspondence["background_track_xy_px"].to(features.device)
+        background_visible = correspondence["background_track_visible"].to(
+            features.device
+        )
+        foreground_limit = maximum_pairs // 2
+        background_limit = maximum_pairs - foreground_limit
+        foreground = _sample_speed_balanced_candidates(
+            dynamic_xy,
+            dynamic_visible,
+            latent_frames=latent_frames,
+            feature_size=(feature_height, feature_width),
+            preprocess_size_px=preprocess_size_px,
+            maximum_pairs=foreground_limit,
+            generator=generator,
+        )
+        background = _sample_speed_balanced_candidates(
+            background_xy,
+            background_visible,
+            latent_frames=latent_frames,
+            feature_size=(feature_height, feature_width),
+            preprocess_size_px=preprocess_size_px,
+            maximum_pairs=background_limit,
+            generator=generator,
+        )
+        if len(foreground[0]) and len(background[0]):
+            foreground_source = _pixel_to_feature(
+                dynamic_xy[0, foreground[1]],
                 preprocess_size_px=preprocess_size_px,
-                maximum_pairs=maximum_pairs,
-                generator=generator,
+                feature_size=(feature_height, feature_width),
+            )
+            background_source = _pixel_to_feature(
+                background_xy[0, background[1]],
+                preprocess_size_px=preprocess_size_px,
+                feature_size=(feature_height, feature_width),
+            )
+
+            def source_keys(frames: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+                cells = torch.floor(source + 0.5).long()
+                cells[:, 0].clamp_(0, feature_width - 1)
+                cells[:, 1].clamp_(0, feature_height - 1)
+                return (
+                    frames * feature_height * feature_width
+                    + cells[:, 1] * feature_width
+                    + cells[:, 0]
+                )
+
+            # A feature token has no foreground/background identity axis. Keep
+            # foreground when both categories land in the same source token so
+            # one query cannot be assigned contradictory destinations.
+            keep_background = ~torch.isin(
+                source_keys(background[0], background_source),
+                source_keys(foreground[0], foreground_source),
+            )
+            background = tuple(value[keep_background] for value in background)
+        if not len(foreground[0]) or not len(background[0]):
+            raise ValueError(
+                "each Track4Gen video must have foreground and background pairs"
+            )
+        target_frames = torch.cat((foreground[0], background[0]))
+        points = torch.cat((foreground[1], background[1]))
+        displacement = torch.cat((foreground[2], background[2]))
+        is_background = torch.cat(
+            (
+                torch.zeros_like(foreground[0], dtype=torch.bool),
+                torch.ones_like(background[0], dtype=torch.bool),
             )
         )
-        if not len(target_frames):
-            raise ValueError(
-                "each Track4Gen video must have first-frame-visible correspondences"
-            )
+        anchor_xy = torch.empty(
+            len(points), 2, dtype=dynamic_xy.dtype, device=features.device
+        )
+        anchor_xy[~is_background] = dynamic_xy[0, points[~is_background]]
+        anchor_xy[is_background] = background_xy[0, points[is_background]]
         anchor_feature_xy = _pixel_to_feature(
-            xy[0, objects, points],
+            anchor_xy,
             preprocess_size_px=preprocess_size_px,
             feature_size=(feature_height, feature_width),
         )
@@ -452,11 +559,11 @@ def track4gen_correspondence_loss(
                 indexing="ij",
             )
             feature_grid = torch.stack((x_grid, y_grid), dim=-1).reshape(-1, 2)
-            normalized_grid = feature_grid.clone()
-            normalized_grid[:, 0] = 2.0 * (normalized_grid[:, 0] + 0.5) / feature_width - 1.0
-            normalized_grid[:, 1] = 2.0 * (normalized_grid[:, 1] + 0.5) / feature_height - 1.0
-            windows = latent_rgb_windows(int(xy.shape[0]), latent_frames)
-            sample_loss = query.sum() * 0.0
+            windows = latent_rgb_windows(int(dynamic_xy.shape[0]), latent_frames)
+            sample_foreground_loss = query.sum() * 0.0
+            sample_background_loss = query.sum() * 0.0
+            sample_foreground_pairs = 0
+            sample_background_pairs = 0
             sample_pairs = 0
             for latent_index in target_frames.unique(sorted=True).tolist():
                 selection = torch.where(target_frames == latent_index)[0]
@@ -466,10 +573,37 @@ def track4gen_correspondence_loss(
                 target_features = F.normalize(target_features, dim=-1, eps=1.0e-6)
                 logits = query[selection] @ target_features.T / temperature
                 start, end = windows[latent_index]
-                selected_objects = objects[selection]
                 selected_points = points[selection]
-                path_xy = xy[start:end, selected_objects, selected_points]
-                path_visible = visible[start:end, selected_objects, selected_points]
+                selected_background = is_background[selection]
+                path_xy = torch.empty(
+                    end - start,
+                    len(selection),
+                    2,
+                    dtype=dynamic_xy.dtype,
+                    device=features.device,
+                )
+                path_visible = torch.empty(
+                    end - start,
+                    len(selection),
+                    dtype=torch.bool,
+                    device=features.device,
+                )
+                if bool((~selected_background).any()):
+                    chosen = torch.where(~selected_background)[0]
+                    path_xy[:, chosen] = dynamic_xy[
+                        start:end, selected_points[chosen]
+                    ]
+                    path_visible[:, chosen] = dynamic_visible[
+                        start:end, selected_points[chosen]
+                    ]
+                if bool(selected_background.any()):
+                    chosen = torch.where(selected_background)[0]
+                    path_xy[:, chosen] = background_xy[
+                        start:end, selected_points[chosen]
+                    ]
+                    path_visible[:, chosen] = background_visible[
+                        start:end, selected_points[chosen]
+                    ]
                 path_feature_xy = _pixel_to_feature(
                     path_xy,
                     preprocess_size_px=preprocess_size_px,
@@ -489,19 +623,30 @@ def track4gen_correspondence_loss(
                     target * target.clamp_min(1.0e-12).log()
                 ).sum(dim=-1)
                 probability = log_probability.exp()
-                predicted_coordinate = probability @ normalized_grid
-                target_coordinate = target @ normalized_grid
+                predicted_coordinate = probability @ feature_grid
+                target_coordinate = target @ feature_grid
                 coordinate = F.smooth_l1_loss(
                     predicted_coordinate,
                     target_coordinate,
-                    beta=0.05,
+                    beta=1.0,
                     reduction="none",
                 ).mean(dim=-1)
-                sample_loss = sample_loss + (
-                    classification + coordinate_weight * coordinate
-                ).sum()
-                predicted_feature_coordinate = probability @ feature_grid
-                target_feature_coordinate = target @ feature_grid
+                # Track4Gen supervises the soft-argmax coordinate with Huber.
+                # Cross-entropy is retained only as a diagnostic; optimizing it
+                # would turn the task into coarse cell classification again.
+                foreground_selection = ~selected_background
+                if bool(foreground_selection.any()):
+                    sample_foreground_loss = sample_foreground_loss + coordinate[
+                        foreground_selection
+                    ].sum()
+                    sample_foreground_pairs += int(foreground_selection.sum().item())
+                if bool(selected_background.any()):
+                    sample_background_loss = sample_background_loss + coordinate[
+                        selected_background
+                    ].sum()
+                    sample_background_pairs += int(selected_background.sum().item())
+                predicted_feature_coordinate = predicted_coordinate
+                target_feature_coordinate = target_coordinate
                 endpoint_error = torch.linalg.vector_norm(
                     predicted_feature_coordinate - target_feature_coordinate,
                     dim=-1,
@@ -512,16 +657,28 @@ def track4gen_correspondence_loss(
                 ).clamp_min(0.0).sum().detach()
                 total_epe = total_epe + endpoint_error.sum().detach()
                 pck_1_hits += int(endpoint_error.le(1.0).sum().item())
+                background_hits = selected_background & endpoint_error.le(1.0)
+                foreground_hits = (~selected_background) & endpoint_error.le(1.0)
+                background_pck_1_hits += int(background_hits.sum().item())
+                foreground_pck_1_hits += int(foreground_hits.sum().item())
                 if bool(fast.any()):
                     fast_epe = fast_epe + endpoint_error[fast].sum().detach()
                     fast_pck_1_hits += int(
                         endpoint_error[fast].le(1.0).sum().item()
                     )
                 sample_pairs += len(selection)
-            sample_losses.append(sample_loss / sample_pairs)
+            if sample_foreground_pairs <= 0 or sample_background_pairs <= 0:
+                raise RuntimeError("Track4Gen lost a foreground/background category")
+            sample_loss = 0.5 * (
+                sample_foreground_loss / sample_foreground_pairs
+                + sample_background_loss / sample_background_pairs
+            )
+            sample_losses.append(sample_loss)
             total_pairs += sample_pairs
             total_displacement = total_displacement + displacement.sum().detach()
             fast_pairs += int(displacement.ge(3.0).sum().item())
+            foreground_pairs += int((~is_background).sum().item())
+            background_pairs += int(is_background.sum().item())
     if len(sample_losses) != len(feature_maps) or total_pairs <= 0:
         raise RuntimeError("Track4Gen did not produce one loss for every video")
     # Every video contributes equally. With a fixed local batch size, DDP's
@@ -548,4 +705,12 @@ def track4gen_correspondence_loss(
         "pck_1": pck_1,
         "fast_epe_tokens": mean_fast_epe.to(loss.device),
         "fast_pck_1": fast_pck_1,
+        "foreground_pairs": loss.new_tensor(float(foreground_pairs)),
+        "background_pairs": loss.new_tensor(float(background_pairs)),
+        "foreground_pck_1": loss.new_tensor(
+            float(foreground_pck_1_hits) / foreground_pairs
+        ),
+        "background_pck_1": loss.new_tensor(
+            float(background_pck_1_hits) / background_pairs
+        ),
     }

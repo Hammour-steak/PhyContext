@@ -31,6 +31,7 @@ from wan_training import (
     enable_block_checkpointing,
     inject_direct_condition_modulation,
     inject_cross_attention_lora,
+    inject_self_attention_lora,
     inject_trajectory_conditioning,
     index_nominal_trajectory_records,
     load_condition_checkpoint,
@@ -65,6 +66,7 @@ class DummyBlock(nn.Module):
     def __init__(self):
         super().__init__()
         self.cross_attn = DummyAttention()
+        self.self_attn = DummyAttention()
 
     def forward(
         self, x, e, seq_lens, grid_sizes, freqs, context, context_lens
@@ -418,7 +420,7 @@ class WanTrainingTest(unittest.TestCase):
             "lora": {"rank": 2, "alpha": 2.0, "module_count": 8},
             "track_correspondence": {
                 "enabled": True,
-                "architecture": "track4gen_swept_latent_v1",
+                "architecture": "track4gen_swept_latent_v2",
                 "block_index": 1,
                 "feature_dim": 4,
                 "refiner_blocks": 1,
@@ -442,6 +444,38 @@ class WanTrainingTest(unittest.TestCase):
             target_track.feedback.weight, source_track.feedback.weight
         )
 
+    def test_self_attention_lora_round_trip(self) -> None:
+        source_model = DummyModel()
+        inject_cross_attention_lora(source_model, rank=2, alpha=2)
+        inject_self_attention_lora(source_model, rank=3, alpha=3)
+        source_condition = nn.Linear(3, 4)
+        with torch.no_grad():
+            source_model.blocks[1].self_attn.v.up.weight.fill_(0.375)
+        metadata = {
+            "schema": "phycontext.wan_condition_adapter.v5",
+            "lora": {"rank": 2, "alpha": 2.0, "module_count": 8},
+            "self_attention_lora": {
+                "enabled": True,
+                "rank": 3,
+                "alpha": 3.0,
+                "block_start": 0,
+                "block_end": 2,
+                "module_count": 8,
+            },
+        }
+        with TemporaryDirectory() as directory:
+            adapter = Path(directory)
+            save_condition_checkpoint(
+                adapter, source_model, source_condition, metadata
+            )
+            target_model = DummyModel()
+            target_condition = nn.Linear(3, 4)
+            load_condition_checkpoint(adapter, target_model, target_condition)
+        torch.testing.assert_close(
+            target_model.blocks[1].self_attn.v.up.weight,
+            source_model.blocks[1].self_attn.v.up.weight,
+        )
+
     def test_track_correspondence_survives_block_checkpointing(self) -> None:
         model = DummyModel()
         adapter = inject_track_correspondence(
@@ -453,7 +487,7 @@ class WanTrainingTest(unittest.TestCase):
         grid = torch.tensor([[2, 2, 2]])
         output = model.blocks[0](x, e, None, grid, None, None, None)
         features = adapter.consume_features()
-        self.assertEqual(tuple(features[0].shape), (4, 2, 2, 2))
+        self.assertEqual(tuple(features[0].shape), (4, 2, 4, 4))
         (output.square().mean() + features[0].square().mean()).backward()
         self.assertGreater(float(x.grad.abs().sum()), 0.0)
         self.assertGreater(float(adapter.feedback.weight.grad.abs().sum()), 0.0)
@@ -464,6 +498,7 @@ class WanTrainingTest(unittest.TestCase):
     def test_optimizer_covers_every_trainable_parameter_exactly_once(self) -> None:
         model = DummyTrajectoryModel().requires_grad_(False)
         inject_cross_attention_lora(model, rank=2, alpha=2.0)
+        inject_self_attention_lora(model, rank=2, alpha=2.0)
         inject_direct_condition_modulation(
             model, rank=2, alpha=2.0, input_dim=36, object_slots=3
         )

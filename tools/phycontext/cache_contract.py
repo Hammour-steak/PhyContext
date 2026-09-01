@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 
-CURRENT_CACHE_SCHEMA = "phycontext.wan_ti2v_cache.v8"
+CURRENT_CACHE_SCHEMA = "phycontext.wan_ti2v_cache.v9"
 CANONICAL_CONDITION_FRAME_PROTOCOL = (
     "shared_first_frame_overrides_target_video_frame_zero_before_vae_encode"
 )
@@ -17,6 +17,7 @@ FULL_RATE_DAS_CACHE_SCHEMAS = frozenset(
         "phycontext.wan_ti2v_cache.v5",
         "phycontext.wan_ti2v_cache.v6",
         "phycontext.wan_ti2v_cache.v7",
+        "phycontext.wan_ti2v_cache.v8",
         CURRENT_CACHE_SCHEMA,
     }
 )
@@ -25,6 +26,7 @@ CANONICAL_CONDITION_FRAME_CACHE_SCHEMAS = frozenset(
         "phycontext.wan_ti2v_cache.v5",
         "phycontext.wan_ti2v_cache.v6",
         "phycontext.wan_ti2v_cache.v7",
+        "phycontext.wan_ti2v_cache.v8",
         CURRENT_CACHE_SCHEMA,
     }
 )
@@ -32,14 +34,19 @@ TRACK_CORRESPONDENCE_CACHE_SCHEMAS = frozenset(
     {
         "phycontext.wan_ti2v_cache.v6",
         "phycontext.wan_ti2v_cache.v7",
+        "phycontext.wan_ti2v_cache.v8",
         CURRENT_CACHE_SCHEMA,
     }
 )
 RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS = frozenset(
-    {"phycontext.wan_ti2v_cache.v7", CURRENT_CACHE_SCHEMA}
+    {
+        "phycontext.wan_ti2v_cache.v7",
+        "phycontext.wan_ti2v_cache.v8",
+        CURRENT_CACHE_SCHEMA,
+    }
 )
 CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS = frozenset(
-    {CURRENT_CACHE_SCHEMA}
+    {"phycontext.wan_ti2v_cache.v8", CURRENT_CACHE_SCHEMA}
 )
 GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA = {
     "phycontext.wan_ti2v_cache.v4": (
@@ -54,6 +61,9 @@ GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA = {
     "phycontext.wan_ti2v_cache.v7": (
         "float64_after_source_decode_until_integer_rasterization"
     ),
+    "phycontext.wan_ti2v_cache.v8": (
+        "float64_after_source_decode_until_integer_rasterization"
+    ),
     CURRENT_CACHE_SCHEMA: (
         "float64_after_source_decode_until_integer_rasterization"
     ),
@@ -65,6 +75,7 @@ SOURCE_FILE_HASH_CACHE_SCHEMAS = frozenset(
         "phycontext.wan_ti2v_cache.v5",
         "phycontext.wan_ti2v_cache.v6",
         "phycontext.wan_ti2v_cache.v7",
+        "phycontext.wan_ti2v_cache.v8",
         CURRENT_CACHE_SCHEMA,
     }
 )

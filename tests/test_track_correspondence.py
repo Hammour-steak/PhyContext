@@ -25,10 +25,18 @@ def synthetic_correspondence() -> dict[str, torch.Tensor]:
     xy[:, 0, 0, 0] = path_x
     xy[:, 0, 0, 1] = 1
     visible[:, 0, 0] = True
+    background_xy = torch.zeros(frames, 2, 2)
+    background_xy[:, 0] = torch.tensor([0.0, 3.0])
+    background_xy[:, 1] = torch.tensor([5.0, 3.0])
+    background_depth = torch.ones(frames, 2)
+    background_visible = torch.ones(frames, 2, dtype=torch.bool)
     return {
         "track_xy_px": xy,
         "track_depth_m": depth,
         "track_visible": visible,
+        "background_track_xy_px": background_xy,
+        "background_track_depth_m": background_depth,
+        "background_track_visible": background_visible,
         "source_frame_indices": torch.arange(frames),
     }
 
@@ -83,7 +91,6 @@ class TrackCorrespondenceTest(unittest.TestCase):
                 maximum_pairs=16,
                 temperature=0.05,
                 gaussian_sigma=0.2,
-                coordinate_weight=0.1,
                 generator=torch.Generator().manual_seed(7),
             )
 
@@ -139,7 +146,6 @@ class TrackCorrespondenceTest(unittest.TestCase):
             "maximum_pairs": 16,
             "temperature": 0.05,
             "gaussian_sigma": 0.2,
-            "coordinate_weight": 0.1,
         }
         aligned_result = track4gen_correspondence_loss(
             [aligned],
@@ -153,7 +159,9 @@ class TrackCorrespondenceTest(unittest.TestCase):
             generator=torch.Generator().manual_seed(7),
             **kwargs,
         )
-        self.assertEqual(float(aligned_result["pairs"]), 2.0)
+        self.assertEqual(float(aligned_result["pairs"]), 4.0)
+        self.assertEqual(float(aligned_result["foreground_pairs"]), 2.0)
+        self.assertEqual(float(aligned_result["background_pairs"]), 2.0)
         self.assertGreaterEqual(float(aligned_result["fast_pairs"]), 1.0)
         self.assertLess(
             float(aligned_result["loss"]), float(wrong_result["loss"])
@@ -184,7 +192,6 @@ class TrackCorrespondenceTest(unittest.TestCase):
             "maximum_pairs": 64,
             "temperature": 0.05,
             "gaussian_sigma": 0.2,
-            "coordinate_weight": 0.1,
         }
         first_loss = track4gen_correspondence_loss(
             [first_features],

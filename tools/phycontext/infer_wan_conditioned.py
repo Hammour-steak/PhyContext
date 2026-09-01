@@ -421,7 +421,11 @@ def main() -> None:
                 "inference cache trajectory representation differs from the adapter"
             )
         if (
-            adapter_metadata.get("schema") == "phycontext.wan_condition_adapter.v4"
+            adapter_metadata.get("schema")
+            in {
+                "phycontext.wan_condition_adapter.v4",
+                "phycontext.wan_condition_adapter.v5",
+            }
             and cache.get("schema") != CURRENT_CACHE_SCHEMA
         ):
             raise ValueError(

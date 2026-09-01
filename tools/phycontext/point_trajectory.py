@@ -718,7 +718,8 @@ def _resolve_das_visible_splats(
     static_xy: np.ndarray | None = None,
     static_depth: np.ndarray | None = None,
     static_valid: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return_static_points: bool = False,
+) -> tuple[np.ndarray, ...]:
     """Return dynamic splats that win the shared dynamic/static z-buffer."""
     preprocess_width, preprocess_height = [int(value) for value in preprocess_size_px]
     x = np.rint(current_xy[..., 0]).astype(np.int64)
@@ -758,13 +759,14 @@ def _resolve_das_visible_splats(
             & (static_y >= 0)
             & (static_y < preprocess_height)
         )
+        static_point_indices = np.flatnonzero(static_inside).astype(np.int64)
         static_x, static_y, static_z, static_objects, static_points = (
             _expand_pixel_splats(
                 static_x[static_inside],
                 static_y[static_inside],
                 static_depth[static_inside],
                 np.full(int(static_inside.sum()), -1, dtype=np.int64),
-                np.full(int(static_inside.sum()), -1, dtype=np.int64),
+                static_point_indices,
                 point_radius_px,
             )
         )
@@ -786,7 +788,8 @@ def _resolve_das_visible_splats(
     candidate_points = candidate_points[full_inside]
     if not len(candidate_x):
         empty = np.empty(0, dtype=np.int64)
-        return empty, empty, empty, empty
+        result = (empty, empty, empty, empty)
+        return result + (empty,) if return_static_points else result
     flat_pixels = candidate_y * preprocess_width + candidate_x
     order = np.lexsort(
         (
@@ -806,12 +809,57 @@ def _resolve_das_visible_splats(
     visible_objects = candidate_objects[visible]
     visible_points = candidate_points[visible]
     dynamic_visible = visible_objects >= 0
-    return (
+    result = (
         visible_x[dynamic_visible],
         visible_y[dynamic_visible],
         visible_objects[dynamic_visible],
         visible_points[dynamic_visible],
     )
+    if return_static_points:
+        return result + (visible_points[~dynamic_visible],)
+    return result
+
+
+def _select_spatially_balanced_static_points(
+    tracks_xy_px: np.ndarray,
+    visible_point_indices: np.ndarray,
+    *,
+    preprocess_size_px: tuple[int, int],
+    maximum_points: int,
+) -> np.ndarray:
+    """Choose deterministic first-frame-visible background queries across the image."""
+    if maximum_points <= 0:
+        raise ValueError("maximum background correspondence points must be positive")
+    indices = np.unique(np.asarray(visible_point_indices, dtype=np.int64))
+    if not len(indices):
+        return indices
+    width, height = [int(value) for value in preprocess_size_px]
+    xy = tracks_xy_px[indices]
+    # Round-robin over a 32 x 18 image partition. This prevents dense floors or
+    # walls from consuming every query while preserving deterministic point IDs.
+    grid_width, grid_height = 32, 18
+    cell_x = np.clip(np.floor((xy[:, 0] + 0.5) * grid_width / width), 0, grid_width - 1)
+    cell_y = np.clip(np.floor((xy[:, 1] + 0.5) * grid_height / height), 0, grid_height - 1)
+    cells = (cell_y.astype(np.int64) * grid_width + cell_x.astype(np.int64))
+    order = np.lexsort((indices, cells))
+    grouped: dict[int, list[int]] = {}
+    for position in order.tolist():
+        grouped.setdefault(int(cells[position]), []).append(int(indices[position]))
+    selected: list[int] = []
+    depth = 0
+    while len(selected) < maximum_points:
+        added = False
+        for cell in sorted(grouped):
+            values = grouped[cell]
+            if depth < len(values):
+                selected.append(values[depth])
+                added = True
+                if len(selected) == maximum_points:
+                    break
+        if not added:
+            break
+        depth += 1
+    return np.asarray(selected, dtype=np.int64)
 
 
 def _serialize_raster_consistent_track_coordinates(
@@ -859,6 +907,7 @@ def build_das_track_correspondence(
     spatial_transform: str = "cover_center_crop",
     static_points_camera0_m: np.ndarray | None = None,
     point_radius_px: int = 0,
+    background_point_count: int = 512,
 ) -> dict[str, np.ndarray]:
     """Preserve point identities visible in the point-center z-buffer."""
     object_count = int(np.asarray(payload["tracks_xy_px"]).shape[1])
@@ -872,6 +921,7 @@ def build_das_track_correspondence(
         static_points_camera0_m=static_points_camera0_m,
         point_radius_px=point_radius_px,
         correspondence_point_radius_px=point_radius_px,
+        background_point_count=background_point_count,
         return_correspondence=True,
     )
     return correspondence
@@ -888,6 +938,7 @@ def rasterize_das_3d_tracks(
     static_points_camera0_m: np.ndarray | None = None,
     point_radius_px: int = 1,
     correspondence_point_radius_px: int = 0,
+    background_point_count: int = 512,
     return_correspondence: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Render DaS-style identity-preserving 3D tracking maps for Wan.
@@ -974,6 +1025,11 @@ def rasterize_das_3d_tracks(
                 (image_width, image_height),
                 (preprocess_width, preprocess_height),
             )
+    static_visibility = (
+        np.zeros((len(frame_indices), static_tracks.shape[1]), dtype=bool)
+        if return_correspondence and static_tracks is not None
+        else None
+    )
 
     for output_index, frame_index in enumerate(frame_indices):
         current_xy = processed_tracks[frame_index]
@@ -1012,44 +1068,44 @@ def rasterize_das_3d_tracks(
             )
         )
         if return_correspondence:
-            if correspondence_point_radius_px == point_radius_px:
-                correspondence_objects = visible_objects
-                correspondence_points = visible_points
-            else:
-                (
-                    _,
-                    _,
-                    correspondence_objects,
-                    correspondence_points,
-                ) = _resolve_das_visible_splats(
-                    current_xy,
-                    current_depth,
-                    current_valid,
-                    preprocess_size_px=(preprocess_width, preprocess_height),
-                    object_indices=object_indices,
-                    point_indices=point_indices,
-                    point_radius_px=correspondence_point_radius_px,
-                    static_xy=(
-                        static_tracks[frame_index]
-                        if static_tracks is not None
-                        else None
-                    ),
-                    static_depth=(
-                        static_depth[frame_index]
-                        if static_depth is not None
-                        else None
-                    ),
-                    static_valid=(
-                        static_valid[frame_index]
-                        if static_valid is not None
-                        else None
-                    ),
-                )
+            (
+                _,
+                _,
+                correspondence_objects,
+                correspondence_points,
+                correspondence_static_points,
+            ) = _resolve_das_visible_splats(
+                current_xy,
+                current_depth,
+                current_valid,
+                preprocess_size_px=(preprocess_width, preprocess_height),
+                object_indices=object_indices,
+                point_indices=point_indices,
+                point_radius_px=correspondence_point_radius_px,
+                static_xy=(
+                    static_tracks[frame_index]
+                    if static_tracks is not None
+                    else None
+                ),
+                static_depth=(
+                    static_depth[frame_index]
+                    if static_depth is not None
+                    else None
+                ),
+                static_valid=(
+                    static_valid[frame_index]
+                    if static_valid is not None
+                    else None
+                ),
+                return_static_points=True,
+            )
             visibility[
                 output_index,
                 correspondence_objects,
                 correspondence_points,
             ] = True
+            if static_visibility is not None:
+                static_visibility[output_index, correspondence_static_points] = True
         if not len(visible_x):
             continue
         cell_x = np.floor(
@@ -1094,4 +1150,26 @@ def rasterize_das_3d_tracks(
         "track_visible": visibility,
         "source_frame_indices": selected,
     }
+    if static_tracks is not None and static_visibility is not None:
+        background_indices = _select_spatially_balanced_static_points(
+            static_tracks[int(selected[0])],
+            np.flatnonzero(static_visibility[0]),
+            preprocess_size_px=(preprocess_width, preprocess_height),
+            maximum_points=background_point_count,
+        )
+        if not len(background_indices):
+            raise ValueError("no first-frame-visible static background points")
+        background_visibility = static_visibility[:, background_indices]
+        correspondence.update(
+            {
+                "background_track_xy_px": _serialize_raster_consistent_track_coordinates(
+                    static_tracks[selected][:, background_indices],
+                    background_visibility,
+                ),
+                "background_track_depth_m": static_depth[selected][
+                    :, background_indices
+                ].astype(np.float32, copy=False),
+                "background_track_visible": background_visibility,
+            }
+        )
     return channels, correspondence

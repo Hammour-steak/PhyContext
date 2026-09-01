@@ -23,7 +23,6 @@ from torch.nn.parallel import DistributedDataParallel
 
 from cache_contract import (
     CANONICAL_CONDITION_FRAME_PROTOCOL,
-    CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     CURRENT_CACHE_SCHEMA,
     resolve_cache_artifact_root,
     resolve_cache_dataset_root,
@@ -51,6 +50,7 @@ from wan_training import (
     drop_trajectory_point_identities,
     enable_block_checkpointing,
     inject_cross_attention_lora,
+    inject_self_attention_lora,
     inject_direct_condition_modulation,
     inject_trajectory_conditioning,
     index_nominal_trajectory_records,
@@ -158,6 +158,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-tokens", type=int, default=SCENE_TOKEN_COUNT)
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
+    parser.add_argument("--self-attention-lora-rank", type=int, default=16)
+    parser.add_argument("--self-attention-lora-alpha", type=float, default=16.0)
     parser.add_argument("--modulation-rank", type=int, default=32)
     parser.add_argument("--modulation-alpha", type=float, default=32.0)
     parser.add_argument("--encoder-learning-rate", type=float, default=1e-4)
@@ -205,12 +207,17 @@ def parse_args() -> argparse.Namespace:
         default=12,
         help="zero-based Wan block whose output receives Track4Gen supervision",
     )
-    parser.add_argument("--track-correspondence-feature-dim", type=int, default=128)
-    parser.add_argument("--track-correspondence-refiner-blocks", type=int, default=2)
+    parser.add_argument("--track-correspondence-feature-dim", type=int, default=256)
+    parser.add_argument("--track-correspondence-refiner-blocks", type=int, default=4)
     parser.add_argument("--track-correspondence-pairs", type=int, default=512)
     parser.add_argument("--track-correspondence-temperature", type=float, default=0.07)
     parser.add_argument("--track-correspondence-gaussian-sigma", type=float, default=0.75)
-    parser.add_argument("--track-correspondence-coordinate-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--track-correspondence-sigma",
+        type=float,
+        default=0.2,
+        help="fixed low-noise sigma for the trajectory-disabled correspondence pass",
+    )
     parser.add_argument(
         "--trajectory-identity-dropout",
         type=float,
@@ -905,7 +912,7 @@ def isolated_physics_response_loss(
     )
 
 
-def forward_losses(
+def forward_generation_losses(
     model,
     condition_encoder,
     loaded: dict,
@@ -986,7 +993,18 @@ def forward_losses(
             context=context,
             seq_len=flow["seq_len"],
         )
-        correspondence_features = consume_track_correspondence_features(raw_model)
+        # This pass uses trajectory conditioning for generation. Its captured
+        # features are deliberately discarded: correspondence supervision is
+        # computed by a separate trajectory-disabled forward below.
+        consume_track_correspondence_features(raw_model)
+        correspondence_sync_zero = sum(
+            (
+                parameter.float().sum() * 0.0
+                for parameter in track_correspondence_feature_parameters(raw_model)
+                if parameter.requires_grad
+            ),
+            predictions[0].sum() * 0.0,
+        )
         reconstruction_masks = [
             balanced_motion_loss_mask(
                 base_mask,
@@ -1020,20 +1038,6 @@ def forward_losses(
             temperature=args.trajectory_temperature,
             beta=args.trajectory_beta,
         )
-        correspondence = track4gen_correspondence_loss(
-            correspondence_features,
-            loaded["track_correspondence"],
-            preprocess_size_px=loaded["scene_size_px"],
-            maximum_pairs=args.track_correspondence_pairs,
-            temperature=args.track_correspondence_temperature,
-            gaussian_sigma=args.track_correspondence_gaussian_sigma,
-            coordinate_weight=args.track_correspondence_coordinate_weight,
-            generator=generator,
-        )
-        if int(correspondence["pairs"].item()) <= 0:
-            raise RuntimeError(
-                "Track4Gen batch has no first-frame-visible material correspondences"
-            )
         lpips_loss = reconstruction.new_zeros(())
         if args.lpips_loss_weight > 0 and not response_enabled:
             if vae is None or perceptual_model is None:
@@ -1053,31 +1057,143 @@ def forward_losses(
             + args.lpips_loss_weight * lpips_loss
             + args.response_loss_weight * response
             + args.trajectory_center_loss_weight * center
-            + args.track_correspondence_loss_weight * correspondence["loss"]
+            + correspondence_sync_zero
         )
     return {
         "total": total,
         "reconstruction": reconstruction,
         "response": response,
         "trajectory_center": center,
+        "trajectory_identity_dropout_fraction": reconstruction.new_tensor(
+            float(identity_dropout_count) / len(trajectory_point_maps)
+        ),
+        "lpips": lpips_loss,
+        "sigma": sigmas[0],
+    }
+
+
+def forward_correspondence_losses(
+    model,
+    loaded: dict,
+    args: argparse.Namespace,
+    device: torch.device,
+    generator: torch.Generator,
+) -> dict[str, torch.Tensor]:
+    """Run Track4Gen supervision with every structured trajectory cue disabled."""
+    raw_model = unwrap(model)
+    if not set_direct_condition(
+        raw_model,
+        loaded["controls"],
+        loaded["initial_state"],
+        enabled=False,
+    ):
+        raise RuntimeError("formal correspondence requires direct-condition support")
+    if args.trajectory_input and not set_trajectory_condition(
+        raw_model,
+        loaded["trajectory_point_maps"],
+        enabled=False,
+    ):
+        raise RuntimeError("formal correspondence requires trajectory support")
+    # Track4Gen learns appearance correspondences from the noisy video itself.
+    # Scene/physics tokens and direct modulation are excluded together with the
+    # full target trajectory so none can encode the requested destination.
+    context = [text[: raw_model.text_len] for text in loaded["text"]]
+    sigmas = torch.full(
+        (len(loaded["latents"]),),
+        args.track_correspondence_sigma,
+        device=device,
+    )
+    flow = make_ti2v_flow_batch(
+        loaded["latents"],
+        sigmas,
+        patch_size=tuple(raw_model.patch_size),
+        generator=generator,
+        shared_noise=False,
+    )
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        model(
+            flow["noisy_latents"],
+            t=flow["timesteps"],
+            context=context,
+            seq_len=flow["seq_len"],
+        )
+        correspondence_features = consume_track_correspondence_features(raw_model)
+        correspondence = track4gen_correspondence_loss(
+            correspondence_features,
+            loaded["track_correspondence"],
+            preprocess_size_px=loaded["scene_size_px"],
+            maximum_pairs=args.track_correspondence_pairs,
+            temperature=args.track_correspondence_temperature,
+            gaussian_sigma=args.track_correspondence_gaussian_sigma,
+            generator=generator,
+        )
+    if int(correspondence["pairs"].item()) <= 0:
+        raise RuntimeError("Track4Gen batch has no material correspondences")
+    return {
         "track_correspondence": correspondence["loss"],
         "track_correspondence_pairs": correspondence["pairs"],
         "track_correspondence_fast_pairs": correspondence["fast_pairs"],
+        "track_correspondence_foreground_pairs": correspondence[
+            "foreground_pairs"
+        ],
+        "track_correspondence_background_pairs": correspondence[
+            "background_pairs"
+        ],
         "track_correspondence_mean_displacement_tokens": correspondence[
             "mean_displacement_tokens"
         ],
         "track_correspondence_kl": correspondence["kl"],
         "track_correspondence_epe_tokens": correspondence["epe_tokens"],
         "track_correspondence_pck_1": correspondence["pck_1"],
+        "track_correspondence_foreground_pck_1": correspondence[
+            "foreground_pck_1"
+        ],
+        "track_correspondence_background_pck_1": correspondence[
+            "background_pck_1"
+        ],
         "track_correspondence_fast_epe_tokens": correspondence[
             "fast_epe_tokens"
         ],
         "track_correspondence_fast_pck_1": correspondence["fast_pck_1"],
-        "trajectory_identity_dropout_fraction": reconstruction.new_tensor(
-            float(identity_dropout_count) / len(trajectory_point_maps)
-        ),
-        "lpips": lpips_loss,
-        "sigma": sigmas[0],
+    }
+
+
+def forward_losses(
+    model,
+    condition_encoder,
+    loaded: dict,
+    args: argparse.Namespace,
+    device: torch.device,
+    generator: torch.Generator,
+    response_enabled: bool,
+    vae=None,
+    perceptual_model=None,
+    fixed_sigma: float | None = None,
+    apply_identity_dropout: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Validation/integration wrapper for the two semantically isolated passes."""
+    correspondence = forward_correspondence_losses(
+        model, loaded, args, device, generator
+    )
+    generation = forward_generation_losses(
+        model,
+        condition_encoder,
+        loaded,
+        args,
+        device,
+        generator,
+        response_enabled,
+        vae=vae,
+        perceptual_model=perceptual_model,
+        fixed_sigma=fixed_sigma,
+        apply_identity_dropout=apply_identity_dropout,
+    )
+    return {
+        **generation,
+        **correspondence,
+        "total": generation["total"]
+        + args.track_correspondence_loss_weight
+        * correspondence["track_correspondence"],
     }
 
 
@@ -1110,6 +1226,12 @@ FAST_PAIR_WEIGHTED_TRACK_METRICS = {
     "track_correspondence_fast_epe_tokens",
     "track_correspondence_fast_pck_1",
 }
+FOREGROUND_PAIR_WEIGHTED_TRACK_METRICS = {
+    "track_correspondence_foreground_pck_1",
+}
+BACKGROUND_PAIR_WEIGHTED_TRACK_METRICS = {
+    "track_correspondence_background_pck_1",
+}
 
 
 def accumulate_loss_metrics(
@@ -1124,6 +1246,12 @@ def accumulate_loss_metrics(
     fast_pair_count = float(
         losses["track_correspondence_fast_pairs"].detach().cpu()
     )
+    foreground_pair_count = float(
+        losses["track_correspondence_foreground_pairs"].detach().cpu()
+    )
+    background_pair_count = float(
+        losses["track_correspondence_background_pairs"].detach().cpu()
+    )
     for key in totals:
         if key == "response" and not response_enabled:
             continue
@@ -1133,6 +1261,10 @@ def accumulate_loss_metrics(
             weight = pair_count
         elif key in FAST_PAIR_WEIGHTED_TRACK_METRICS:
             weight = fast_pair_count
+        elif key in FOREGROUND_PAIR_WEIGHTED_TRACK_METRICS:
+            weight = foreground_pair_count
+        elif key in BACKGROUND_PAIR_WEIGHTED_TRACK_METRICS:
+            weight = background_pair_count
         else:
             weight = 1.0
         if weight <= 0:
@@ -1172,10 +1304,14 @@ def validate(
             "track_correspondence",
             "track_correspondence_pairs",
             "track_correspondence_fast_pairs",
+            "track_correspondence_foreground_pairs",
+            "track_correspondence_background_pairs",
             "track_correspondence_mean_displacement_tokens",
             "track_correspondence_kl",
             "track_correspondence_epe_tokens",
             "track_correspondence_pck_1",
+            "track_correspondence_foreground_pck_1",
+            "track_correspondence_background_pck_1",
             "track_correspondence_fast_epe_tokens",
             "track_correspondence_fast_pck_1",
             "trajectory_identity_dropout_fraction",
@@ -1265,7 +1401,7 @@ def adapter_metadata(
     direct_object_slots: int,
 ) -> dict:
     return {
-        "schema": "phycontext.wan_condition_adapter.v4",
+        "schema": "phycontext.wan_condition_adapter.v5",
         "base_model": str(checkpoint),
         "base_model_index_sha256": sha256(
             checkpoint / "diffusion_pytorch_model.safetensors.index.json"
@@ -1319,7 +1455,26 @@ def adapter_metadata(
             "rank": args.lora_rank,
             "alpha": args.lora_alpha,
             "module_count": len(
-                [module for module in model.modules() if isinstance(module, LoRALinear)]
+                [
+                    module
+                    for name, module in model.named_modules()
+                    if ".cross_attn." in name and isinstance(module, LoRALinear)
+                ]
+            ),
+        },
+        "self_attention_lora": {
+            "enabled": True,
+            "target": "wan.blocks.*.self_attn.{q,k,v,o}",
+            "rank": args.self_attention_lora_rank,
+            "alpha": args.self_attention_lora_alpha,
+            "block_start": 0,
+            "block_end": len(model.blocks),
+            "module_count": len(
+                [
+                    module
+                    for name, module in model.named_modules()
+                    if ".self_attn." in name and isinstance(module, LoRALinear)
+                ]
             ),
         },
         "direct_modulation": {
@@ -1427,23 +1582,24 @@ def adapter_metadata(
             "gaussian_sigma_feature_cells": (
                 args.track_correspondence_gaussian_sigma
             ),
-            "coordinate_weight": args.track_correspondence_coordinate_weight,
+            "correspondence_sigma": args.track_correspondence_sigma,
+            "feature_grid_upsample_factor": 2,
             "query": "clean_first_frame_visible_material_point",
             "target": "visible_same_point_swept_over_each_four_rgb_frame_latent_window",
             "similarity": "global_target_frame_cosine_cost_volume",
-            "objective": "soft_target_cross_entropy_plus_expected_coordinate_huber",
+            "objective": "soft_argmax_feature_coordinate_huber",
             "visibility": "cached_global_dynamic_static_z_buffer",
-            "sampling": "equal_slow_medium_fast_feature_displacement_bins",
+            "sampling": "equal_foreground_background_then_equal_slow_medium_fast_bins",
             "feedback": "zero_initialized_linear_of_stop_gradient_refined_features",
             "feature_objective_normalization": "equal_video_weight_then_ddp_rank_mean",
-            "identity_shortcut_mitigation": (
-                "training_only_rgb_identity_dropout_with_occupancy_preserved"
-            ),
+            "conditioning_during_correspondence": "text_only_no_scene_physics_or_trajectory",
+            "identity_shortcut_mitigation": "trajectory_branch_fully_disabled",
             "identity_dropout_probability": args.trajectory_identity_dropout,
             "diagnostics": [
                 "kl_above_soft_target_entropy",
                 "expected_coordinate_epe_tokens",
                 "pck_at_1_token",
+                "foreground_and_background_pck_at_1_token",
                 "fast_subset_epe_and_pck_at_1_token",
             ],
         },
@@ -1560,6 +1716,12 @@ def adapter_metadata(
         ],
         "track_correspondence_fast_pck_1": [
             item["track_correspondence_fast_pck_1"] for item in history
+        ],
+        "track_correspondence_foreground_pck_1": [
+            item["track_correspondence_foreground_pck_1"] for item in history
+        ],
+        "track_correspondence_background_pck_1": [
+            item["track_correspondence_background_pck_1"] for item in history
         ],
         "trajectory_identity_dropout_fractions": [
             item["trajectory_identity_dropout_fraction"] for item in history
@@ -1692,6 +1854,8 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "scene_tokens",
     "lora_rank",
     "lora_alpha",
+    "self_attention_lora_rank",
+    "self_attention_lora_alpha",
     "modulation_rank",
     "modulation_alpha",
     "encoder_learning_rate",
@@ -1722,7 +1886,7 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "track_correspondence_pairs",
     "track_correspondence_temperature",
     "track_correspondence_gaussian_sigma",
-    "track_correspondence_coordinate_weight",
+    "track_correspondence_sigma",
     "trajectory_identity_dropout",
     "trajectory_temperature",
     "trajectory_beta",
@@ -1808,11 +1972,16 @@ def main() -> None:
         raise ValueError("scene token count must be positive")
     if min(
         args.lora_rank,
+        args.self_attention_lora_rank,
         args.modulation_rank,
         args.trajectory_condition_rank,
     ) <= 0:
         raise ValueError("adapter ranks must be positive")
-    if args.lora_alpha <= 0 or args.modulation_alpha <= 0:
+    if (
+        args.lora_alpha <= 0
+        or args.self_attention_lora_alpha <= 0
+        or args.modulation_alpha <= 0
+    ):
         raise ValueError("adapter alpha values must be positive")
     if not 0 <= args.warmup_ratio < 1:
         raise ValueError("warmup ratio must lie in [0, 1)")
@@ -1854,10 +2023,10 @@ def main() -> None:
         or args.track_correspondence_block_index < 0
         or args.track_correspondence_feature_dim <= 0
         or args.track_correspondence_refiner_blocks <= 0
-        or args.track_correspondence_pairs <= 0
+        or args.track_correspondence_pairs < 2
         or args.track_correspondence_temperature <= 0
         or args.track_correspondence_gaussian_sigma <= 0
-        or args.track_correspondence_coordinate_weight < 0
+        or not 0 < args.track_correspondence_sigma < 1
     ):
         raise ValueError("Track4Gen correspondence settings are invalid")
     if args.lpips_loss_weight > 0 and args.lpips_resolution < 32:
@@ -1899,10 +2068,7 @@ def main() -> None:
             raise ValueError(
                 "cache trajectory representation differs from the training request"
             )
-        if (
-            cache.get("schema")
-            not in CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS
-        ):
+        if cache.get("schema") != CURRENT_CACHE_SCHEMA:
             raise ValueError(
                 "Track4Gen training requires the current exact-correspondence "
                 f"cache schema {CURRENT_CACHE_SCHEMA}"
@@ -2061,6 +2227,11 @@ def main() -> None:
             inject_cross_attention_lora(
                 model, rank=args.lora_rank, alpha=args.lora_alpha
             )
+            inject_self_attention_lora(
+                model,
+                rank=args.self_attention_lora_rank,
+                alpha=args.self_attention_lora_alpha,
+            )
             inject_direct_condition_modulation(
                 model,
                 rank=args.modulation_rank,
@@ -2068,6 +2239,40 @@ def main() -> None:
                 input_dim=12 * direct_object_slots,
                 object_slots=direct_object_slots,
             )
+
+        self_attention_modules = [
+            (name, module)
+            for name, module in model.named_modules()
+            if ".self_attn." in name and isinstance(module, LoRALinear)
+        ]
+        if not self_attention_modules:
+            if args.resume is not None:
+                raise ValueError(
+                    "resume adapter has no self-attention LoRA; initialize a new run"
+                )
+            inject_self_attention_lora(
+                model,
+                rank=args.self_attention_lora_rank,
+                alpha=args.self_attention_lora_alpha,
+            )
+        else:
+            previous_self = (
+                previous.get("self_attention_lora", {}) if previous else None
+            )
+            if len(self_attention_modules) != 4 * len(model.blocks) or (
+                previous_self is not None
+                and (
+                    not previous_self.get("enabled", False)
+                    or int(previous_self.get("rank", 0))
+                    != args.self_attention_lora_rank
+                    or float(previous_self.get("alpha", 0.0))
+                    != args.self_attention_lora_alpha
+                )
+            ):
+                raise ValueError(
+                    "source adapter self-attention LoRA architecture differs "
+                    "from arguments"
+                )
 
         existing_trajectory = getattr(
             model, "phycontext_trajectory_conditioner", None
@@ -2211,10 +2416,14 @@ def main() -> None:
                     "track_correspondence",
                     "track_correspondence_pairs",
                     "track_correspondence_fast_pairs",
+                    "track_correspondence_foreground_pairs",
+                    "track_correspondence_background_pairs",
                     "track_correspondence_mean_displacement_tokens",
                     "track_correspondence_kl",
                     "track_correspondence_epe_tokens",
                     "track_correspondence_pck_1",
+                    "track_correspondence_foreground_pck_1",
+                    "track_correspondence_background_pck_1",
                     "track_correspondence_fast_epe_tokens",
                     "track_correspondence_fast_pck_1",
                     "trajectory_identity_dropout_fraction",
@@ -2267,11 +2476,38 @@ def main() -> None:
                     + rank
                 )
                 synchronize = accumulation_index + 1 == args.gradient_accumulation
+                # The correspondence pass never sees target trajectory maps,
+                # scene tokens, or direct physics modulation. It is backwarded
+                # immediately so its high-resolution graph is released before
+                # the generation/LPIPS pass. DDP reduces the accumulated model
+                # gradients on the final generation backward.
+                with contextlib.ExitStack() as stack:
+                    if world_size > 1:
+                        stack.enter_context(model.no_sync())
+                    correspondence_losses = forward_correspondence_losses(
+                        model,
+                        loaded,
+                        args,
+                        device,
+                        generator,
+                    )
+                    correspondence_objective = (
+                        args.track_correspondence_loss_weight
+                        * correspondence_losses["track_correspondence"]
+                    )
+                    if not torch.isfinite(correspondence_objective):
+                        raise RuntimeError(
+                            "formal correspondence loss is non-finite"
+                        )
+                    (
+                        correspondence_objective
+                        / args.gradient_accumulation
+                    ).backward()
                 with contextlib.ExitStack() as stack:
                     if not synchronize and world_size > 1:
                         stack.enter_context(model.no_sync())
                         stack.enter_context(condition_encoder.no_sync())
-                    losses = forward_losses(
+                    generation_losses = forward_generation_losses(
                         model,
                         condition_encoder,
                         loaded,
@@ -2283,9 +2519,18 @@ def main() -> None:
                         perceptual_model=perceptual_model,
                         apply_identity_dropout=True,
                     )
-                    if not torch.isfinite(losses["total"]):
-                        raise RuntimeError("formal training loss is non-finite")
-                    (losses["total"] / args.gradient_accumulation).backward()
+                    if not torch.isfinite(generation_losses["total"]):
+                        raise RuntimeError("formal generation loss is non-finite")
+                    (
+                        generation_losses["total"]
+                        / args.gradient_accumulation
+                    ).backward()
+                losses = {
+                    **generation_losses,
+                    **correspondence_losses,
+                    "total": generation_losses["total"].detach()
+                    + correspondence_objective.detach(),
+                }
                 accumulate_loss_metrics(
                     local_sums,
                     local_counts,

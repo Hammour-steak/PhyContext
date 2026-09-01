@@ -528,6 +528,11 @@ class TrainingDefaultTests(unittest.TestCase):
         self.assertGreater(args.track_correspondence_temperature, 0.0)
         self.assertGreater(args.track_correspondence_pairs, 0)
         self.assertEqual(args.track_correspondence_block_index, 12)
+        self.assertEqual(args.track_correspondence_feature_dim, 256)
+        self.assertEqual(args.track_correspondence_refiner_blocks, 4)
+        self.assertEqual(args.self_attention_lora_rank, 16)
+        self.assertGreater(args.track_correspondence_sigma, 0.0)
+        self.assertLess(args.track_correspondence_sigma, 1.0)
         self.assertLess(
             args.track_correspondence_feedback_learning_rate,
             args.track_correspondence_learning_rate,
@@ -753,9 +758,9 @@ class TrainingDefaultTests(unittest.TestCase):
                     "architecture": "full_frame_causal_patch_v2",
                 },
                 "track_correspondence": {
-                    "architecture": "track4gen_swept_latent_v1",
+                    "architecture": "track4gen_swept_latent_v2",
                     "block_index": 18,
-                    "feature_dim": 128,
+                    "feature_dim": 256,
                 },
             }
             train_wan_formal.write_input_contract(checkpoint, metadata)

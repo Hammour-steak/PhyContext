@@ -13,6 +13,7 @@ from cache_contract import (
     CANONICAL_CONDITION_FRAME_PROTOCOL,
     CANONICAL_CONDITION_FRAME_CACHE_SCHEMAS,
     CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
+    CURRENT_CACHE_SCHEMA,
     FLOAT64_GEOMETRY_CACHE_SCHEMAS,
     FULL_RATE_DAS_CACHE_SCHEMAS,
     GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
@@ -229,6 +230,20 @@ def main() -> None:
                 "visibility_query": "projected_material_point_center_pixel",
             }
         )
+    if cache_schema == CURRENT_CACHE_SCHEMA:
+        expected_correspondence_preprocess.update(
+            {
+                "foreground_background_sampling": "balanced_during_training",
+                "background_query_selection": (
+                    "up_to_512_first_frame_visible_static_points_spatially_balanced"
+                ),
+            }
+        )
+        expected_correspondence_preprocess["cached_tensors"][3:3] = [
+            "background_track_xy_px",
+            "background_track_depth_m",
+            "background_track_visible",
+        ]
     if cache_schema in RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
         expected_correspondence_preprocess["coordinate_serialization"] = (
             "float32_with_float64_visible_raster_pixel_preserved"
@@ -434,6 +449,7 @@ def main() -> None:
                                 int(cache["preprocess"]["height"]),
                             ),
                             expected_frames=int(cache["preprocess"]["frames"]),
+                            require_background=cache_schema == CURRENT_CACHE_SCHEMA,
                         )
                     except ValueError as error:
                         errors.append(
@@ -453,6 +469,21 @@ def main() -> None:
                         "track_visible": (
                             "visible_shape",
                             "visible_dtype",
+                            "bool",
+                        ),
+                        "background_track_xy_px": (
+                            "background_xy_shape",
+                            "background_xy_dtype",
+                            "float32",
+                        ),
+                        "background_track_depth_m": (
+                            "background_depth_shape",
+                            "background_depth_dtype",
+                            "float32",
+                        ),
+                        "background_track_visible": (
+                            "background_visible_shape",
+                            "background_visible_dtype",
                             "bool",
                         ),
                         "source_frame_indices": (

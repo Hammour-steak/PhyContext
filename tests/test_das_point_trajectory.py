@@ -431,6 +431,15 @@ class DasPointTrajectoryTest(unittest.TestCase):
 
         self.assertEqual(float(rendered[3].sum()), 0.0)
         self.assertFalse(bool(correspondence["track_visible"][:, 0, 0].any()))
+        self.assertEqual(
+            tuple(correspondence["background_track_xy_px"].shape), (2, 1, 2)
+        )
+        self.assertTrue(
+            bool(correspondence["background_track_visible"][:, 0].all())
+        )
+        self.assertTrue(
+            bool((correspondence["background_track_depth_m"][:, 0] > 0).all())
+        )
 
     def test_static_control_splat_does_not_hide_adjacent_correspondence(self) -> None:
         payload = point_payload()
