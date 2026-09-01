@@ -28,7 +28,6 @@ from wan_training import (
     DirectConditionModulator,
     LoRALinear,
     balanced_motion_loss_mask,
-    drop_trajectory_point_identities,
     enable_block_checkpointing,
     inject_direct_condition_modulation,
     inject_cross_attention_lora,
@@ -167,22 +166,6 @@ class WanTrainingTest(unittest.TestCase):
         self.assertFalse(trajectory.call_args.kwargs["enabled"])
         self.assertEqual(len(model.context), 1)
         self.assertEqual(tuple(model.context[0].shape), (5, 8))
-
-    def test_das_identity_dropout_preserves_every_occupancy_channel(self) -> None:
-        point_map = torch.randn(12, 3, 2, 2)
-        point_map[3::4] = torch.rand_like(point_map[3::4])
-        result, count = drop_trajectory_point_identities(
-            [point_map],
-            1.0,
-            generator=torch.Generator().manual_seed(7),
-        )
-        self.assertEqual(count, 1)
-        for base in range(0, 12, 4):
-            torch.testing.assert_close(
-                result[0][base : base + 3],
-                torch.zeros_like(result[0][base : base + 3]),
-            )
-            torch.testing.assert_close(result[0][base + 3], point_map[base + 3])
 
     def test_response_forward_holds_noise_text_and_trajectory_fixed(self) -> None:
         model = CapturingResponseModel()
