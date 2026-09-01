@@ -24,6 +24,7 @@ from torch.nn.parallel import DistributedDataParallel
 from cache_contract import (
     CANONICAL_CONDITION_FRAME_PROTOCOL,
     CURRENT_CACHE_SCHEMA,
+    TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     resolve_cache_artifact_root,
     resolve_cache_dataset_root,
     validate_cache_artifact,
@@ -52,7 +53,7 @@ from wan_training import (
     inject_direct_condition_modulation,
     inject_trajectory_conditioning,
     index_nominal_trajectory_records,
-    latent_motion_supervision_losses,
+    latent_object_center_loss,
     load_condition_checkpoint,
     lora_parameters,
     make_formal_training_batch,
@@ -73,9 +74,13 @@ from wan_training import (
     validate_point_track_object_slots,
     trajectory_conditioner_parameters,
 )
-from temporal_supervision import (
-    clean_video_flow_residual_loss,
-    load_temporal_supervision,
+from track_correspondence import (
+    TRACK_CORRESPONDENCE_ARCHITECTURE,
+    consume_track_correspondence_features,
+    inject_track_correspondence,
+    track4gen_correspondence_loss,
+    track_correspondence_parameters,
+    validate_track_correspondence,
 )
 
 
@@ -106,7 +111,7 @@ TRAINING_CODE_PATHS = (
     Path("tools/phycontext/video_preprocess.py"),
     Path("tools/phycontext/point_trajectory.py"),
     Path("tools/phycontext/cache_contract.py"),
-    Path("tools/phycontext/temporal_supervision.py"),
+    Path("tools/phycontext/track_correspondence.py"),
 )
 
 
@@ -157,6 +162,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-learning-rate", type=float, default=5e-5)
     parser.add_argument("--direct-learning-rate", type=float, default=5e-5)
     parser.add_argument("--trajectory-learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--track-correspondence-learning-rate", type=float, default=1e-4
+    )
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--minimum-learning-rate-ratio", type=float, default=0.1)
     parser.add_argument("--encoder-weight-decay", type=float, default=0.01)
@@ -179,45 +187,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motion-foreground-share", type=float, default=0.5)
     parser.add_argument("--minimum-response-energy", type=float, default=1e-3)
     parser.add_argument("--trajectory-center-loss-weight", type=float, default=0.2)
+    parser.add_argument("--track-correspondence-loss-weight", type=float, default=0.1)
     parser.add_argument(
-        "--trajectory-distribution-loss-weight", type=float, default=0.05
-    )
-    parser.add_argument("--trajectory-velocity-loss-weight", type=float, default=0.2)
-    parser.add_argument("--flow-temporal-loss-weight", type=float, default=0.1)
-    parser.add_argument("--flow-temporal-beta", type=float, default=0.02)
-    parser.add_argument(
-        "--flow-foreground-share",
-        type=float,
-        default=0.5,
-        help=(
-            "share of the single flow residual assigned to visible material "
-            "points; the remainder is assigned to stable zero-flow background"
-        ),
-    )
-    parser.add_argument(
-        "--temporal-loss-resolution",
+        "--track-correspondence-block-index",
         type=int,
-        default=128,
-        help="RGB long edge for aspect-preserving exact-time VAE supervision",
+        default=12,
+        help="zero-based Wan block whose output receives Track4Gen supervision",
     )
-    parser.add_argument(
-        "--temporal-mask-erosion-px",
-        type=int,
-        default=2,
-        help="instance-mask interior margin at the 832x480 preprocess resolution",
-    )
-    parser.add_argument(
-        "--background-mask-dilation-px",
-        type=int,
-        default=2,
-        help="two-frame object-sweep margin at temporal-loss resolution",
-    )
-    parser.add_argument(
-        "--background-stability-threshold",
-        type=float,
-        default=0.05,
-        help="maximum target RGB pair change for a stable background pixel",
-    )
+    parser.add_argument("--track-correspondence-feature-dim", type=int, default=128)
+    parser.add_argument("--track-correspondence-refiner-blocks", type=int, default=2)
+    parser.add_argument("--track-correspondence-pairs", type=int, default=512)
+    parser.add_argument("--track-correspondence-temperature", type=float, default=0.07)
+    parser.add_argument("--track-correspondence-gaussian-sigma", type=float, default=0.75)
+    parser.add_argument("--track-correspondence-coordinate-weight", type=float, default=0.1)
     parser.add_argument("--trajectory-temperature", type=float, default=0.03)
     parser.add_argument("--trajectory-beta", type=float, default=0.05)
     parser.add_argument(
@@ -352,10 +334,14 @@ def require_complete_cache(
     if not records:
         raise ValueError(f"cache has no {split} records")
     canonical_trajectory_representation(trajectory_representation)
-    missing = [item["sample_id"] for item in records if "point_track" not in item]
+    missing = [
+        item["sample_id"]
+        for item in records
+        if "point_track" not in item or "track_correspondence" not in item
+    ]
     if missing:
         raise ValueError(
-            "point-track training requires cached point trajectories; "
+            "Track4Gen training requires cached point maps and exact correspondences; "
             f"{len(missing)} missing in {split}"
         )
     verified_scenes: dict[Path, str] = {}
@@ -365,6 +351,10 @@ def require_complete_cache(
             ("latent", f"latent for {sample_id}"),
             ("text_context", f"text context for {sample_id}"),
             ("point_track", f"point track for {sample_id}"),
+            (
+                "track_correspondence",
+                f"track correspondence for {sample_id}",
+            ),
         ):
             validate_cache_artifact(
                 artifact_root,
@@ -384,11 +374,20 @@ def require_complete_cache(
             )
         expected_object_ids = record_dynamic_object_ids(item)
         point_track = item["point_track"]
+        track_correspondence = item["track_correspondence"]
         if (
             point_track.get("object_ids") != expected_object_ids
             or int(point_track.get("object_count", -1)) != len(expected_object_ids)
         ):
             raise ValueError(f"point-track object binding is invalid for {sample_id}")
+        if (
+            track_correspondence.get("object_ids") != expected_object_ids
+            or int(track_correspondence.get("object_count", -1))
+            != len(expected_object_ids)
+        ):
+            raise ValueError(
+                f"track-correspondence object binding is invalid for {sample_id}"
+            )
         scene_path = (
             dataset_root / item["record"]["conditioning"]["scene"]
         ).resolve()
@@ -512,9 +511,22 @@ def optimizer_groups(
                 "weight_decay": 0.0,
             }
         )
+    candidates.append(
+        {
+            "name": "track_correspondence",
+            "params": [
+                parameter
+                for parameter in track_correspondence_parameters(model)
+                if parameter.requires_grad
+            ],
+            "lr": args.track_correspondence_learning_rate,
+            "initial_lr": args.track_correspondence_learning_rate,
+            "weight_decay": 0.0,
+        }
+    )
     groups = [group for group in candidates if group["params"]]
     names = {group["name"] for group in groups}
-    required = {"wan_lora"}
+    required = {"wan_lora", "track_correspondence"}
     if args.trajectory_input:
         required.add("trajectory_conditioning")
     if args.training_stage == "joint":
@@ -577,35 +589,6 @@ def apply_learning_rate(optimizer, factor: float) -> dict[str, float]:
     return values
 
 
-def temporal_flow_enabled(args: argparse.Namespace) -> bool:
-    return bool(getattr(args, "flow_temporal_loss_weight", 0.0) > 0)
-
-
-def scheduled_temporal_window(
-    schedule_index: int,
-    rank: int,
-    world_size: int,
-    latent_frame_count: int,
-) -> int:
-    """Reserve one quarter of flow windows for the condition boundary.
-
-    The remaining distributed slots cycle uniformly over every later
-    two-chunk window.  This keeps the unique frame-0-to-frame-1 anchor from
-    being diluted to one out of all 23 possible windows.
-    """
-    if schedule_index < 0 or rank < 0 or world_size <= 0 or rank >= world_size:
-        raise ValueError("temporal chunk schedule arguments are invalid")
-    window_count = latent_frame_count - 2
-    if window_count <= 0:
-        raise ValueError("temporal supervision requires two generated latent chunks")
-    global_slot = schedule_index * world_size + rank
-    if global_slot % 4 == 0 or window_count == 1:
-        return 1
-    preceding_boundary_slots = global_slot // 4 + 1
-    later_slot = global_slot - preceding_boundary_slots
-    return 2 + later_slot % (window_count - 1)
-
-
 def load_microbatch(
     artifact_root: Path,
     dataset_root: Path,
@@ -614,10 +597,7 @@ def load_microbatch(
     trajectory_batch: list[dict] | None = None,
     trajectory_representation: str = "das_3d_tracks",
     scene_size_px: tuple[int, int] | None = None,
-    temporal_window_start: int | None = None,
     video_frame_count: int | None = None,
-    temporal_loss_resolution: int = 128,
-    temporal_mask_erosion_px: int = 2,
 ) -> dict:
     records = [item["record"] for item in batch]
     trajectory_representation = canonical_trajectory_representation(
@@ -654,36 +634,30 @@ def load_microbatch(
         trajectory_point_maps = target_point_maps
     else:
         trajectory_point_maps = [load_point_map(item) for item in trajectory_batch]
-    temporal_batch = None
-    if temporal_window_start is not None:
-        if scene_size_px is None or video_frame_count is None:
+    if scene_size_px is None or video_frame_count is None:
+        raise ValueError("track correspondence requires video size and frame count")
+    track_correspondence_batch = []
+    for item in batch:
+        descriptor = item.get("track_correspondence")
+        if not isinstance(descriptor, dict):
             raise ValueError(
-                "temporal supervision requires video size and frame count"
+                f"record has no track-correspondence cache: {item['sample_id']}"
             )
-        temporal_batch = []
-        temporal_by_sample = {}
-        for item in batch:
-            sample_id = item["sample_id"]
-            if sample_id not in temporal_by_sample:
-                sample = load_temporal_supervision(
-                    item,
-                    dataset_root,
-                    preprocess_size_px=scene_size_px,
-                    output_frame_count=video_frame_count,
-                    latent_window_start=temporal_window_start,
-                    latent_window_chunks=2,
-                    decoded_resolution=temporal_loss_resolution,
-                    mask_erosion_px=temporal_mask_erosion_px,
-                )
-                temporal_by_sample[sample_id] = {
-                    key: (
-                        value.to(device) if isinstance(value, torch.Tensor) else value
-                    )
-                    for key, value in sample.items()
-                }
-            temporal_batch.append(temporal_by_sample[sample_id])
+        tensors = load_file(
+            str(artifact_root / descriptor["path"]), device="cpu"
+        )
+        tensors = {
+            key: value.to(device)
+            for key, value in validate_track_correspondence(
+                tensors,
+                preprocess_size_px=scene_size_px,
+                expected_frames=video_frame_count,
+            ).items()
+        }
+        track_correspondence_batch.append(tensors)
     return {
         "records": records,
+        "scene_size_px": scene_size_px,
         "latents": [
             load_file(
                 str(artifact_root / item["latent"]["path"]), device="cpu"
@@ -700,7 +674,7 @@ def load_microbatch(
         "motion_masks": target_motion_masks,
         "trajectory_point_maps": trajectory_point_maps,
         "trajectory_sample_ids": [item["sample_id"] for item in trajectory_batch],
-        "temporal_supervision": temporal_batch,
+        "track_correspondence": track_correspondence_batch,
         "scene": collate_scene_conditions(
             [
                 load_scene_condition(
@@ -889,6 +863,7 @@ def forward_losses(
             context=context,
             seq_len=flow["seq_len"],
         )
+        correspondence_features = consume_track_correspondence_features(raw_model)
         reconstruction_masks = [
             balanced_motion_loss_mask(
                 base_mask,
@@ -923,42 +898,27 @@ def forward_losses(
         predicted_clean = recover_clean_latents(
             flow["noisy_latents"], predictions, sigmas
         )
-        motion = latent_motion_supervision_losses(
+        center = latent_object_center_loss(
             predicted_clean,
             loaded["latents"],
             loaded["motion_masks"],
             temperature=args.trajectory_temperature,
             beta=args.trajectory_beta,
         )
-        temporal = {
-            key: reconstruction.new_zeros(())
-            for key in (
-                "flow",
-                "object",
-                "background",
-                "object_pairs",
-                "background_pixels",
+        correspondence = track4gen_correspondence_loss(
+            correspondence_features,
+            loaded["track_correspondence"],
+            preprocess_size_px=loaded["scene_size_px"],
+            maximum_pairs=args.track_correspondence_pairs,
+            temperature=args.track_correspondence_temperature,
+            gaussian_sigma=args.track_correspondence_gaussian_sigma,
+            coordinate_weight=args.track_correspondence_coordinate_weight,
+            generator=generator,
+        )
+        if int(correspondence["pairs"].item()) <= 0:
+            raise RuntimeError(
+                "Track4Gen batch has no first-frame-visible material correspondences"
             )
-        }
-        if temporal_flow_enabled(args):
-            if vae is None or loaded.get("temporal_supervision") is None:
-                raise RuntimeError(
-                    "decoded temporal flow is enabled but its VAE/data are missing"
-                )
-            with torch.autocast(device_type="cuda", enabled=False):
-                temporal = clean_video_flow_residual_loss(
-                    predicted_clean,
-                    loaded["latents"],
-                    loaded["temporal_supervision"],
-                    vae,
-                    decoded_resolution=args.temporal_loss_resolution,
-                    beta=args.flow_temporal_beta,
-                    foreground_share=args.flow_foreground_share,
-                    background_dilation_px=args.background_mask_dilation_px,
-                    background_stability_threshold=(
-                        args.background_stability_threshold
-                    ),
-                )
         lpips_loss = reconstruction.new_zeros(())
         if args.lpips_loss_weight > 0:
             if vae is None or perceptual_model is None:
@@ -976,24 +936,21 @@ def forward_losses(
         total = (
             args.reconstruction_loss_weight * reconstruction
             + args.lpips_loss_weight * lpips_loss
-            + args.flow_temporal_loss_weight * temporal["flow"]
             + args.response_loss_weight * response
-            + args.trajectory_center_loss_weight * motion["center"]
-            + args.trajectory_distribution_loss_weight * motion["distribution"]
-            + args.trajectory_velocity_loss_weight * motion["velocity"]
+            + args.trajectory_center_loss_weight * center
+            + args.track_correspondence_loss_weight * correspondence["loss"]
         )
     return {
         "total": total,
         "reconstruction": reconstruction,
         "response": response,
-        "trajectory_center": motion["center"],
-        "trajectory_distribution": motion["distribution"],
-        "trajectory_velocity": motion["velocity"],
-        "flow_temporal": temporal["flow"],
-        "flow_object": temporal["object"],
-        "flow_background": temporal["background"],
-        "flow_object_pairs": temporal["object_pairs"],
-        "flow_background_pixels": temporal["background_pixels"],
+        "trajectory_center": center,
+        "track_correspondence": correspondence["loss"],
+        "track_correspondence_pairs": correspondence["pairs"],
+        "track_correspondence_fast_pairs": correspondence["fast_pairs"],
+        "track_correspondence_mean_displacement_tokens": correspondence[
+            "mean_displacement_tokens"
+        ],
         "lpips": lpips_loss,
         "sigma": sigmas[0],
     }
@@ -1033,7 +990,6 @@ def validate(
     world_size: int,
     scene_size_px: tuple[int, int],
     video_frame_count: int = 97,
-    latent_frame_count: int = 25,
     vae=None,
     perceptual_model=None,
 ) -> dict[str, float]:
@@ -1047,13 +1003,10 @@ def validate(
             "reconstruction",
             "response",
             "trajectory_center",
-            "trajectory_distribution",
-            "trajectory_velocity",
-            "flow_temporal",
-            "flow_object",
-            "flow_background",
-            "flow_object_pairs",
-            "flow_background_pixels",
+            "track_correspondence",
+            "track_correspondence_pairs",
+            "track_correspondence_fast_pairs",
+            "track_correspondence_mean_displacement_tokens",
             "lpips",
         )
     }
@@ -1086,20 +1039,7 @@ def validate(
             trajectory_batch=trajectory_batch,
             trajectory_representation=args.trajectory_representation,
             scene_size_px=scene_size_px,
-            temporal_window_start=(
-                scheduled_temporal_window(
-                    batch_index, rank, world_size, latent_frame_count
-                )
-                if temporal_flow_enabled(args)
-                else None
-            ),
             video_frame_count=video_frame_count,
-            temporal_loss_resolution=getattr(
-                args, "temporal_loss_resolution", 128
-            ),
-            temporal_mask_erosion_px=getattr(
-                args, "temporal_mask_erosion_px", 2
-            ),
         )
         generator = torch.Generator(device=device).manual_seed(
             args.seed + 10_000_000 + batch_index * world_size + rank
@@ -1152,7 +1092,7 @@ def adapter_metadata(
     direct_object_slots: int,
 ) -> dict:
     return {
-        "schema": "phycontext.wan_condition_adapter.v3",
+        "schema": "phycontext.wan_condition_adapter.v4",
         "base_model": str(checkpoint),
         "base_model_index_sha256": sha256(
             checkpoint / "diffusion_pytorch_model.safetensors.index.json"
@@ -1180,9 +1120,9 @@ def adapter_metadata(
             str(args.initialize_adapter) if args.initialize_adapter else None
         ),
         "optimizer_scope": (
-            "scene_lora_trajectory"
+            "scene_lora_trajectory_track_correspondence"
             if args.training_stage == "trajectory_warmup"
-            else "joint"
+            else "joint_with_track_correspondence"
         ),
         "sample_count": len(train_records),
         "selected_base_scene_count": len(
@@ -1238,6 +1178,9 @@ def adapter_metadata(
             "lora_learning_rate": args.lora_learning_rate,
             "direct_learning_rate": args.direct_learning_rate,
             "trajectory_learning_rate": args.trajectory_learning_rate,
+            "track_correspondence_learning_rate": (
+                args.track_correspondence_learning_rate
+            ),
             "encoder_weight_decay": args.encoder_weight_decay,
             "warmup_ratio": args.warmup_ratio,
             "minimum_learning_rate_ratio": args.minimum_learning_rate_ratio,
@@ -1284,70 +1227,34 @@ def adapter_metadata(
         "trajectory_supervision": {
             "enabled": True,
             "provided_as_model_input": args.trajectory_input,
-            "type": "clean_latent_correspondence_motion",
-            "weights": {
-                "center": args.trajectory_center_loss_weight,
-                "distribution": args.trajectory_distribution_loss_weight,
-                "velocity": args.trajectory_velocity_loss_weight,
-            },
-            "objectives": {
-                "center": "normalized_image_xy_smooth_l1",
-                "distribution": "spatial_probability_jensen_shannon",
-                "velocity": "adjacent_normalized_image_xy_smooth_l1",
-            },
+            "type": "clean_latent_object_center_guard",
+            "weight": args.trajectory_center_loss_weight,
+            "objective": "normalized_image_xy_smooth_l1",
             "temperature": args.trajectory_temperature,
             "beta": args.trajectory_beta,
             "coordinate_frame": "normalized_image_xy",
             "identity_reference": "current_target_frame_features",
         },
-        "decoded_temporal_supervision": {
-            "enabled": temporal_flow_enabled(args),
-            "objective": {
-                "type": "flow_aligned_rgb_temporal_residual",
-                "weight": args.flow_temporal_loss_weight,
-                "beta": args.flow_temporal_beta,
-                "aggregation": "foreground_background_convex_combination",
-                "foreground_share": args.flow_foreground_share,
-                "condition_boundary_window_share": 0.25,
-            },
-            "decode": {
-                "space": "vae_decoded_rgb",
-                "long_edge": args.temporal_loss_resolution,
-                "spatial_resize": "aspect_preserving_integer_vae_latent_grid",
-                "time_mapping": "latent_k_to_source_frames_4k_minus_3_through_4k",
-                "causal_context": "exact_prefix_no_grad_selected_two_chunks_grad",
-                "window": (
-                    "two_adjacent_generated_latents_eight_source_frames_with_"
-                    "condition_frame_prefix_for_first_window"
-                ),
-                "cross_chunk_transitions_supervised": True,
-                "condition_to_first_generated_transition_supervised": True,
-            },
-            "object_population": {
-                "correspondence": "projected_3d_material_point_flow",
-                "residual": "predicted_rgb_delta_matches_target_rgb_delta",
-                "visibility": (
-                    "visible_in_both_frames_after_global_dynamic_zbuffer_and_"
-                    "eroded_renderer_instance_mask"
-                ),
-                "mask_erosion_px_at_preprocess_resolution": (
-                    args.temporal_mask_erosion_px
-                ),
-            },
-            "background_population": {
-                "correspondence": "identity_zero_flow",
-                "residual": "predicted_rgb_delta_matches_target_rgb_delta",
-                "region": "complement_of_two_frame_instance_mask_sweep",
-                "mask_dilation_px_at_decoded_resolution": (
-                    args.background_mask_dilation_px
-                ),
-                "target_rgb_pair_stability_threshold": (
-                    args.background_stability_threshold
-                ),
-                "excluded_target_dynamic_regions": (
-                    "shadows_reflections_occlusions_disocclusions"
-                ),
-            },
+        "track_correspondence": {
+            "enabled": True,
+            "architecture": TRACK_CORRESPONDENCE_ARCHITECTURE,
+            "block_index": args.track_correspondence_block_index,
+            "feature_dim": args.track_correspondence_feature_dim,
+            "refiner_blocks": args.track_correspondence_refiner_blocks,
+            "loss_weight": args.track_correspondence_loss_weight,
+            "maximum_pairs_per_video": args.track_correspondence_pairs,
+            "temperature": args.track_correspondence_temperature,
+            "gaussian_sigma_feature_cells": (
+                args.track_correspondence_gaussian_sigma
+            ),
+            "coordinate_weight": args.track_correspondence_coordinate_weight,
+            "query": "clean_first_frame_visible_material_point",
+            "target": "visible_same_point_swept_over_each_four_rgb_frame_latent_window",
+            "similarity": "global_target_frame_cosine_cost_volume",
+            "objective": "soft_target_cross_entropy_plus_expected_coordinate_huber",
+            "visibility": "cached_global_dynamic_static_z_buffer",
+            "sampling": "equal_slow_medium_fast_feature_displacement_bins",
+            "feedback": "zero_initialized_linear_of_stop_gradient_refined_features",
         },
         "trajectory_conditioning": {
             "enabled": args.trajectory_input,
@@ -1427,20 +1334,12 @@ def adapter_metadata(
         "trajectory_center_losses": [
             item["trajectory_center"] for item in history
         ],
-        "trajectory_distribution_losses": [
-            item["trajectory_distribution"] for item in history
+        "track_correspondence_losses": [
+            item["track_correspondence"] for item in history
         ],
-        "trajectory_velocity_losses": [
-            item["trajectory_velocity"] for item in history
-        ],
-        "flow_temporal_losses": [
-            item.get("flow_temporal", 0.0) for item in history
-        ],
-        "flow_object_diagnostics": [
-            item.get("flow_object", 0.0) for item in history
-        ],
-        "flow_background_diagnostics": [
-            item.get("flow_background", 0.0) for item in history
+        "track_correspondence_mean_displacement_tokens": [
+            item["track_correspondence_mean_displacement_tokens"]
+            for item in history
         ],
         "peak_cuda_memory_gib": peak_memory,
         "seed": args.seed,
@@ -1451,7 +1350,7 @@ def write_input_contract(checkpoint_root: Path, metadata: dict) -> None:
     cache = json.loads(Path(metadata["cache_manifest"]).read_text(encoding="utf-8"))
     preprocess = cache["preprocess"]
     input_contract = {
-        "schema": "phycontext.inference_input_contract.v5",
+        "schema": "phycontext.inference_input_contract.v6",
         "adapter_sha256": sha256(checkpoint_root / "adapter.safetensors"),
         "base_model_index_sha256": metadata["base_model_index_sha256"],
         "cache_manifest_sha256": metadata["cache_manifest_sha256"],
@@ -1490,6 +1389,12 @@ def write_input_contract(checkpoint_root: Path, metadata: dict) -> None:
                 if metadata["trajectory_conditioning"]["enabled"]
                 else None
             ),
+        },
+        "track_correspondence": {
+            "architecture": metadata["track_correspondence"]["architecture"],
+            "block_index": metadata["track_correspondence"]["block_index"],
+            "feature_dim": metadata["track_correspondence"]["feature_dim"],
+            "inference_role": "learned_zero_bridge_feature_feedback_only",
         },
     }
     (checkpoint_root / "input_contract.json").write_text(
@@ -1570,6 +1475,7 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "lora_learning_rate",
     "direct_learning_rate",
     "trajectory_learning_rate",
+    "track_correspondence_learning_rate",
     "warmup_ratio",
     "minimum_learning_rate_ratio",
     "encoder_weight_decay",
@@ -1585,15 +1491,14 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "motion_foreground_share",
     "minimum_response_energy",
     "trajectory_center_loss_weight",
-    "trajectory_distribution_loss_weight",
-    "trajectory_velocity_loss_weight",
-    "flow_temporal_loss_weight",
-    "flow_temporal_beta",
-    "flow_foreground_share",
-    "temporal_loss_resolution",
-    "temporal_mask_erosion_px",
-    "background_mask_dilation_px",
-    "background_stability_threshold",
+    "track_correspondence_loss_weight",
+    "track_correspondence_block_index",
+    "track_correspondence_feature_dim",
+    "track_correspondence_refiner_blocks",
+    "track_correspondence_pairs",
+    "track_correspondence_temperature",
+    "track_correspondence_gaussian_sigma",
+    "track_correspondence_coordinate_weight",
     "trajectory_temperature",
     "trajectory_beta",
     "trajectory_input",
@@ -1719,18 +1624,17 @@ def main() -> None:
         raise ValueError("LPIPS weight and frame count must be nonnegative/positive")
     if args.lpips_temporal_window <= 0:
         raise ValueError("LPIPS temporal window must be positive")
-    if args.flow_temporal_loss_weight < 0:
-        raise ValueError("decoded flow loss weight must be nonnegative")
-    if args.flow_temporal_beta <= 0 or not 0 < args.flow_foreground_share < 1:
-        raise ValueError("decoded flow Smooth-L1 beta/share is invalid")
     if (
-        args.temporal_loss_resolution < 16
-        or args.temporal_loss_resolution % 16
-        or args.temporal_mask_erosion_px < 0
-        or args.background_mask_dilation_px < 0
-        or not 0 < args.background_stability_threshold <= 2
+        args.track_correspondence_loss_weight <= 0
+        or args.track_correspondence_block_index < 0
+        or args.track_correspondence_feature_dim <= 0
+        or args.track_correspondence_refiner_blocks <= 0
+        or args.track_correspondence_pairs <= 0
+        or args.track_correspondence_temperature <= 0
+        or args.track_correspondence_gaussian_sigma <= 0
+        or args.track_correspondence_coordinate_weight < 0
     ):
-        raise ValueError("decoded temporal resolution/mask margins are invalid")
+        raise ValueError("Track4Gen correspondence settings are invalid")
     if args.lpips_loss_weight > 0 and args.lpips_resolution < 32:
         raise ValueError("LPIPS resolution must be at least 32 when enabled")
     if min(
@@ -1738,18 +1642,14 @@ def main() -> None:
         args.lora_learning_rate,
         args.direct_learning_rate,
         args.trajectory_learning_rate,
+        args.track_correspondence_learning_rate,
         args.trajectory_temperature,
         args.trajectory_beta,
         float(args.trajectory_condition_rank),
     ) <= 0:
         raise ValueError("formal optimization settings must be positive")
-    trajectory_weights = (
-        args.trajectory_center_loss_weight,
-        args.trajectory_distribution_loss_weight,
-        args.trajectory_velocity_loss_weight,
-    )
-    if min(trajectory_weights) < 0 or not any(trajectory_weights):
-        raise ValueError("trajectory weights must be nonnegative and not all zero")
+    if args.trajectory_center_loss_weight <= 0:
+        raise ValueError("trajectory center weight must be positive")
 
     rank, local_rank, world_size, device = setup_distributed()
     root = args.project_root.resolve()
@@ -1766,13 +1666,10 @@ def main() -> None:
             raise ValueError(
                 "cache trajectory representation differs from the training request"
             )
-        if (
-            args.trajectory_representation == "das_3d_tracks"
-            and cache.get("schema") != CURRENT_CACHE_SCHEMA
-        ):
+        if cache.get("schema") not in TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
             raise ValueError(
-                "full-rate das_3d_tracks training requires the current Wan cache "
-                f"schema {CURRENT_CACHE_SCHEMA}"
+                "Track4Gen training requires the current exact-correspondence "
+                f"cache schema {CURRENT_CACHE_SCHEMA}"
             )
         source_manifest = validate_cache_source_manifest(root, cache)
         validate_cache_record_coverage(
@@ -1787,9 +1684,8 @@ def main() -> None:
             int(cache["preprocess"]["height"]),
         )
         video_frame_count = int(cache["preprocess"]["frames"])
-        latent_frame_count = (video_frame_count - 1) // 4 + 1
         if video_frame_count < 5 or (video_frame_count - 1) % 4:
-            raise ValueError("temporal supervision requires a 4n+1 video length")
+            raise ValueError("Track4Gen supervision requires a 4n+1 video length")
         train_records = filter_base_scenes(
             [item for item in cache["records"] if item["record"]["split"] == "train"],
             args.base_scene_count,
@@ -1978,6 +1874,27 @@ def main() -> None:
         elif existing_trajectory is not None:
             raise ValueError("source adapter contains trajectory conditioning")
 
+        existing_track = getattr(model, "phycontext_track_correspondence", None)
+        if existing_track is None:
+            existing_track = inject_track_correspondence(
+                model,
+                block_index=args.track_correspondence_block_index,
+                feature_dim=args.track_correspondence_feature_dim,
+                refiner_blocks=args.track_correspondence_refiner_blocks,
+            )
+        elif (
+            int(existing_track.block_index)
+            != args.track_correspondence_block_index
+            or int(existing_track.feature_dim)
+            != args.track_correspondence_feature_dim
+            or int(existing_track.refiner_blocks)
+            != args.track_correspondence_refiner_blocks
+            or existing_track.architecture != TRACK_CORRESPONDENCE_ARCHITECTURE
+        ):
+            raise ValueError(
+                "source adapter uses a different Track4Gen correspondence architecture"
+            )
+
         configure_training_stage(condition_encoder, model, args.training_stage)
         checkpointed_blocks = 0
         if not args.no_gradient_checkpointing:
@@ -1986,7 +1903,7 @@ def main() -> None:
         condition_encoder.to(device).train()
         vae = None
         perceptual_model = None
-        if args.lpips_loss_weight > 0 or temporal_flow_enabled(args):
+        if args.lpips_loss_weight > 0:
             from wan.modules.vae2_2 import Wan2_2_VAE
 
             vae = Wan2_2_VAE(
@@ -2055,13 +1972,10 @@ def main() -> None:
                     "reconstruction",
                     "response",
                     "trajectory_center",
-                    "trajectory_distribution",
-                    "trajectory_velocity",
-                    "flow_temporal",
-                    "flow_object",
-                    "flow_background",
-                    "flow_object_pairs",
-                    "flow_background_pixels",
+                    "track_correspondence",
+                    "track_correspondence_pairs",
+                    "track_correspondence_fast_pairs",
+                    "track_correspondence_mean_displacement_tokens",
                     "lpips",
                     "sigma",
                 )
@@ -2101,19 +2015,7 @@ def main() -> None:
                     trajectory_batch=trajectory_batch,
                     trajectory_representation=args.trajectory_representation,
                     scene_size_px=scene_size_px,
-                    temporal_window_start=(
-                        scheduled_temporal_window(
-                            step * args.gradient_accumulation + accumulation_index,
-                            rank,
-                            world_size,
-                            latent_frame_count,
-                        )
-                        if temporal_flow_enabled(args)
-                        else None
-                    ),
                     video_frame_count=video_frame_count,
-                    temporal_loss_resolution=args.temporal_loss_resolution,
-                    temporal_mask_erosion_px=args.temporal_mask_erosion_px,
                 )
                 trajectory_sample_ids.extend(loaded["trajectory_sample_ids"])
                 generator = torch.Generator(device=device).manual_seed(
@@ -2200,7 +2102,6 @@ def main() -> None:
                     world_size,
                     scene_size_px,
                     video_frame_count=video_frame_count,
-                    latent_frame_count=latent_frame_count,
                     vae=vae,
                     perceptual_model=perceptual_model,
                 )

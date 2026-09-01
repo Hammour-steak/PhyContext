@@ -7,7 +7,7 @@ entry point or environment variables:
 
 ```text
 dataset       datasets/physweep_training
-cache         cache/wan/physweep_training/das_3d_tracks_canonical_v5_832x480x97
+cache         cache/wan/physweep_training/das_3d_tracks_track4gen_v6_832x480x97
 resolution    832 x 480 x 97 frames
 scene tokens  128
 ```
@@ -27,23 +27,18 @@ simulation, rendering, and publication belong to the separate dataset project.
 
 `audit_wan_cache.py` verifies the complete merged cache and all hash bindings.
 `audit_wan_cache_samples.py` then independently rerasterizes and re-encodes a
-stratified sample (40 by default), requiring tensor-exact point maps and latent
-reconstruction under the canonical first-frame protocol. The complementary
+stratified sample (40 by default), requiring tensor-exact point maps, exact
+material-point correspondence artifacts, and latent reconstruction under the
+canonical first-frame protocol. The complementary
 `audit_vae_temporal_decode.py` verifies that cached latents decode to finite,
 correctly aligned video tensors and reports first-frame reconstruction error.
-`temporal_supervision.py` implements one formal flow-aligned anti-flicker
-objective. It decodes exact two-chunk causal windows, retains the condition
-frame for the first window, uses hash-bound projected 3D tracks plus renderer
-masks for double-visible material-point correspondences, and uses identity
-correspondences only on target-stable background outside each two-frame object
-sweep. One quarter of distributed temporal windows supervise the unique
-condition-to-first-generated-frame boundary; the rest cover all later windows.
-The object and background population means are combined into one robust
-RGB-residual scalar, while their values remain available as diagnostics.
-It does not add another large cache or modify the published PhysSweep data.
-`audit_wan_adapter.py` fails closed on its decode protocol, positive
-weight/beta, foreground share, per-step loss histories, and
-valid-point/background-pixel counters.
+`track_correspondence.py` implements the formal Track4Gen-style feature
+objective. It supervises exact first-frame-visible simulator material points
+against their swept, z-buffer-visible positions in every four-RGB-frame Wan
+latent window. `audit_wan_adapter.py` fails closed on the selected block,
+refiner and feedback tensors, objective settings, per-step loss history, and
+pair counts. Decoded RGB flow, trajectory-distribution, and velocity objectives
+are legacy checkpoint metadata only and are not part of the maintained trainer.
 
 ## PhysSweep release adapter
 

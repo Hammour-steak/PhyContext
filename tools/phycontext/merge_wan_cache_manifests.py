@@ -9,6 +9,7 @@ from pathlib import Path
 
 from cache_contract import (
     SUPPORTED_CACHE_SCHEMAS,
+    TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     validate_cache_record_coverage,
 )
 
@@ -87,6 +88,7 @@ def main() -> None:
         "source_point_trajectory_manifest",
         "source_point_trajectory_manifest_sha256",
         "point_track_preprocess",
+        "point_correspondence_preprocess",
     )
     first = payloads[0]
     for key in invariant_keys:
@@ -103,7 +105,9 @@ def main() -> None:
                 raise ValueError(f"record without sample_id: {path}")
             if sample_id in records:
                 raise ValueError(f"duplicate sample_id across shards: {sample_id}")
-            required_descriptors = ("record", "latent", "text_context", "point_track")
+            required_descriptors = ["record", "latent", "text_context", "point_track"]
+            if required_schema in TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
+                required_descriptors.append("track_correspondence")
             missing_descriptors = [
                 key for key in required_descriptors if key not in record
             ]

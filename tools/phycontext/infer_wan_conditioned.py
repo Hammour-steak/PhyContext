@@ -150,7 +150,10 @@ def load_and_validate_input_contract(
             f"formal adapter is missing its input contract: {contract_path}"
         )
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    if contract.get("schema") != "phycontext.inference_input_contract.v5":
+    if contract.get("schema") not in {
+        "phycontext.inference_input_contract.v5",
+        "phycontext.inference_input_contract.v6",
+    }:
         raise ValueError("adapter input contract schema is unsupported")
     contract_trajectory = contract.get("trajectory", {})
     metadata_trajectory = adapter_metadata.get("trajectory_conditioning", {})
@@ -418,11 +421,11 @@ def main() -> None:
                 "inference cache trajectory representation differs from the adapter"
             )
         if (
-            trajectory_representation == "das_3d_tracks"
+            adapter_metadata.get("schema") == "phycontext.wan_condition_adapter.v4"
             and cache.get("schema") != CURRENT_CACHE_SCHEMA
         ):
             raise ValueError(
-                "das_3d_tracks inference requires the current Wan cache schema "
+                "Track4Gen adapter inference requires the current Wan cache schema "
                 f"{CURRENT_CACHE_SCHEMA}"
             )
         validate_cache_source_manifest(root, cache)

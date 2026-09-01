@@ -33,6 +33,7 @@ from cache_wan_inputs import (
     trajectory_frame_indices,
 )
 from point_trajectory import rasterize_das_3d_tracks
+from track_correspondence import validate_track_correspondence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -169,17 +170,17 @@ def validate_point_map(
     scene_path = (dataset_root / record["conditioning"]["scene"]).resolve()
     with np.load(scene_path, allow_pickle=False) as archive:
         static_points = archive["environment_xyz_camera_m"].astype(np.float32)
-    recomputed = torch.from_numpy(
-        rasterize_das_3d_tracks(
-            payload,
-            (latent_shape[3], latent_shape[2]),
-            preprocess_size_px=(width, height),
-            frame_indices=indices,
-            max_objects=3,
-            static_points_camera0_m=static_points,
-            point_radius_px=1,
-        )
+    recomputed_map, recomputed_correspondence = rasterize_das_3d_tracks(
+        payload,
+        (latent_shape[3], latent_shape[2]),
+        preprocess_size_px=(width, height),
+        frame_indices=indices,
+        max_objects=3,
+        static_points_camera0_m=static_points,
+        point_radius_px=1,
+        return_correspondence=True,
     )
+    recomputed = torch.from_numpy(recomputed_map)
     difference = (cached - recomputed).abs()
     max_abs = float(difference.max())
     if not torch.equal(cached, recomputed):
@@ -188,12 +189,52 @@ def validate_point_map(
     visible_cells = int(slots[:, 3:4].sum())
     if visible_cells <= 0:
         raise ValueError(f"point condition has no visible cells: {sample_id}")
+    correspondence_descriptor = item.get("track_correspondence")
+    if not isinstance(correspondence_descriptor, dict):
+        raise ValueError(f"missing track-correspondence descriptor: {sample_id}")
+    if (
+        correspondence_descriptor.get("object_ids") != object_ids
+        or int(correspondence_descriptor.get("object_count", -1))
+        != len(object_ids)
+    ):
+        raise ValueError(f"track-correspondence object binding mismatch: {sample_id}")
+    correspondence_path = validate_cache_artifact(
+        artifact_root,
+        correspondence_descriptor,
+        f"track correspondence for {sample_id}",
+    )
+    cached_correspondence = load_file(str(correspondence_path), device="cpu")
+    validate_track_correspondence(
+        cached_correspondence,
+        preprocess_size_px=(width, height),
+        expected_frames=frames,
+    )
+    correspondence_max_abs = 0.0
+    for key, expected_array in recomputed_correspondence.items():
+        expected_tensor = torch.from_numpy(expected_array)
+        actual_tensor = cached_correspondence.get(key)
+        if actual_tensor is None or not torch.equal(actual_tensor, expected_tensor):
+            if (
+                actual_tensor is not None
+                and torch.is_floating_point(actual_tensor)
+                and actual_tensor.shape == expected_tensor.shape
+            ):
+                correspondence_max_abs = max(
+                    correspondence_max_abs,
+                    float((actual_tensor - expected_tensor).abs().max()),
+                )
+            raise ValueError(
+                f"track-correspondence recomputation mismatch: {sample_id} {key}"
+            )
     return {
         "exact_recompute": True,
         "max_abs_error": max_abs,
         "visible_cells": visible_cells,
         "cached_sha256": item["point_track"]["sha256"],
         "source_sha256": source["sha256"],
+        "track_correspondence_exact_recompute": True,
+        "track_correspondence_max_abs_error": correspondence_max_abs,
+        "track_correspondence_sha256": correspondence_descriptor["sha256"],
     }
 
 
@@ -268,6 +309,10 @@ def main() -> None:
     cache = json.loads(cache_path.read_text(encoding="utf-8"))
     if cache.get("schema") != CURRENT_CACHE_SCHEMA:
         raise ValueError(f"sample recomputation requires {CURRENT_CACHE_SCHEMA}")
+    if cache.get("point_track_preprocess", {}).get("representation") != (
+        "das_3d_tracks"
+    ):
+        raise ValueError("sample recomputation currently audits das_3d_tracks caches")
     validate_cache_source_manifest(root, cache)
     artifact_root = resolve_cache_artifact_root(root, cache)
     dataset_root = resolve_cache_dataset_root(root, cache)
@@ -345,9 +390,14 @@ def main() -> None:
             "sweep_modes": dict(Counter(item["sweep_mode"] for item in results)),
         },
         "point_exact_recompute_count": len(results),
+        "track_correspondence_exact_recompute_count": len(results),
         "latent_exact_recompute_count": len(results),
         "max_point_abs_error": max(
             item["point_track"]["max_abs_error"] for item in results
+        ),
+        "max_track_correspondence_abs_error": max(
+            item["point_track"]["track_correspondence_max_abs_error"]
+            for item in results
         ),
         "max_latent_abs_error": max(
             item["latent"]["max_abs_error"] for item in results

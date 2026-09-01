@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 
 from conditioning_model import PhyContextConditionEncoder
+from track_correspondence import inject_track_correspondence
 from train_wan_formal import (
     configure_training_stage,
     learning_rate_factor,
@@ -25,14 +26,14 @@ from wan_training import (
     DirectConditionModulator,
     LoRALinear,
     balanced_motion_loss_mask,
+    enable_block_checkpointing,
     inject_direct_condition_modulation,
     inject_cross_attention_lora,
     inject_trajectory_conditioning,
     index_nominal_trajectory_records,
     load_condition_checkpoint,
-    latent_correspondence_motion,
     latent_correspondence_trajectory,
-    latent_motion_supervision_losses,
+    latent_object_center_loss,
     lora_parameters,
     make_ti2v_flow_batch,
     make_formal_training_batch,
@@ -326,6 +327,64 @@ class WanTrainingTest(unittest.TestCase):
             target_condition.weight, source_condition.weight
         )
 
+    def test_track_correspondence_round_trip(self) -> None:
+        source_model = DummyModel()
+        inject_cross_attention_lora(source_model, rank=2, alpha=2)
+        source_track = inject_track_correspondence(
+            source_model, block_index=1, feature_dim=4, refiner_blocks=1
+        )
+        source_condition = nn.Linear(3, 4)
+        with torch.no_grad():
+            source_track.input_projection.weight.fill_(0.125)
+            source_track.feedback.weight.fill_(0.03125)
+        metadata = {
+            "schema": "phycontext.wan_condition_adapter.v4",
+            "lora": {"rank": 2, "alpha": 2.0, "module_count": 8},
+            "track_correspondence": {
+                "enabled": True,
+                "architecture": "track4gen_swept_latent_v1",
+                "block_index": 1,
+                "feature_dim": 4,
+                "refiner_blocks": 1,
+            },
+        }
+        with TemporaryDirectory() as directory:
+            adapter = Path(directory)
+            save_condition_checkpoint(
+                adapter, source_model, source_condition, metadata
+            )
+            target_model = DummyModel()
+            target_condition = nn.Linear(3, 4)
+            load_condition_checkpoint(adapter, target_model, target_condition)
+        target_track = target_model.phycontext_track_correspondence
+        self.assertEqual(target_track.block_index, 1)
+        torch.testing.assert_close(
+            target_track.input_projection.weight,
+            source_track.input_projection.weight,
+        )
+        torch.testing.assert_close(
+            target_track.feedback.weight, source_track.feedback.weight
+        )
+
+    def test_track_correspondence_survives_block_checkpointing(self) -> None:
+        model = DummyModel()
+        adapter = inject_track_correspondence(
+            model, block_index=0, feature_dim=4, refiner_blocks=1
+        )
+        self.assertEqual(enable_block_checkpointing(model), 2)
+        x = torch.randn(1, 8, 8, requires_grad=True)
+        e = torch.randn(1, 8, 6, 8)
+        grid = torch.tensor([[2, 2, 2]])
+        output = model.blocks[0](x, e, None, grid, None, None, None)
+        features = adapter.consume_features()
+        self.assertEqual(tuple(features[0].shape), (4, 2, 2, 2))
+        (output.square().mean() + features[0].square().mean()).backward()
+        self.assertGreater(float(x.grad.abs().sum()), 0.0)
+        self.assertGreater(float(adapter.feedback.weight.grad.abs().sum()), 0.0)
+        self.assertGreater(
+            float(adapter.input_projection.weight.grad.abs().sum()), 0.0
+        )
+
     def test_optimizer_covers_every_trainable_parameter_exactly_once(self) -> None:
         model = DummyTrajectoryModel().requires_grad_(False)
         inject_cross_attention_lora(model, rank=2, alpha=2.0)
@@ -334,6 +393,9 @@ class WanTrainingTest(unittest.TestCase):
         )
         inject_trajectory_conditioning(
             model, rank=2, representation="das_3d_tracks"
+        )
+        inject_track_correspondence(
+            model, block_index=1, feature_dim=4, refiner_blocks=1
         )
         encoder = PhyContextConditionEncoder(
             hidden_dim=16,
@@ -348,6 +410,7 @@ class WanTrainingTest(unittest.TestCase):
             lora_learning_rate=5.0e-5,
             direct_learning_rate=5.0e-5,
             trajectory_learning_rate=1.0e-4,
+            track_correspondence_learning_rate=1.0e-4,
             trajectory_input=True,
             training_stage="joint",
         )
@@ -654,13 +717,10 @@ class WanTrainingTest(unittest.TestCase):
                 "reconstruction": one,
                 "response": torch.tensor(2.0 if response_enabled else 100.0),
                 "trajectory_center": one,
-                "trajectory_distribution": one,
-                "trajectory_velocity": one,
-                "flow_temporal": one,
-                "flow_object": one,
-                "flow_background": one,
-                "flow_object_pairs": torch.tensor(3.0),
-                "flow_background_pixels": torch.tensor(4.0),
+                "track_correspondence": one,
+                "track_correspondence_pairs": torch.tensor(3.0),
+                "track_correspondence_fast_pairs": torch.tensor(1.0),
+                "track_correspondence_mean_displacement_tokens": one,
                 "lpips": one,
             }
 
@@ -776,79 +836,18 @@ class WanTrainingTest(unittest.TestCase):
         torch.testing.assert_close(
             predicted_centers[valid], target_centers[valid], atol=1e-4, rtol=1e-4
         )
-        exact_loss = latent_motion_supervision_losses(
+        exact_loss = latent_object_center_loss(
             [exact], [target], [motion], temperature=0.03
-        )["center"]
+        )
         exact_loss.backward()
         self.assertIsNotNone(exact.grad)
 
         shifted = torch.roll(target, shifts=1, dims=-1).requires_grad_(True)
-        shifted_loss = latent_motion_supervision_losses(
+        shifted_loss = latent_object_center_loss(
             [shifted], [target], [motion], temperature=0.03
-        )["center"]
+        )
         self.assertGreater(
             float(shifted_loss.detach()), float(exact_loss.detach()) + 0.01
-        )
-
-    def test_distribution_rejects_symmetric_duplicates_with_correct_center(self) -> None:
-        target = torch.zeros(3, 4, 5, 7)
-        motion = torch.zeros(1, 4, 5, 7, dtype=torch.uint8)
-        feature = torch.tensor([3.0, -2.0, 1.0])
-        for frame in range(4):
-            target[:, frame, 2, 3] = feature
-            motion[:, frame, 2, 3] = 1
-
-        duplicate = torch.zeros_like(target)
-        duplicate[:, :, 2, 1] = feature[:, None]
-        duplicate[:, :, 2, 5] = feature[:, None]
-        duplicate.requires_grad_(True)
-        predicted, expected, _, _, valid = latent_correspondence_motion(
-            duplicate,
-            target,
-            motion,
-            temperature=0.03,
-        )
-        torch.testing.assert_close(
-            predicted[valid], expected[valid], atol=1e-4, rtol=1e-4
-        )
-
-        exact_losses = latent_motion_supervision_losses(
-            [target], [target], [motion], temperature=0.03
-        )
-        duplicate_losses = latent_motion_supervision_losses(
-            [duplicate], [target], [motion], temperature=0.03
-        )
-        self.assertLess(float(duplicate_losses["center"].detach()), 1e-4)
-        self.assertGreater(
-            float(duplicate_losses["distribution"].detach()),
-            float(exact_losses["distribution"].detach()) + 0.1,
-        )
-        duplicate_losses["distribution"].backward()
-        self.assertIsNotNone(duplicate.grad)
-
-    def test_velocity_loss_rejects_wrong_frame_to_frame_displacement(self) -> None:
-        target = torch.zeros(3, 5, 5, 7)
-        motion = torch.zeros(1, 5, 5, 7, dtype=torch.uint8)
-        feature = torch.tensor([3.0, -2.0, 1.0])
-        target_positions = [1, 1, 2, 3, 4]
-        predicted_positions = [1, 1, 1, 3, 4]
-        wrong = torch.zeros_like(target)
-        for frame, (target_x, predicted_x) in enumerate(
-            zip(target_positions, predicted_positions)
-        ):
-            target[:, frame, 2, target_x] = feature
-            wrong[:, frame, 2, predicted_x] = feature
-            motion[:, frame, 2, target_x] = 1
-
-        exact_losses = latent_motion_supervision_losses(
-            [target], [target], [motion], temperature=0.03
-        )
-        wrong_losses = latent_motion_supervision_losses(
-            [wrong], [target], [motion], temperature=0.03
-        )
-        self.assertGreater(
-            float(wrong_losses["velocity"].detach()),
-            float(exact_losses["velocity"].detach()) + 0.01,
         )
 
     def test_masked_loss_ignores_condition_frame(self) -> None:

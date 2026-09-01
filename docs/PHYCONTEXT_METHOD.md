@@ -40,6 +40,10 @@ center-crop applied to RGB before they are normalized for the scene encoder.
   identities plus visibility. It resolves dynamic/static occlusion at full
   preprocessing resolution, retains all 97 condition frames, and learns the
   causal 97-to-25 temporal projection used by Wan.
+- A Track4Gen-style 128-D spatial refiner reads an intermediate Wan block.
+  First-frame query features must retrieve the same simulator material points
+  in later latent windows through a global cosine cost volume. A zero-initialized
+  bridge feeds detached refined features back to Wan.
 - Rank-16 cross-attention LoRA learns how Wan uses the added context.
 
 The trajectory branch specifies gross motion. Structured scene and physical
@@ -55,28 +59,23 @@ left unchanged. The production path always uses each target sample's own
 trajectory.
 
 The maintained objective combines flow matching, controlled-region
-reconstruction, trajectory alignment, LPIPS, and two decoded-video temporal
-residual objectives:
+reconstruction, paired physical-response separation, LPIPS, a low-weight clean
+latent object-center guard, and feature correspondence. The correspondence
+cache preserves exact object/point axes, projected pixels, metric depth, and
+global dynamic/static z-buffer visibility for all 97 frames. Wan latent zero is
+the condition frame; latent `k >= 1` maps to source frames `4k-3 .. 4k`. Each
+target is therefore a visibility-weighted swept heatmap of the same material
+point over those four RGB frames. Candidate queries are balanced across slow,
+medium, and fast feature-grid displacement.
 
-- Object appearance is sampled at the same simulator material point in
-  consecutive frames. Only points that win the dynamic z-buffer in both frames
-  and lie inside an eroded renderer instance mask are used. The predicted RGB
-  change must match the target RGB change, so real translation, rotation, and
-  lighting change are not incorrectly forced to zero.
-- Background supervision uses second temporal differences. It excludes the
-  three-frame union of all instance masks (with dilation) and target regions
-  that change enough to indicate shadows, reflections, occlusion, or
-  disocclusion. The predicted second difference matches the target rather than
-  assuming a static value.
-
-Wan latent zero is the condition frame; latent `k >= 1` maps to source frames
-`4k-3 .. 4k`. Training decodes two adjacent generated latents at a time with
-their exact causal prefix. Prefix cache construction is detached, while both
-selected latents retain gradients. The resulting eight-frame window includes
-the VAE four-frame boundary, so no periodic transition is left unsupervised.
-Spatial resizing preserves aspect ratio on the integer VAE grid. The formal
-configuration is the single source of truth for weights, thresholds, and
-schedules.
+The feature objective uses soft-target cross entropy over the global target
+feature map plus a small expected-coordinate Huber term. It directly trains the
+refiner and upstream LoRA features. The diffusion objective trains the
+zero-initialized feedback bridge, while stop-gradient prevents that bridge from
+turning the refiner into an unconstrained shortcut. Decoded RGB optical-flow,
+trajectory-distribution, and adjacent-latent velocity losses are not part of the
+formal path; they were removed because they duplicate or conflict with exact
+material correspondence, especially at occlusion and high speed.
 
 Required ablations are:
 

@@ -296,6 +296,29 @@ class DasPointTrajectoryTest(unittest.TestCase):
         self.assertEqual(float(rendered[3, :, 4, 4].sum()), 0.0)
         self.assertEqual(rendered[7, :, 4, 4].tolist(), [1.0, 1.0])
 
+    def test_condition_map_and_correspondence_share_one_zbuffer(self) -> None:
+        payload = point_payload(object_count=2)
+        payload["initial_points_camera_m"][0, 0] = (-1.0, 0.0, 3.0)
+        payload["initial_points_camera_m"][1, 0] = (1.0, 0.0, 1.0)
+        payload["points_camera_m"][:, 0, 0] = (-1.0, 0.0, 3.0)
+        payload["points_camera_m"][:, 1, 0] = (1.0, 0.0, 1.0)
+        payload["depth_m"][:, 0, 0] = 3.0
+        payload["depth_m"][:, 1, 0] = 1.0
+        payload["valid"][:, :, 0] = True
+        payload["tracks_xy_px"][:, :, 0] = (4.0, 4.0)
+
+        rendered, correspondence = rasterize_das_3d_tracks(
+            payload,
+            (8, 8),
+            preprocess_size_px=(8, 8),
+            return_correspondence=True,
+        )
+
+        self.assertFalse(bool(correspondence["track_visible"][:, 0, 0].any()))
+        self.assertTrue(bool(correspondence["track_visible"][:, 1, 0].all()))
+        self.assertEqual(float(rendered[3].sum()), 0.0)
+        self.assertGreater(float(rendered[7].sum()), 0.0)
+
     def test_full_resolution_visibility_does_not_merge_distinct_pixels(self) -> None:
         payload = point_payload(object_count=2)
         payload["image_size_px"] = np.asarray([16, 16])

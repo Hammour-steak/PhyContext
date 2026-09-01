@@ -33,10 +33,10 @@ corner-aligned scale.
 After source-array decoding, rasterization geometry stays in float64 through
 projection, resize, and crop, and is converted to integer pixels only at the
 z-buffer; this prevents additional precision loss at a half-pixel rounding
-boundary. Cache schemas v4 and v5 record this geometry contract together with
-static-point camera clipping; v5 additionally binds the canonical TI2V first
-frame before the full causal VAE encode. Older point maps cannot be consumed as
-current DaS conditions.
+boundary. Cache schemas v4-v6 record this geometry contract together with
+static-point camera clipping; v5 adds the canonical TI2V first-frame binding,
+and v6 adds exact material-point correspondence targets. Older point maps remain
+readable for legacy adapters but cannot train the current correspondence path.
 
 `unproject_physweep_tracks` provides the metric-depth inverse of the published
 projection. `tools/phycontext/audit_das_roundtrip.py` uses it to verify a real
@@ -60,17 +60,17 @@ four-frame window to frames 1-96, producing the Wan-aligned temporal grid
 `[12, 25, 30, 52]` before patch projection. Empty slots are zero-filled. The explicit
 visibility channel avoids confusing black background with a valid point whose
 normalized coordinate color is near zero. Visibility also supplies the latent
-motion envelope used by reconstruction and coarse trajectory losses; it is not
+motion envelope used by reconstruction and the coarse center guard; it is not
 a second model condition.
 
-The decoded-video object temporal loss does not try to invert the many-to-one
-RGB condition map. It reloads the hash-bound raw 2,048-point trajectory and the
-renderer instance masks for an eight-frame training window, reruns a global
-dynamic z-buffer, and retains only double-visible points inside eroded masks.
-This avoids treating an averaged 30 x 52 identity color as an exact point ID.
-Static occlusion is supplied by the renderer mask; dynamic objects still
-compete in one depth buffer. The paired background objective excludes the
-dilated three-frame object sweep and target-dynamic non-background regions.
+The v6 cache writes a separate loss-only correspondence artifact with
+`track_xy_px [97,O,2048,2]`, `track_depth_m [97,O,2048]`, and
+`track_visible [97,O,2048]`. The condition map and this artifact are emitted by
+the same projection/z-buffer pass, so their visibility semantics cannot drift.
+Unlike the many-to-one 30 x 52 RGB condition, the loss artifact retains the
+exact object slot and material-point index. A first-frame feature query retrieves
+the same point from the global intermediate-Wan feature map for each swept
+four-RGB-frame target window.
 
 Static occlusion uses the 8,192 environment points in the scene condition,
 transformed through the published camera transform or camera sequence. A single
@@ -91,7 +91,7 @@ fixed shape is `[18, T_latent, H_latent, W_latent]`.
 Old caches and checkpoints are not overwritten. DaS-style caching uses:
 
 ```text
-cache/wan/physweep_training/das_3d_tracks_canonical_v5_832x480x97/
+cache/wan/physweep_training/das_3d_tracks_track4gen_v6_832x480x97/
 ```
 
 The legacy cache remains under `dense_point_tracks_832x480x97/`.

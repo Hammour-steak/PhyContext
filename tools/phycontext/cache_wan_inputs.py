@@ -19,12 +19,14 @@ from cache_contract import (
     CURRENT_CACHE_SCHEMA,
     GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
     SUPPORTED_CACHE_SCHEMAS,
+    TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     resolve_cache_artifact_root,
 )
 from point_trajectory import (
     DAS_TRACK_CHANNELS_PER_OBJECT,
     POINT_TRAJECTORY_SCHEMA,
     TRACK_CHANNELS_PER_OBJECT,
+    build_das_track_correspondence,
     rasterize_das_3d_tracks,
     rasterize_projected_tracks,
 )
@@ -568,6 +570,22 @@ def main() -> None:
             "temporal_encoding": "conditioner_first_frame_plus_learned_stride4_windows",
             "point_splat_radius_px": 1,
         }
+    point_correspondence_preprocess = {
+        "source_schema": POINT_TRAJECTORY_SCHEMA,
+        "representation": "exact_material_point_correspondence",
+        "frame_selection": "same_evenly_spaced_indices_as_preprocessed_video",
+        "spatial_transform": "cover_then_center_crop_to_preprocess_size",
+        "preprocess_size_px": [args.width, args.height],
+        "point_axis": "fixed_object_slot_and_material_point_index",
+        "visibility": "same_full_resolution_dynamic_and_static_nearest_depth_z_buffer_as_das_tracks",
+        "point_splat_radius_px": 1,
+        "cached_tensors": [
+            "track_xy_px",
+            "track_depth_m",
+            "track_visible",
+            "source_frame_indices",
+        ],
+    }
     reuse_cache_path = None
     reuse_cache_hash = None
     reuse_records = {}
@@ -575,6 +593,7 @@ def main() -> None:
     reuse_artifact_root = root
     reuse_latents = False
     reuse_point_tracks = False
+    reuse_track_correspondence = False
     if args.reuse_cache_manifest is not None:
         reuse_cache_path = (root / args.reuse_cache_manifest).resolve()
         reuse_cache_hash = sha256(reuse_cache_path)
@@ -613,6 +632,12 @@ def main() -> None:
                 # only when their condition-frame protocol also matches.
             else:
                 reuse_point_tracks = True
+            if (
+                reuse_cache.get("schema") in TRACK_CORRESPONDENCE_CACHE_SCHEMAS
+                and reuse_cache.get("point_correspondence_preprocess")
+                == point_correspondence_preprocess
+            ):
+                reuse_track_correspondence = True
         reused_text_by_hash = index_reusable_text_contexts(reuse_records)
 
     selection = {
@@ -660,6 +685,10 @@ def main() -> None:
                 raise ValueError("cache belongs to a different point trajectory manifest")
             if existing.get("point_track_preprocess") != point_track_preprocess:
                 raise ValueError("cache uses different point-track preprocessing")
+            if existing.get("point_correspondence_preprocess") != (
+                point_correspondence_preprocess
+            ):
+                raise ValueError("cache uses different point-correspondence preprocessing")
         cached = {record["sample_id"]: record for record in existing["records"]}
 
     device = torch.device(args.device)
@@ -670,8 +699,10 @@ def main() -> None:
     latent_root = cache_root / "latents"
     text_root = cache_root / "text"
     point_track_root = cache_root / "point_tracks"
+    track_correspondence_root = cache_root / "track_correspondence"
 
-    point_track_targets = []
+    point_track_targets = {}
+    track_correspondence_targets = {}
     if point_manifest_path is not None:
         expected_point_shape = expected_point_track_shape(
             args.trajectory_representation,
@@ -696,8 +727,42 @@ def main() -> None:
                 reusable_descriptor,
                 args.overwrite,
             ):
-                point_track_targets.append((record, point_path))
-        for index, (record, point_path) in enumerate(point_track_targets, 1):
+                point_track_targets[record["sample_id"]] = point_path
+            correspondence_path = (
+                track_correspondence_root
+                / f"{record['sample_id']}.safetensors"
+            )
+            current = cached.get(record["sample_id"], {}).get(
+                "track_correspondence"
+            )
+            reusable = (
+                reuse_records.get(record["sample_id"], {}).get(
+                    "track_correspondence"
+                )
+                if reuse_track_correspondence
+                else None
+            )
+            if prepare_reusable_artifact(
+                correspondence_path,
+                artifact_root,
+                reuse_artifact_root,
+                current,
+                reusable,
+                args.overwrite,
+            ):
+                track_correspondence_targets[record["sample_id"]] = (
+                    correspondence_path
+                )
+        geometry_target_ids = set(point_track_targets) | set(
+            track_correspondence_targets
+        )
+        geometry_targets = [
+            record
+            for record in selected
+            if record["sample_id"] in geometry_target_ids
+        ]
+        for index, record in enumerate(geometry_targets, 1):
+            sample_id = record["sample_id"]
             source = point_records[record["sample_id"]]
             source_path = (dataset_root / source["path"]).resolve()
             if (
@@ -730,13 +795,11 @@ def main() -> None:
                 args.frames,
                 expected_latent_shape[1],
             )
-            renderer = (
-                rasterize_das_3d_tracks
-                if args.trajectory_representation == "das_3d_tracks"
-                else rasterize_projected_tracks
-            )
             static_points_camera0_m = None
-            if args.trajectory_representation == "das_3d_tracks":
+            if (
+                args.trajectory_representation == "das_3d_tracks"
+                or sample_id in track_correspondence_targets
+            ):
                 scene_path = dataset_root / record["conditioning"]["scene"]
                 with np.load(scene_path, allow_pickle=False) as scene_archive:
                     if "environment_xyz_camera_m" not in scene_archive:
@@ -746,32 +809,93 @@ def main() -> None:
                     static_points_camera0_m = scene_archive[
                         "environment_xyz_camera_m"
                     ].astype(np.float32)
-            point_track_map = renderer(
-                point_payload,
-                (expected_latent_shape[3], expected_latent_shape[2]),
-                preprocess_size_px=(args.width, args.height),
-                frame_indices=frame_indices,
-                max_objects=3,
-                **(
-                    {
-                        "static_points_camera0_m": static_points_camera0_m,
-                        "point_radius_px": 1,
-                    }
-                    if args.trajectory_representation == "das_3d_tracks"
-                    else {}
-                ),
-            )
+            if args.trajectory_representation == "das_3d_tracks":
+                point_track_map, correspondence = rasterize_das_3d_tracks(
+                    point_payload,
+                    (expected_latent_shape[3], expected_latent_shape[2]),
+                    preprocess_size_px=(args.width, args.height),
+                    frame_indices=frame_indices,
+                    max_objects=3,
+                    static_points_camera0_m=static_points_camera0_m,
+                    point_radius_px=1,
+                    return_correspondence=True,
+                )
+            else:
+                point_track_map = rasterize_projected_tracks(
+                    point_payload,
+                    (expected_latent_shape[3], expected_latent_shape[2]),
+                    preprocess_size_px=(args.width, args.height),
+                    frame_indices=frame_indices,
+                    max_objects=3,
+                )
+                correspondence = (
+                    build_das_track_correspondence(
+                        point_payload,
+                        preprocess_size_px=(args.width, args.height),
+                        frame_indices=trajectory_frame_indices(
+                            "das_3d_tracks",
+                            source_frame_count,
+                            args.frames,
+                            expected_latent_shape[1],
+                        ),
+                        static_points_camera0_m=static_points_camera0_m,
+                        point_radius_px=1,
+                    )
+                    if sample_id in track_correspondence_targets
+                    else None
+                )
             if tuple(point_track_map.shape) != expected_point_shape:
                 raise ValueError(
                     f"unexpected point-track shape for {record['sample_id']}: "
                     f"{tuple(point_track_map.shape)} != {expected_point_shape}"
                 )
-            atomic_safetensors(
-                {"point_track_map": torch.from_numpy(point_track_map)},
-                point_path,
-            )
+            point_path = point_track_targets.get(sample_id)
+            if point_path is not None:
+                atomic_safetensors(
+                    {"point_track_map": torch.from_numpy(point_track_map)},
+                    point_path,
+                )
+            correspondence_path = track_correspondence_targets.get(sample_id)
+            if correspondence_path is not None:
+                object_count = int(source["object_count"])
+                expected_geometry_shape = (args.frames, object_count, 2048)
+                if correspondence is None or (
+                    tuple(correspondence["track_xy_px"].shape)
+                    != expected_geometry_shape + (2,)
+                    or tuple(correspondence["track_depth_m"].shape)
+                    != expected_geometry_shape
+                    or tuple(correspondence["track_visible"].shape)
+                    != expected_geometry_shape
+                    or tuple(correspondence["source_frame_indices"].shape)
+                    != (args.frames,)
+                ):
+                    raise ValueError(
+                        f"unexpected point-correspondence shape for {sample_id}"
+                    )
+                atomic_safetensors(
+                    {
+                        "track_xy_px": torch.from_numpy(
+                            correspondence["track_xy_px"]
+                        ),
+                        "track_depth_m": torch.from_numpy(
+                            correspondence["track_depth_m"]
+                        ),
+                        "track_visible": torch.from_numpy(
+                            correspondence["track_visible"]
+                        ),
+                        "source_frame_indices": torch.from_numpy(
+                            correspondence["source_frame_indices"]
+                        ),
+                    },
+                    correspondence_path,
+                )
+            outputs = []
+            if point_path is not None:
+                outputs.append("point-track")
+            if correspondence_path is not None:
+                outputs.append("track-correspondence")
             print(
-                f"point-track {index}/{len(point_track_targets)} {record['sample_id']}",
+                f"geometry[{'+'.join(outputs)}] {index}/{len(geometry_targets)} {sample_id}",
                 flush=True,
             )
 
@@ -925,6 +1049,30 @@ def main() -> None:
                 "object_count": source["object_count"],
                 "object_ids": source["object_ids"],
             }
+            correspondence_path = (
+                track_correspondence_root
+                / f"{record['sample_id']}.safetensors"
+            )
+            if not correspondence_path.is_file():
+                raise FileNotFoundError(
+                    "track correspondence was not materialized for "
+                    f"{record['sample_id']}"
+                )
+            object_count = int(source["object_count"])
+            cached_record["track_correspondence"] = {
+                "path": relative(correspondence_path, artifact_root),
+                "sha256": sha256(correspondence_path),
+                "xy_shape": [args.frames, object_count, 2048, 2],
+                "depth_shape": [args.frames, object_count, 2048],
+                "visible_shape": [args.frames, object_count, 2048],
+                "source_frame_indices_shape": [args.frames],
+                "xy_dtype": "float32",
+                "depth_dtype": "float32",
+                "visible_dtype": "bool",
+                "source_frame_indices_dtype": "int64",
+                "object_count": object_count,
+                "object_ids": source["object_ids"],
+            }
         cached[record["sample_id"]] = cached_record
 
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -955,6 +1103,7 @@ def main() -> None:
                 ),
                 "source_point_trajectory_manifest_sha256": point_manifest_hash,
                 "point_track_preprocess": point_track_preprocess,
+                "point_correspondence_preprocess": point_correspondence_preprocess,
             }
         )
     if reuse_cache_path is not None:
@@ -975,6 +1124,7 @@ def main() -> None:
         "new_latent_count": len(latent_targets),
         "new_text_count": len(missing_text),
         "new_point_track_count": len(point_track_targets),
+        "new_track_correspondence_count": len(track_correspondence_targets),
         "reused_latent_count": len(selected) - len(latent_targets),
         "reused_text_count": len(text_by_hash) - len(missing_text),
         "peak_cuda_memory_gib": round(peak_memory / 1024**3, 3),

@@ -17,11 +17,13 @@ from cache_contract import (
     GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
     SOURCE_FILE_HASH_CACHE_SCHEMAS,
     SUPPORTED_CACHE_SCHEMAS,
+    TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     resolve_cache_artifact_root,
     resolve_cache_dataset_root,
     validate_cache_record_coverage,
     validate_cache_source_manifest,
 )
+from track_correspondence import validate_track_correspondence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -198,11 +200,40 @@ def main() -> None:
         )
     if cache.get("point_track_preprocess") != expected_point_preprocess:
         errors.append("point-track preprocessing contract mismatch; cache must be rebuilt")
+    expected_correspondence_preprocess = {
+        "source_schema": "physweep.point_trajectories.v1",
+        "representation": "exact_material_point_correspondence",
+        "frame_selection": "same_evenly_spaced_indices_as_preprocessed_video",
+        "spatial_transform": "cover_then_center_crop_to_preprocess_size",
+        "preprocess_size_px": [
+            int(cache["preprocess"]["width"]),
+            int(cache["preprocess"]["height"]),
+        ],
+        "point_axis": "fixed_object_slot_and_material_point_index",
+        "visibility": "same_full_resolution_dynamic_and_static_nearest_depth_z_buffer_as_das_tracks",
+        "point_splat_radius_px": 1,
+        "cached_tensors": [
+            "track_xy_px",
+            "track_depth_m",
+            "track_visible",
+            "source_frame_indices",
+        ],
+    }
+    if cache_schema in TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
+        if cache.get("point_correspondence_preprocess") != (
+            expected_correspondence_preprocess
+        ):
+            errors.append(
+                "point-correspondence preprocessing contract mismatch; cache must be rebuilt"
+            )
+    elif "point_correspondence_preprocess" in cache:
+        errors.append("legacy cache unexpectedly declares point correspondence")
     sample_ids = set()
     latent_paths = set()
     text_paths = set()
     base_ids = set()
     point_track_shapes = set()
+    track_correspondence_shapes = set()
     for item in cache["records"]:
         sample_id = item["sample_id"]
         if sample_id in sample_ids:
@@ -352,6 +383,89 @@ def main() -> None:
                         errors.append(
                             f"unused DaS point-track slots are nonzero: {sample_id}"
                         )
+        if cache_schema in TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
+            correspondence_record = item.get("track_correspondence")
+            expected_object_ids = record_dynamic_object_ids(record)
+            if not isinstance(correspondence_record, dict):
+                errors.append(f"missing track-correspondence record: {sample_id}")
+            else:
+                if correspondence_record.get("object_ids") != expected_object_ids:
+                    errors.append(
+                        f"track-correspondence object binding mismatch: {sample_id}"
+                    )
+                if int(correspondence_record.get("object_count", -1)) != len(
+                    expected_object_ids
+                ):
+                    errors.append(
+                        f"track-correspondence object count mismatch: {sample_id}"
+                    )
+                correspondence_path = artifact_root / correspondence_record.get(
+                    "path", ""
+                )
+                if (
+                    not correspondence_path.is_file()
+                    or sha256(correspondence_path)
+                    != correspondence_record.get("sha256")
+                ):
+                    errors.append(
+                        f"track-correspondence file/hash mismatch: {sample_id}"
+                    )
+                else:
+                    values = load_file(str(correspondence_path), device="cpu")
+                    try:
+                        validate_track_correspondence(
+                            values,
+                            preprocess_size_px=(
+                                int(cache["preprocess"]["width"]),
+                                int(cache["preprocess"]["height"]),
+                            ),
+                            expected_frames=int(cache["preprocess"]["frames"]),
+                        )
+                    except ValueError as error:
+                        errors.append(
+                            f"invalid track correspondence {sample_id}: {error}"
+                        )
+                    tensor_contract = {
+                        "track_xy_px": (
+                            "xy_shape",
+                            "xy_dtype",
+                            "float32",
+                        ),
+                        "track_depth_m": (
+                            "depth_shape",
+                            "depth_dtype",
+                            "float32",
+                        ),
+                        "track_visible": (
+                            "visible_shape",
+                            "visible_dtype",
+                            "bool",
+                        ),
+                        "source_frame_indices": (
+                            "source_frame_indices_shape",
+                            "source_frame_indices_dtype",
+                            "int64",
+                        ),
+                    }
+                    for tensor_name, (
+                        shape_key,
+                        dtype_key,
+                        expected_dtype,
+                    ) in tensor_contract.items():
+                        tensor = values.get(tensor_name)
+                        if tensor is None:
+                            continue
+                        track_correspondence_shapes.add(
+                            (tensor_name, tuple(tensor.shape))
+                        )
+                        if list(tensor.shape) != correspondence_record.get(shape_key):
+                            errors.append(
+                                f"track-correspondence descriptor shape mismatch: {sample_id} {tensor_name}"
+                            )
+                        if correspondence_record.get(dtype_key) != expected_dtype:
+                            errors.append(
+                                f"track-correspondence descriptor dtype mismatch: {sample_id} {tensor_name}"
+                            )
         if not args.skip_video_hashes:
             video_path = dataset_root / record["target"]["video"]
             if sha256(video_path) != item["source_video_sha256"]:
@@ -366,6 +480,10 @@ def main() -> None:
         "unique_text_context_count": len(text_paths),
         "expected_latent_shape": list(expected_shape),
         "point_track_shapes": [list(shape) for shape in sorted(point_track_shapes)],
+        "track_correspondence_shapes": [
+            {"tensor": name, "shape": list(shape)}
+            for name, shape in sorted(track_correspondence_shapes)
+        ],
         "trajectory_representation": trajectory_representation,
         "errors": errors,
     }

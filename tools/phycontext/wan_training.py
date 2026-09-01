@@ -9,6 +9,8 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+from track_correspondence import inject_track_correspondence
+
 
 SWEEP_AXES = ("mass_kg", "contact_friction", "contact_restitution")
 TRAJECTORY_INPUT_SOURCES = ("target", "nominal_base")
@@ -929,6 +931,14 @@ def save_condition_checkpoint(
                 for key, value in trajectory_conditioner.state_dict().items()
             }
         )
+    track_adapter = getattr(model, "phycontext_track_correspondence", None)
+    if track_adapter is not None:
+        tensors.update(
+            {
+                f"track_correspondence.{key}": value.detach().cpu().contiguous()
+                for key, value in track_adapter.state_dict().items()
+            }
+        )
     save_file(tensors, output_dir / "adapter.safetensors")
     (output_dir / "adapter.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
@@ -944,6 +954,7 @@ def load_condition_checkpoint(
     if metadata.get("schema") not in {
         "phycontext.wan_condition_adapter.v2",
         "phycontext.wan_condition_adapter.v3",
+        "phycontext.wan_condition_adapter.v4",
     }:
         raise ValueError("adapter uses an unsupported conditioning schema")
     lora = metadata["lora"]
@@ -1027,6 +1038,24 @@ def load_condition_checkpoint(
         consumed.update(
             key for key in tensors if key.startswith(trajectory_prefix)
         )
+    track_config = metadata.get("track_correspondence", {})
+    if track_config.get("enabled", False):
+        adapter = inject_track_correspondence(
+            model,
+            block_index=int(track_config["block_index"]),
+            feature_dim=int(track_config["feature_dim"]),
+            refiner_blocks=int(track_config["refiner_blocks"]),
+        )
+        if adapter.architecture != track_config.get("architecture"):
+            raise ValueError("adapter track-correspondence architecture is unsupported")
+        track_prefix = "track_correspondence."
+        track_state = {
+            key[len(track_prefix) :]: value
+            for key, value in tensors.items()
+            if key.startswith(track_prefix)
+        }
+        adapter.load_state_dict(track_state, strict=True)
+        consumed.update(key for key in tensors if key.startswith(track_prefix))
     unexpected = sorted(set(tensors) - consumed)
     if unexpected:
         raise ValueError(f"unexpected adapter tensors: {unexpected}")
@@ -1057,12 +1086,44 @@ def enable_block_checkpointing(model: nn.Module) -> int:
 
         return checkpoint(run, x, e, context, use_reentrant=False)
 
+    track_adapter = getattr(model, "phycontext_track_correspondence", None)
+
+    def checkpointed_track_forward(
+        self,
+        x,
+        e,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        context,
+        context_lens,
+    ):
+        def run(x_value, e_value, context_value):
+            return self._phycontext_forward(
+                x_value,
+                e_value,
+                seq_lens,
+                grid_sizes,
+                freqs,
+                context_value,
+                context_lens,
+            )
+
+        hidden = checkpoint(run, x, e, context, use_reentrant=False)
+        return track_adapter(hidden, grid_sizes)
+
     count = 0
     for block in model.blocks:
         if hasattr(block, "_phycontext_forward"):
             continue
-        block._phycontext_forward = block.forward
-        block.forward = types.MethodType(checkpointed_forward, block)
+        if hasattr(block, "_phycontext_track_base_forward"):
+            if track_adapter is None:
+                raise RuntimeError("track-wrapped block has no correspondence adapter")
+            block._phycontext_forward = block._phycontext_track_base_forward
+            block.forward = types.MethodType(checkpointed_track_forward, block)
+        else:
+            block._phycontext_forward = block.forward
+            block.forward = types.MethodType(checkpointed_forward, block)
         count += 1
     return count
 
@@ -1260,34 +1321,14 @@ def latent_correspondence_trajectory(
     return predicted, target, valid
 
 
-def _jensen_shannon_distribution_loss(
-    predicted: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    """Compare normalized spatial mass without requiring calibrated mask logits."""
-    if predicted.shape != target.shape or predicted.ndim != 2:
-        raise ValueError("motion distributions must share frames x positions")
-    midpoint = 0.5 * (predicted + target)
-    epsilon = torch.finfo(predicted.dtype).eps
-    predicted_kl = predicted * (
-        predicted.clamp_min(epsilon).log() - midpoint.clamp_min(epsilon).log()
-    )
-    target_kl = torch.where(
-        target > 0,
-        target * (target.clamp_min(epsilon).log() - midpoint.clamp_min(epsilon).log()),
-        torch.zeros_like(target),
-    )
-    return 0.5 * (predicted_kl.sum(dim=-1) + target_kl.sum(dim=-1)).mean()
-
-
-def latent_motion_supervision_losses(
+def latent_object_center_loss(
     predicted_clean: list[torch.Tensor],
     target_clean: list[torch.Tensor],
     motion_masks: list[torch.Tensor],
     temperature: float = 0.07,
     beta: float = 0.05,
-) -> dict[str, torch.Tensor]:
-    """Supervise object location, occupancy, and velocity in clean-latent space."""
+) -> torch.Tensor:
+    """Keep one coarse object-location guard beside exact feature correspondence."""
     if not (
         len(predicted_clean) == len(target_clean) == len(motion_masks)
         and predicted_clean
@@ -1296,22 +1337,11 @@ def latent_motion_supervision_losses(
     if beta <= 0:
         raise ValueError("motion supervision Smooth-L1 beta must be positive")
     center_losses = []
-    distribution_losses = []
-    velocity_losses = []
     for predicted, target, mask in zip(
         predicted_clean, target_clean, motion_masks
     ):
-        (
-            predicted_centers,
-            target_centers,
-            predicted_distribution,
-            target_distribution,
-            valid,
-        ) = latent_correspondence_motion(
-            predicted,
-            target,
-            mask,
-            temperature=temperature,
+        predicted_centers, target_centers, valid = latent_correspondence_trajectory(
+            predicted, target, mask, temperature=temperature
         )
         if valid.any():
             center_losses.append(
@@ -1322,33 +1352,8 @@ def latent_motion_supervision_losses(
                     reduction="mean",
                 )
             )
-            distribution_losses.append(
-                _jensen_shannon_distribution_loss(
-                    predicted_distribution[valid].flatten(1),
-                    target_distribution[valid].flatten(1),
-                )
-            )
-        valid_velocity = valid[1:] & valid[:-1]
-        if valid_velocity.any():
-            predicted_velocity = predicted_centers[1:] - predicted_centers[:-1]
-            target_velocity = target_centers[1:] - target_centers[:-1]
-            velocity_losses.append(
-                F.smooth_l1_loss(
-                    predicted_velocity[valid_velocity],
-                    target_velocity[valid_velocity],
-                    beta=beta,
-                    reduction="mean",
-                )
-            )
-
     zero = predicted_clean[0].sum() * 0.0
-    return {
-        "center": torch.stack(center_losses).mean() if center_losses else zero,
-        "distribution": (
-            torch.stack(distribution_losses).mean() if distribution_losses else zero
-        ),
-        "velocity": torch.stack(velocity_losses).mean() if velocity_losses else zero,
-    }
+    return torch.stack(center_losses).mean() if center_losses else zero
 
 
 def masked_flow_loss(

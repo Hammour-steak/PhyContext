@@ -44,8 +44,9 @@ PhysSweep project/data root + immutable one-object release
         -> validate or run inference
 ```
 
-The dataset is read only. Wan latents, text embeddings, and full-rate DaS-style
-point-track maps default to this repository's `cache/` directory, but an
+The dataset is read only. Wan latents, text embeddings, full-rate DaS-style
+point-track maps, and exact material-point correspondence targets default to
+this repository's `cache/` directory, but an
 external cache root is supported for large runs. Checkpoints and inference
 results stay under `outputs/` unless explicitly redirected.
 
@@ -114,6 +115,8 @@ trajectory            DaS-style 3D tracks, `[12, 97, 30, 52]`
 cross-attention LoRA  rank 16
 direct modulation     rank 32
 trajectory branch     rank 32
+feature correspondence block 12 (zero based), 128-D refiner
+formal objectives      flow matching + response + LPIPS + center guard + correspondence
 sampling steps        30
 ```
 

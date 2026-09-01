@@ -20,6 +20,7 @@ if str(PHYCONTEXT_TOOLS) not in sys.path:
 
 from cache_contract import (  # noqa: E402
     CURRENT_CACHE_SCHEMA,
+    TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     resolve_cache_dataset_root,
     validate_cache_source_manifest,
 )
@@ -96,12 +97,9 @@ def preflight(root: Path, config: dict[str, Any]) -> tuple[Path, Path]:
             raise ValueError(
                 "Wan cache trajectory representation differs from training config"
             )
-        if (
-            expected_representation == "das_3d_tracks"
-            and cache.get("schema") != CURRENT_CACHE_SCHEMA
-        ):
+        if cache.get("schema") not in TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
             raise ValueError(
-                "full-rate das_3d_tracks training requires the current cache "
+                "Track4Gen correspondence training requires the current cache "
                 f"schema {CURRENT_CACHE_SCHEMA}"
             )
     cache_dataset_root = resolve_cache_dataset_root(root, cache)

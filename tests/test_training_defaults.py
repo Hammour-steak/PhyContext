@@ -212,6 +212,9 @@ class TrainingDefaultTests(unittest.TestCase):
                                     "latent": {"path": f"latent/{sample_id}"},
                                     "text_context": {"path": f"text/{sample_id}"},
                                     "point_track": {"path": f"{sample_id}.safetensors"},
+                                    "track_correspondence": {
+                                        "path": f"track/{sample_id}.safetensors"
+                                    },
                                 }
                             ],
                         }
@@ -454,24 +457,36 @@ class TrainingDefaultTests(unittest.TestCase):
         formal_config = json.loads(
             (ROOT / "configs/training/one_object.json").read_text(encoding="utf-8")
         )["training"]
+        for removed in (
+            "flow_temporal_loss_weight",
+            "trajectory_distribution_loss_weight",
+            "trajectory_velocity_loss_weight",
+        ):
+            self.assertFalse(hasattr(args, removed))
+            self.assertNotIn(removed, formal_config)
         self.assertEqual(formal_config["steps"], args.steps)
         self.assertEqual(
             formal_config["validation_batches"], args.validation_batches
         )
-        self.assertGreater(args.flow_temporal_loss_weight, 0.0)
-        self.assertGreater(args.flow_temporal_beta, 0.0)
-        self.assertTrue(0.0 < args.flow_foreground_share < 1.0)
+        self.assertGreater(args.track_correspondence_loss_weight, 0.0)
+        self.assertGreater(args.track_correspondence_temperature, 0.0)
+        self.assertGreater(args.track_correspondence_pairs, 0)
+        self.assertEqual(args.track_correspondence_block_index, 12)
         self.assertEqual(
-            formal_config["flow_temporal_loss_weight"],
-            args.flow_temporal_loss_weight,
+            formal_config["track_correspondence_loss_weight"],
+            args.track_correspondence_loss_weight,
         )
         self.assertEqual(
-            formal_config["flow_temporal_beta"],
-            args.flow_temporal_beta,
+            formal_config["track_correspondence_temperature"],
+            args.track_correspondence_temperature,
         )
         self.assertEqual(
-            formal_config["flow_foreground_share"],
-            args.flow_foreground_share,
+            formal_config["track_correspondence_pairs"],
+            args.track_correspondence_pairs,
+        )
+        self.assertEqual(
+            formal_config["track_correspondence_block_index"],
+            args.track_correspondence_block_index,
         )
         self.assertEqual(
             (VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FRAMES), (832, 480, 97)
@@ -540,7 +555,7 @@ class TrainingDefaultTests(unittest.TestCase):
         fingerprints = train_wan_formal.training_code_sha256()
         self.assertIn("tools/phycontext/video_preprocess.py", fingerprints)
         self.assertIn("tools/phycontext/point_trajectory.py", fingerprints)
-        self.assertIn("tools/phycontext/temporal_supervision.py", fingerprints)
+        self.assertIn("tools/phycontext/track_correspondence.py", fingerprints)
 
     def test_dataset_override_cannot_reuse_the_original_trajectory(self) -> None:
         with patch.object(
@@ -667,12 +682,17 @@ class TrainingDefaultTests(unittest.TestCase):
                     "input_channels": 12,
                     "architecture": "full_frame_causal_patch_v2",
                 },
+                "track_correspondence": {
+                    "architecture": "track4gen_swept_latent_v1",
+                    "block_index": 18,
+                    "feature_dim": 128,
+                },
             }
             train_wan_formal.write_input_contract(checkpoint, metadata)
             contract = json.loads(
                 (checkpoint / "input_contract.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(contract["schema"], "phycontext.inference_input_contract.v5")
+            self.assertEqual(contract["schema"], "phycontext.inference_input_contract.v6")
             self.assertEqual(
                 (contract["sampling"]["width"], contract["sampling"]["height"]),
                 (832, 480),

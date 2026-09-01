@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ADAPTER = Path("outputs/training/formal/final")
 TRAJECTORY_COMPONENTS = ("center", "distribution", "velocity")
 DECODED_TEMPORAL_COMPONENTS = ("object", "background")
+TRACK_CORRESPONDENCE_ARCHITECTURE = "track4gen_swept_latent_v1"
 TRAJECTORY_REPRESENTATION_CONTRACTS = {
     "dense_point_tracks": {
         "input_channels": 18,
@@ -65,9 +66,11 @@ def main() -> None:
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     tensors = load_file(str(tensor_path), device="cpu")
     errors = []
-    if metadata.get("schema") not in {
+    schema = metadata.get("schema")
+    if schema not in {
         "phycontext.wan_condition_adapter.v2",
         "phycontext.wan_condition_adapter.v3",
+        "phycontext.wan_condition_adapter.v4",
     }:
         errors.append("adapter conditioning schema mismatch")
     lora_keys = sorted(key for key in tensors if key.startswith("wan_lora."))
@@ -79,6 +82,9 @@ def main() -> None:
     )
     trajectory_conditioning_keys = sorted(
         key for key in tensors if key.startswith("trajectory_conditioning.")
+    )
+    track_correspondence_keys = sorted(
+        key for key in tensors if key.startswith("track_correspondence.")
     )
     expected_modules = int(metadata["lora"]["module_count"])
     if len(lora_keys) != expected_modules * 2:
@@ -209,43 +215,205 @@ def main() -> None:
         errors.append("loss history is empty or non-finite")
     trajectory_config = metadata.get("trajectory_supervision", {})
     trajectory_weights = trajectory_config.get("weights", {})
-    trajectory_histories = {
-        name: [
-            float(value)
-            for value in metadata.get(f"trajectory_{name}_losses", [])
-        ]
-        for name in TRAJECTORY_COMPONENTS
-    }
-    if trajectory_config.get("enabled"):
+    trajectory_histories = {}
+    decoded_temporal_config = metadata.get("decoded_temporal_supervision")
+    decoded_temporal_report_components = {}
+    track_config = metadata.get("track_correspondence", {})
+    track_report = {"enabled": False, "tensor_count": len(track_correspondence_keys)}
+    if schema in {
+        "phycontext.wan_condition_adapter.v2",
+        "phycontext.wan_condition_adapter.v3",
+    }:
+        trajectory_histories = {
+            name: [
+                float(value)
+                for value in metadata.get(f"trajectory_{name}_losses", [])
+            ]
+            for name in TRAJECTORY_COMPONENTS
+        }
+        if trajectory_config.get("enabled"):
+            if bool(trajectory_config.get("provided_as_model_input")) != (
+                trajectory_conditioning_enabled
+            ):
+                errors.append(
+                    "trajectory supervision/input declarations are inconsistent"
+                )
+            if not metadata.get("motion_supervision", {}).get("enabled"):
+                errors.append("trajectory supervision requires motion masks")
+            if trajectory_config.get("type") != "clean_latent_correspondence_motion":
+                errors.append("trajectory supervision type is invalid")
+            parsed_weights = []
+            for name in TRAJECTORY_COMPONENTS:
+                weight = trajectory_weights.get(name)
+                if (
+                    weight is None
+                    or not math.isfinite(float(weight))
+                    or float(weight) < 0
+                ):
+                    errors.append(f"trajectory {name} weight is invalid")
+                else:
+                    parsed_weights.append(float(weight))
+                history = trajectory_histories[name]
+                if len(history) != int(metadata["steps"]):
+                    errors.append(f"trajectory {name} history length mismatch")
+                elif not all(
+                    math.isfinite(value) and value >= 0 for value in history
+                ):
+                    errors.append(f"trajectory {name} history is invalid")
+            if len(parsed_weights) == len(TRAJECTORY_COMPONENTS) and not any(
+                parsed_weights
+            ):
+                errors.append("trajectory weights are all zero")
+    else:
+        trajectory_histories = {
+            "center": [
+                float(value)
+                for value in metadata.get("trajectory_center_losses", [])
+            ]
+        }
+        if trajectory_config.get("type") != "clean_latent_object_center_guard":
+            errors.append("v4 trajectory supervision must be the center guard")
         if bool(trajectory_config.get("provided_as_model_input")) != (
             trajectory_conditioning_enabled
         ):
             errors.append(
-                "trajectory supervision/input declarations are inconsistent"
+                "v4 trajectory supervision/input declarations are inconsistent"
             )
-        if not metadata.get("motion_supervision", {}).get("enabled"):
-            errors.append("trajectory supervision requires motion masks")
-        if trajectory_config.get("type") != "clean_latent_correspondence_motion":
-            errors.append("trajectory supervision type is invalid")
-        parsed_weights = []
-        for name in TRAJECTORY_COMPONENTS:
-            weight = trajectory_weights.get(name)
-            if weight is None or not math.isfinite(float(weight)) or float(weight) < 0:
-                errors.append(f"trajectory {name} weight is invalid")
-            else:
-                parsed_weights.append(float(weight))
-            history = trajectory_histories[name]
-            if len(history) != int(metadata["steps"]):
-                errors.append(f"trajectory {name} history length mismatch")
-            elif not all(math.isfinite(value) and value >= 0 for value in history):
-                errors.append(f"trajectory {name} history is invalid")
-        if len(parsed_weights) == len(TRAJECTORY_COMPONENTS) and not any(
-            parsed_weights
+        center_weight = trajectory_config.get("weight")
+        if (
+            not trajectory_config.get("enabled")
+            or center_weight is None
+            or not math.isfinite(float(center_weight))
+            or float(center_weight) <= 0
         ):
-            errors.append("trajectory weights are all zero")
-    decoded_temporal_config = metadata.get("decoded_temporal_supervision")
-    decoded_temporal_report_components = {}
-    if decoded_temporal_config is not None:
+            errors.append("v4 trajectory center weight is invalid")
+        center_history = trajectory_histories["center"]
+        if len(center_history) != int(metadata["steps"]):
+            errors.append("trajectory center history length mismatch")
+        elif not all(
+            math.isfinite(value) and value >= 0 for value in center_history
+        ):
+            errors.append("trajectory center history is invalid")
+        removed_fields = (
+            "trajectory_distribution_losses",
+            "trajectory_velocity_losses",
+            "flow_temporal_losses",
+            "flow_object_diagnostics",
+            "flow_background_diagnostics",
+            "object_temporal_losses",
+            "background_temporal_losses",
+            "decoded_temporal_supervision",
+        )
+        for field in removed_fields:
+            if field in metadata:
+                errors.append(f"v4 adapter contains removed objective metadata: {field}")
+        if not track_config.get("enabled"):
+            errors.append("v4 track correspondence is disabled")
+        if track_config.get("architecture") != TRACK_CORRESPONDENCE_ARCHITECTURE:
+            errors.append("track correspondence architecture is invalid")
+        expected_track_semantics = {
+            "query": "clean_first_frame_visible_material_point",
+            "target": "visible_same_point_swept_over_each_four_rgb_frame_latent_window",
+            "similarity": "global_target_frame_cosine_cost_volume",
+            "objective": "soft_target_cross_entropy_plus_expected_coordinate_huber",
+            "visibility": "cached_global_dynamic_static_z_buffer",
+            "sampling": "equal_slow_medium_fast_feature_displacement_bins",
+            "feedback": "zero_initialized_linear_of_stop_gradient_refined_features",
+        }
+        for field, expected in expected_track_semantics.items():
+            if track_config.get(field) != expected:
+                errors.append(f"track correspondence {field} semantics are invalid")
+        positive_track_fields = (
+            "feature_dim",
+            "refiner_blocks",
+            "loss_weight",
+            "maximum_pairs_per_video",
+            "temperature",
+            "gaussian_sigma_feature_cells",
+        )
+        for field in positive_track_fields:
+            value = track_config.get(field)
+            if (
+                value is None
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+            ):
+                errors.append(f"track correspondence {field} is invalid")
+        block_index = track_config.get("block_index")
+        coordinate_weight = track_config.get("coordinate_weight")
+        if block_index is None or int(block_index) < 0:
+            errors.append("track correspondence block index is invalid")
+        if (
+            coordinate_weight is None
+            or not math.isfinite(float(coordinate_weight))
+            or float(coordinate_weight) < 0
+        ):
+            errors.append("track correspondence coordinate weight is invalid")
+        if not track_correspondence_keys:
+            errors.append("track correspondence state is missing")
+        feature_dim = int(track_config.get("feature_dim", 0))
+        expected_track_shapes = {
+            "track_correspondence.input_norm.weight": (3072,),
+            "track_correspondence.input_norm.bias": (3072,),
+            "track_correspondence.input_projection.weight": (feature_dim, 3072),
+            "track_correspondence.input_projection.bias": (feature_dim,),
+            "track_correspondence.feedback.weight": (3072, feature_dim),
+        }
+        for key, expected_shape in expected_track_shapes.items():
+            tensor = tensors.get(key)
+            if tensor is None or tuple(tensor.shape) != expected_shape:
+                errors.append(f"track correspondence tensor shape mismatch: {key}")
+        refiner_prefixes = {
+            key.split(".")[2]
+            for key in track_correspondence_keys
+            if key.startswith("track_correspondence.refiner.")
+            and len(key.split(".")) > 3
+        }
+        if len(refiner_prefixes) != int(track_config.get("refiner_blocks", 0)):
+            errors.append("track correspondence refiner block count mismatch")
+        track_losses = [
+            float(value)
+            for value in metadata.get("track_correspondence_losses", [])
+        ]
+        track_displacements = [
+            float(value)
+            for value in metadata.get(
+                "track_correspondence_mean_displacement_tokens", []
+            )
+        ]
+        for label, values in (
+            ("loss", track_losses),
+            ("displacement", track_displacements),
+        ):
+            if len(values) != int(metadata["steps"]):
+                errors.append(f"track correspondence {label} history length mismatch")
+            elif not all(math.isfinite(value) and value >= 0 for value in values):
+                errors.append(f"track correspondence {label} history is invalid")
+        for step in metadata.get("history", []):
+            for key in (
+                "track_correspondence_pairs",
+                "track_correspondence_fast_pairs",
+            ):
+                value = step.get(key)
+                if (
+                    value is None
+                    or not math.isfinite(float(value))
+                    or float(value) < 0
+                ):
+                    errors.append(f"{key} history is invalid")
+                    break
+        track_report = {
+            "enabled": bool(track_config.get("enabled")),
+            "architecture": track_config.get("architecture"),
+            "block_index": block_index,
+            "feature_dim": track_config.get("feature_dim"),
+            "tensor_count": len(track_correspondence_keys),
+            "final_loss": track_losses[-1] if track_losses else None,
+            "mean_displacement_tokens": (
+                track_displacements[-1] if track_displacements else None
+            ),
+        }
+    if decoded_temporal_config is not None and schema != "phycontext.wan_condition_adapter.v4":
         decoded_temporal_enabled = bool(
             decoded_temporal_config.get("enabled")
         )
@@ -429,6 +597,7 @@ def main() -> None:
             ),
             "rank": trajectory_conditioning_config.get("rank"),
         },
+        "track_correspondence": track_report,
         "steps": metadata["steps"],
         "training_input_count": int(metadata["sample_count"]),
         "losses": losses,
@@ -438,7 +607,11 @@ def main() -> None:
                 "provided_as_model_input"
             ),
             "type": trajectory_config.get("type"),
-            "weights": trajectory_weights,
+            "weights": (
+                trajectory_weights
+                if schema != "phycontext.wan_condition_adapter.v4"
+                else {"center": trajectory_config.get("weight")}
+            ),
             "components": {
                 name: {
                     "final_loss": history[-1] if history else None,

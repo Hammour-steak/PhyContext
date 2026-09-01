@@ -706,6 +706,139 @@ def _expand_pixel_splats(
     )
 
 
+def _resolve_das_visible_splats(
+    current_xy: np.ndarray,
+    current_depth: np.ndarray,
+    current_valid: np.ndarray,
+    *,
+    preprocess_size_px: tuple[int, int],
+    object_indices: np.ndarray,
+    point_indices: np.ndarray,
+    point_radius_px: int,
+    static_xy: np.ndarray | None = None,
+    static_depth: np.ndarray | None = None,
+    static_valid: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return dynamic splats that win the shared dynamic/static z-buffer."""
+    preprocess_width, preprocess_height = [int(value) for value in preprocess_size_px]
+    x = np.rint(current_xy[..., 0]).astype(np.int64)
+    y = np.rint(current_xy[..., 1]).astype(np.int64)
+    inside = (
+        current_valid
+        & np.isfinite(current_xy).all(axis=-1)
+        & np.isfinite(current_depth)
+        & (current_depth > 1.0e-6)
+        & (x >= 0)
+        & (x < preprocess_width)
+        & (y >= 0)
+        & (y < preprocess_height)
+    )
+    candidate_x, candidate_y, candidate_depth, candidate_objects, candidate_points = (
+        _expand_pixel_splats(
+            x[inside],
+            y[inside],
+            current_depth[inside],
+            object_indices[inside],
+            point_indices[inside],
+            point_radius_px,
+        )
+    )
+    if static_xy is not None:
+        if static_depth is None or static_valid is None:
+            raise ValueError("static DaS z-buffer inputs are incomplete")
+        static_x = np.rint(static_xy[:, 0]).astype(np.int64)
+        static_y = np.rint(static_xy[:, 1]).astype(np.int64)
+        static_inside = (
+            static_valid
+            & np.isfinite(static_xy).all(axis=-1)
+            & np.isfinite(static_depth)
+            & (static_depth > 1.0e-6)
+            & (static_x >= 0)
+            & (static_x < preprocess_width)
+            & (static_y >= 0)
+            & (static_y < preprocess_height)
+        )
+        static_x, static_y, static_z, static_objects, static_points = (
+            _expand_pixel_splats(
+                static_x[static_inside],
+                static_y[static_inside],
+                static_depth[static_inside],
+                np.full(int(static_inside.sum()), -1, dtype=np.int64),
+                np.full(int(static_inside.sum()), -1, dtype=np.int64),
+                point_radius_px,
+            )
+        )
+        candidate_x = np.concatenate((candidate_x, static_x))
+        candidate_y = np.concatenate((candidate_y, static_y))
+        candidate_depth = np.concatenate((candidate_depth, static_z))
+        candidate_objects = np.concatenate((candidate_objects, static_objects))
+        candidate_points = np.concatenate((candidate_points, static_points))
+    full_inside = (
+        (candidate_x >= 0)
+        & (candidate_x < preprocess_width)
+        & (candidate_y >= 0)
+        & (candidate_y < preprocess_height)
+    )
+    candidate_x = candidate_x[full_inside]
+    candidate_y = candidate_y[full_inside]
+    candidate_depth = candidate_depth[full_inside]
+    candidate_objects = candidate_objects[full_inside]
+    candidate_points = candidate_points[full_inside]
+    if not len(candidate_x):
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty, empty, empty
+    flat_pixels = candidate_y * preprocess_width + candidate_x
+    order = np.lexsort(
+        (
+            candidate_points,
+            candidate_objects,
+            candidate_depth,
+            flat_pixels,
+        )
+    )
+    sorted_pixels = flat_pixels[order]
+    nearest = np.concatenate(
+        (np.array([True]), sorted_pixels[1:] != sorted_pixels[:-1])
+    )
+    visible = order[nearest]
+    visible_x = candidate_x[visible]
+    visible_y = candidate_y[visible]
+    visible_objects = candidate_objects[visible]
+    visible_points = candidate_points[visible]
+    dynamic_visible = visible_objects >= 0
+    return (
+        visible_x[dynamic_visible],
+        visible_y[dynamic_visible],
+        visible_objects[dynamic_visible],
+        visible_points[dynamic_visible],
+    )
+
+
+def build_das_track_correspondence(
+    payload: dict[str, np.ndarray],
+    *,
+    preprocess_size_px: tuple[int, int],
+    frame_indices: list[int] | None = None,
+    spatial_transform: str = "cover_center_crop",
+    static_points_camera0_m: np.ndarray | None = None,
+    point_radius_px: int = 1,
+) -> dict[str, np.ndarray]:
+    """Preserve exact point identities and global z-buffer visibility for loss use."""
+    object_count = int(np.asarray(payload["tracks_xy_px"]).shape[1])
+    _, correspondence = rasterize_das_3d_tracks(
+        payload,
+        (1, 1),
+        preprocess_size_px=preprocess_size_px,
+        frame_indices=frame_indices,
+        max_objects=object_count,
+        spatial_transform=spatial_transform,
+        static_points_camera0_m=static_points_camera0_m,
+        point_radius_px=point_radius_px,
+        return_correspondence=True,
+    )
+    return correspondence
+
+
 def rasterize_das_3d_tracks(
     payload: dict[str, np.ndarray],
     output_size_px: tuple[int, int],
@@ -716,7 +849,8 @@ def rasterize_das_3d_tracks(
     spatial_transform: str = "cover_center_crop",
     static_points_camera0_m: np.ndarray | None = None,
     point_radius_px: int = 1,
-) -> np.ndarray:
+    return_correspondence: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Render DaS-style identity-preserving 3D tracking maps for Wan.
 
     Each object slot contributes ``R, G, B, visibility``. RGB is determined once
@@ -774,6 +908,9 @@ def rasterize_das_3d_tracks(
         ),
         dtype=np.float32,
     )
+    visibility = np.zeros(
+        (len(frame_indices), object_count, point_count), dtype=bool
+    )
     object_indices = np.broadcast_to(
         np.arange(object_count, dtype=np.int64)[:, None],
         (object_count, point_count),
@@ -804,94 +941,33 @@ def rasterize_das_3d_tracks(
             & np.isfinite(current_depth)
             & (current_depth > 1.0e-6)
         )
-        x = np.rint(current_xy[..., 0]).astype(np.int64)
-        y = np.rint(current_xy[..., 1]).astype(np.int64)
-        inside = (
-            current_valid
-            & (x >= 0)
-            & (x < preprocess_width)
-            & (y >= 0)
-            & (y < preprocess_height)
-        )
-        if not np.any(inside) and static_tracks is None:
-            continue
-
-        candidate_x = x[inside]
-        candidate_y = y[inside]
-        candidate_depth = current_depth[inside]
-        candidate_objects = object_indices[inside]
-        candidate_points = point_indices[inside]
-        candidate_x, candidate_y, candidate_depth, candidate_objects, candidate_points = (
-            _expand_pixel_splats(
-                candidate_x,
-                candidate_y,
-                candidate_depth,
-                candidate_objects,
-                candidate_points,
-                point_radius_px,
+        visible_x, visible_y, visible_objects, visible_points = (
+            _resolve_das_visible_splats(
+                current_xy,
+                current_depth,
+                current_valid,
+                preprocess_size_px=(preprocess_width, preprocess_height),
+                object_indices=object_indices,
+                point_indices=point_indices,
+                point_radius_px=point_radius_px,
+                static_xy=(
+                    static_tracks[frame_index]
+                    if static_tracks is not None
+                    else None
+                ),
+                static_depth=(
+                    static_depth[frame_index]
+                    if static_depth is not None
+                    else None
+                ),
+                static_valid=(
+                    static_valid[frame_index]
+                    if static_valid is not None
+                    else None
+                ),
             )
         )
-        if static_tracks is not None:
-            static_x = np.rint(static_tracks[frame_index, :, 0]).astype(np.int64)
-            static_y = np.rint(static_tracks[frame_index, :, 1]).astype(np.int64)
-            static_inside = (
-                static_valid[frame_index]
-                & (static_x >= 0)
-                & (static_x < preprocess_width)
-                & (static_y >= 0)
-                & (static_y < preprocess_height)
-            )
-            static_x, static_y, static_z, static_objects, static_points = (
-                _expand_pixel_splats(
-                    static_x[static_inside],
-                    static_y[static_inside],
-                    static_depth[frame_index, static_inside],
-                    np.full(int(static_inside.sum()), -1, dtype=np.int64),
-                    np.full(int(static_inside.sum()), -1, dtype=np.int64),
-                    point_radius_px,
-                )
-            )
-            candidate_x = np.concatenate((candidate_x, static_x))
-            candidate_y = np.concatenate((candidate_y, static_y))
-            candidate_depth = np.concatenate((candidate_depth, static_z))
-            candidate_objects = np.concatenate((candidate_objects, static_objects))
-            candidate_points = np.concatenate((candidate_points, static_points))
-        full_inside = (
-            (candidate_x >= 0)
-            & (candidate_x < preprocess_width)
-            & (candidate_y >= 0)
-            & (candidate_y < preprocess_height)
-        )
-        candidate_x = candidate_x[full_inside]
-        candidate_y = candidate_y[full_inside]
-        candidate_depth = candidate_depth[full_inside]
-        candidate_objects = candidate_objects[full_inside]
-        candidate_points = candidate_points[full_inside]
-        if not len(candidate_x):
-            continue
-        flat_pixels = candidate_y * preprocess_width + candidate_x
-        order = np.lexsort(
-            (
-                candidate_points,
-                candidate_objects,
-                candidate_depth,
-                flat_pixels,
-            )
-        )
-        sorted_pixels = flat_pixels[order]
-        nearest = np.concatenate(
-            (np.array([True]), sorted_pixels[1:] != sorted_pixels[:-1])
-        )
-        visible = order[nearest]
-        visible_x = candidate_x[visible]
-        visible_y = candidate_y[visible]
-        visible_objects = candidate_objects[visible]
-        visible_points = candidate_points[visible]
-        dynamic_visible = visible_objects >= 0
-        visible_x = visible_x[dynamic_visible]
-        visible_y = visible_y[dynamic_visible]
-        visible_objects = visible_objects[dynamic_visible]
-        visible_points = visible_points[dynamic_visible]
+        visibility[output_index, visible_objects, visible_points] = True
         if not len(visible_x):
             continue
         cell_x = np.floor(
@@ -925,4 +1001,13 @@ def rasterize_das_3d_tracks(
                 target = channels[base + color_channel, output_index].reshape(-1)
                 target[occupied] = sums[occupied] / counts[occupied]
             channels[base + 3, output_index].reshape(-1)[occupied] = 1.0
-    return channels
+    if not return_correspondence:
+        return channels
+    selected = np.asarray(frame_indices, dtype=np.int64)
+    correspondence = {
+        "track_xy_px": processed_tracks[selected].astype(np.float32, copy=False),
+        "track_depth_m": depth[selected].astype(np.float32, copy=False),
+        "track_visible": visibility,
+        "source_frame_indices": selected,
+    }
+    return channels, correspondence
