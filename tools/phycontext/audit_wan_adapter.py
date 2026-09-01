@@ -54,6 +54,43 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_lora_tensor_shapes(
+    tensors: dict[str, torch.Tensor],
+    keys: list[str],
+    *,
+    rank: int,
+    label: str,
+) -> list[str]:
+    """Validate every serialized LoRA module as one compatible down/up pair."""
+    errors = []
+    grouped: dict[str, dict[str, torch.Tensor]] = {}
+    for key in keys:
+        if key.endswith(".down.weight"):
+            module_name = key[: -len(".down.weight")]
+            projection = "down"
+        elif key.endswith(".up.weight"):
+            module_name = key[: -len(".up.weight")]
+            projection = "up"
+        else:
+            errors.append(f"{label} contains an invalid tensor name: {key}")
+            continue
+        grouped.setdefault(module_name, {})[projection] = tensors[key]
+    if rank <= 0:
+        errors.append(f"{label} rank must be positive")
+        return errors
+    for module_name, pair in grouped.items():
+        if set(pair) != {"down", "up"}:
+            errors.append(f"{label} module is missing a down/up tensor: {module_name}")
+            continue
+        down = pair["down"]
+        up = pair["up"]
+        if down.ndim != 2 or up.ndim != 2:
+            errors.append(f"{label} module tensors must be matrices: {module_name}")
+        elif int(down.shape[0]) != rank or int(up.shape[1]) != rank:
+            errors.append(f"{label} module rank does not match metadata: {module_name}")
+    return errors
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Audit a PhyContext Wan adapter")
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
@@ -89,10 +126,27 @@ def main() -> None:
     )
     cross_lora_keys = [key for key in lora_keys if ".cross_attn." in key]
     self_lora_keys = [key for key in lora_keys if ".self_attn." in key]
-    expected_modules = int(metadata["lora"]["module_count"])
+    cross_lora_config = metadata["lora"]
+    expected_modules = int(cross_lora_config["module_count"])
     if len(cross_lora_keys) != expected_modules * 2:
         errors.append("LoRA tensor count does not match module count")
+    if cross_lora_config.get("target") != "wan.blocks.*.cross_attn.{q,k,v,o}":
+        errors.append("cross-attention LoRA target is invalid")
+    cross_lora_rank = int(cross_lora_config.get("rank", 0))
+    cross_lora_alpha = float(cross_lora_config.get("alpha", 0.0))
+    if not math.isfinite(cross_lora_alpha) or cross_lora_alpha <= 0:
+        errors.append("cross-attention LoRA alpha must be positive and finite")
+    errors.extend(
+        validate_lora_tensor_shapes(
+            tensors,
+            cross_lora_keys,
+            rank=cross_lora_rank,
+            label="cross-attention LoRA",
+        )
+    )
     self_lora_config = metadata.get("self_attention_lora", {})
+    expected_self_modules = 0
+    self_lora_rank = int(self_lora_config.get("rank", 0))
     if schema == "phycontext.wan_condition_adapter.v5":
         expected_self_modules = int(self_lora_config.get("module_count", 0))
         if not self_lora_config.get("enabled", False) or expected_self_modules <= 0:
@@ -101,8 +155,30 @@ def main() -> None:
             errors.append("self-attention LoRA tensor count does not match metadata")
         if self_lora_config.get("target") != "wan.blocks.*.self_attn.{q,k,v,o}":
             errors.append("self-attention LoRA target is invalid")
+        block_start = int(self_lora_config.get("block_start", -1))
+        block_end = int(self_lora_config.get("block_end", -1))
+        if block_start < 0 or block_end <= block_start:
+            errors.append("self-attention LoRA block range is invalid")
+        elif expected_self_modules != 4 * (block_end - block_start):
+            errors.append("self-attention LoRA module count does not match block range")
+        self_lora_alpha = float(self_lora_config.get("alpha", 0.0))
+        if not math.isfinite(self_lora_alpha) or self_lora_alpha <= 0:
+            errors.append("self-attention LoRA alpha must be positive and finite")
+        errors.extend(
+            validate_lora_tensor_shapes(
+                tensors,
+                self_lora_keys,
+                rank=self_lora_rank,
+                label="self-attention LoRA",
+            )
+        )
     elif self_lora_keys or self_lora_config.get("enabled", False):
         errors.append("legacy adapter unexpectedly contains self-attention LoRA")
+    unclassified_lora_keys = sorted(
+        set(lora_keys) - set(cross_lora_keys) - set(self_lora_keys)
+    )
+    if unclassified_lora_keys:
+        errors.append("adapter contains unclassified LoRA tensors")
     if not condition_keys:
         errors.append("condition encoder state is missing")
     direct_enabled = bool(
@@ -735,7 +811,16 @@ def main() -> None:
         "adapter_sha256": sha256(tensor_path),
         "adapter_size_mib": round(tensor_path.stat().st_size / 1024**2, 3),
         "lora_module_count": expected_modules,
-        "lora_tensor_count": len(lora_keys),
+        "lora_tensor_count": len(cross_lora_keys),
+        "self_attention_lora": {
+            "enabled": bool(self_lora_config.get("enabled", False)),
+            "module_count": expected_self_modules,
+            "tensor_count": len(self_lora_keys),
+            "rank": self_lora_config.get("rank"),
+            "alpha": self_lora_config.get("alpha"),
+            "block_start": self_lora_config.get("block_start"),
+            "block_end": self_lora_config.get("block_end"),
+        },
         "condition_tensor_count": len(condition_keys),
         "direct_modulation_tensor_count": len(direct_keys),
         "trajectory_conditioning": {
