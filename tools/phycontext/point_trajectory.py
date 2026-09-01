@@ -814,6 +814,43 @@ def _resolve_das_visible_splats(
     )
 
 
+def _serialize_raster_consistent_track_coordinates(
+    coordinates_xy_px: np.ndarray,
+    visibility: np.ndarray,
+) -> np.ndarray:
+    """Encode visible float64 raster decisions faithfully in float32.
+
+    The cover/crop transform intentionally stays in float64 through the
+    z-buffer.  A coordinate infinitesimally beside a half-integer can round to
+    the correct raster pixel in float64 but become an exact tie when serialized
+    as float32.  Move only those visible ties by one float32 ULP so consumers
+    recover the same pixel without changing the high-precision z-buffer.
+    """
+    coordinates = np.asarray(coordinates_xy_px, dtype=np.float64)
+    visible = np.asarray(visibility, dtype=bool)
+    if coordinates.shape[:-1] != visible.shape or coordinates.shape[-1] != 2:
+        raise ValueError("track coordinates and visibility shapes do not match")
+    serialized = coordinates.astype(np.float32)
+    precise_pixels = np.rint(coordinates)
+    serialized_pixels = np.rint(serialized.astype(np.float64))
+    mismatch = visible[..., None] & (precise_pixels != serialized_pixels)
+    if np.any(mismatch):
+        direction = np.where(
+            precise_pixels < serialized_pixels,
+            np.float32(-np.inf),
+            np.float32(np.inf),
+        )
+        serialized[mismatch] = np.nextafter(
+            serialized[mismatch], direction[mismatch]
+        )
+    if not np.array_equal(
+        np.rint(serialized.astype(np.float64))[visible],
+        precise_pixels[visible],
+    ):
+        raise ValueError("float32 track serialization changed a visible raster pixel")
+    return serialized
+
+
 def build_das_track_correspondence(
     payload: dict[str, np.ndarray],
     *,
@@ -1005,7 +1042,9 @@ def rasterize_das_3d_tracks(
         return channels
     selected = np.asarray(frame_indices, dtype=np.int64)
     correspondence = {
-        "track_xy_px": processed_tracks[selected].astype(np.float32, copy=False),
+        "track_xy_px": _serialize_raster_consistent_track_coordinates(
+            processed_tracks[selected], visibility
+        ),
         "track_depth_m": depth[selected].astype(np.float32, copy=False),
         "track_visible": visibility,
         "source_frame_indices": selected,

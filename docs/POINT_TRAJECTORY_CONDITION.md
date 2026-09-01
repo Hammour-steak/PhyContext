@@ -33,9 +33,11 @@ corner-aligned scale.
 After source-array decoding, rasterization geometry stays in float64 through
 projection, resize, and crop, and is converted to integer pixels only at the
 z-buffer; this prevents additional precision loss at a half-pixel rounding
-boundary. Cache schemas v4-v6 record this geometry contract together with
+boundary. Cache schemas v4-v7 record this geometry contract together with
 static-point camera clipping; v5 adds the canonical TI2V first-frame binding,
-and v6 adds exact material-point correspondence targets. Older point maps remain
+v6 adds exact material-point correspondence targets, and v7 preserves each
+float64 visible raster decision when its coordinate is serialized as float32.
+Older point maps remain
 readable for legacy adapters but cannot train the current correspondence path.
 
 `unproject_physweep_tracks` provides the metric-depth inverse of the published
@@ -63,7 +65,7 @@ normalized coordinate color is near zero. Visibility also supplies the latent
 motion envelope used by reconstruction and the coarse center guard; it is not
 a second model condition.
 
-The v6 cache writes a separate loss-only correspondence artifact with
+The v7 cache writes a separate loss-only correspondence artifact with
 `track_xy_px [97,O,2048,2]`, `track_depth_m [97,O,2048]`, and
 `track_visible [97,O,2048]`. The condition map and this artifact are emitted by
 the same projection/z-buffer pass, so their visibility semantics cannot drift.
@@ -91,7 +93,7 @@ fixed shape is `[18, T_latent, H_latent, W_latent]`.
 Old caches and checkpoints are not overwritten. DaS-style caching uses:
 
 ```text
-cache/wan/physweep_training/das_3d_tracks_track4gen_v6_832x480x97/
+cache/wan/physweep_training/das_3d_tracks_track4gen_v7_832x480x97/
 ```
 
 The legacy cache remains under `dense_point_tracks_832x480x97/`.

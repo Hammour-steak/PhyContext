@@ -18,8 +18,8 @@ from cache_contract import (
     CANONICAL_CONDITION_FRAME_PROTOCOL,
     CURRENT_CACHE_SCHEMA,
     GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
+    RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     SUPPORTED_CACHE_SCHEMAS,
-    TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     resolve_cache_artifact_root,
 )
 from point_trajectory import (
@@ -40,6 +40,7 @@ from project_defaults import (
     VIDEO_WIDTH,
 )
 from schema import SWEEP_AXES, iter_jsonl
+from track_correspondence import validate_track_correspondence
 from video_preprocess import cover_center_crop_frames
 
 
@@ -578,6 +579,7 @@ def main() -> None:
         "preprocess_size_px": [args.width, args.height],
         "point_axis": "fixed_object_slot_and_material_point_index",
         "visibility": "same_full_resolution_dynamic_and_static_nearest_depth_z_buffer_as_das_tracks",
+        "coordinate_serialization": "float32_with_float64_visible_raster_pixel_preserved",
         "point_splat_radius_px": 1,
         "cached_tensors": [
             "track_xy_px",
@@ -633,7 +635,8 @@ def main() -> None:
             else:
                 reuse_point_tracks = True
             if (
-                reuse_cache.get("schema") in TRACK_CORRESPONDENCE_CACHE_SCHEMAS
+                reuse_cache.get("schema")
+                in RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS
                 and reuse_cache.get("point_correspondence_preprocess")
                 == point_correspondence_preprocess
             ):
@@ -872,23 +875,20 @@ def main() -> None:
                     raise ValueError(
                         f"unexpected point-correspondence shape for {sample_id}"
                     )
-                atomic_safetensors(
+                correspondence_tensors = validate_track_correspondence(
                     {
-                        "track_xy_px": torch.from_numpy(
-                            correspondence["track_xy_px"]
-                        ),
-                        "track_depth_m": torch.from_numpy(
-                            correspondence["track_depth_m"]
-                        ),
-                        "track_visible": torch.from_numpy(
-                            correspondence["track_visible"]
-                        ),
-                        "source_frame_indices": torch.from_numpy(
-                            correspondence["source_frame_indices"]
-                        ),
+                        key: torch.from_numpy(correspondence[key])
+                        for key in (
+                            "track_xy_px",
+                            "track_depth_m",
+                            "track_visible",
+                            "source_frame_indices",
+                        )
                     },
-                    correspondence_path,
+                    preprocess_size_px=(args.width, args.height),
+                    expected_frames=args.frames,
                 )
+                atomic_safetensors(correspondence_tensors, correspondence_path)
             outputs = []
             if point_path is not None:
                 outputs.append("point-track")

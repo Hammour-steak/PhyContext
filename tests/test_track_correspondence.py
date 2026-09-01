@@ -63,6 +63,14 @@ class TrackCorrespondenceTest(unittest.TestCase):
                 value, preprocess_size_px=(6, 4), expected_frames=9
             )
 
+    def test_contract_rejects_float32_half_tie_beyond_last_pixel(self) -> None:
+        value = synthetic_correspondence()
+        value["track_xy_px"][0, 0, 0, 0] = 5.5
+        with self.assertRaisesRegex(ValueError, "rasterizes outside"):
+            validate_track_correspondence(
+                value, preprocess_size_px=(6, 4), expected_frames=9
+            )
+
     def test_training_rejects_nonconsecutive_source_frames(self) -> None:
         features = torch.randn(8, 3, 4, 6)
         correspondence = synthetic_correspondence()

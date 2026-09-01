@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 
 from point_trajectory import (  # noqa: E402
+    _serialize_raster_consistent_track_coordinates,
     rasterize_das_3d_tracks,
     validate_point_trajectory,
     cover_center_crop_coordinates,
@@ -42,6 +43,44 @@ def point_payload(object_count: int = 1) -> dict[str, np.ndarray]:
 
 
 class DasPointTrajectoryTest(unittest.TestCase):
+    def test_float32_correspondence_preserves_visible_raster_pixel(self) -> None:
+        coordinates = np.asarray(
+            [
+                [
+                    [
+                        [np.nextafter(831.5, -np.inf), 184.4762420654297],
+                        [20.25, np.nextafter(479.5, -np.inf)],
+                    ]
+                ]
+            ],
+            dtype=np.float64,
+        )
+        visible = np.ones(coordinates.shape[:-1], dtype=bool)
+
+        serialized = _serialize_raster_consistent_track_coordinates(
+            coordinates, visible
+        )
+
+        self.assertEqual(serialized.dtype, np.float32)
+        self.assertLess(float(serialized[0, 0, 0, 0]), 831.5)
+        self.assertLess(float(serialized[0, 0, 1, 1]), 479.5)
+        np.testing.assert_array_equal(
+            np.rint(serialized.astype(np.float64)),
+            np.rint(coordinates),
+        )
+
+    def test_invisible_coordinates_are_not_semantically_adjusted(self) -> None:
+        coordinates = np.asarray(
+            [[[[np.nextafter(831.5, -np.inf), 2.0]]]], dtype=np.float64
+        )
+        visible = np.zeros(coordinates.shape[:-1], dtype=bool)
+
+        serialized = _serialize_raster_consistent_track_coordinates(
+            coordinates, visible
+        )
+
+        self.assertEqual(float(serialized[0, 0, 0, 0]), 831.5)
+
     def test_physweep_projection_round_trips_through_metric_depth(self) -> None:
         intrinsics = np.asarray(
             [[600.0, 0.0, 640.0], [0.0, 600.0, 360.0], [0.0, 0.0, 1.0]],

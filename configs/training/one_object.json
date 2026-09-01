@@ -1,7 +1,7 @@
 {
   "schema_version": "phycontext_training_run_v1",
   "dataset_manifest": "datasets/physweep_training/manifest.jsonl",
-  "cache_manifest": "cache/wan/physweep_training/das_3d_tracks_track4gen_v6_832x480x97/manifest.json",
+  "cache_manifest": "cache/wan/physweep_training/das_3d_tracks_track4gen_v7_832x480x97/manifest.json",
   "wan_repo": "external/Wan2.2",
   "checkpoint": "checkpoints/Wan2.2-TI2V-5B",
   "output_root": "outputs/training/formal",

@@ -177,7 +177,7 @@ def main() -> None:
             "spatial_transform": "cover_then_center_crop_to_preprocess_size",
             "pixel_center_convention": "opencv_half_pixel",
             "geometry_compute_dtype": GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA[
-                CURRENT_CACHE_SCHEMA
+                cache_schema
             ],
             "preprocess_size_px": [
                 int(cache["preprocess"]["width"]),
@@ -219,6 +219,10 @@ def main() -> None:
             "source_frame_indices",
         ],
     }
+    if cache_schema == CURRENT_CACHE_SCHEMA:
+        expected_correspondence_preprocess["coordinate_serialization"] = (
+            "float32_with_float64_visible_raster_pixel_preserved"
+        )
     if cache_schema in TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
         if cache.get("point_correspondence_preprocess") != (
             expected_correspondence_preprocess
