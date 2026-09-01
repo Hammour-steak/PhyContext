@@ -23,8 +23,8 @@ from torch.nn.parallel import DistributedDataParallel
 
 from cache_contract import (
     CANONICAL_CONDITION_FRAME_PROTOCOL,
+    CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     CURRENT_CACHE_SCHEMA,
-    RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     resolve_cache_artifact_root,
     resolve_cache_dataset_root,
     validate_cache_artifact,
@@ -1901,7 +1901,7 @@ def main() -> None:
             )
         if (
             cache.get("schema")
-            not in RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS
+            not in CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS
         ):
             raise ValueError(
                 "Track4Gen training requires the current exact-correspondence "

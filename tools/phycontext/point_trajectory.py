@@ -860,7 +860,7 @@ def build_das_track_correspondence(
     static_points_camera0_m: np.ndarray | None = None,
     point_radius_px: int = 1,
 ) -> dict[str, np.ndarray]:
-    """Preserve exact point identities and global z-buffer visibility for loss use."""
+    """Preserve point identities visible at their own projected center pixels."""
     object_count = int(np.asarray(payload["tracks_xy_px"]).shape[1])
     _, correspondence = rasterize_das_3d_tracks(
         payload,
@@ -893,8 +893,11 @@ def rasterize_das_3d_tracks(
     Each object slot contributes ``R, G, B, visibility``. RGB is determined once
     from the point's first-frame camera coordinate ``(x, y, 1/z)``. At every
     selected frame all objects and optional static scene points compete in a
-    full-preprocess-resolution z-buffer. Visible dynamic points are aggregated
-    onto the requested output grid only after visibility has been resolved.
+    full-preprocess-resolution z-buffer. Visible dynamic splats are aggregated
+    onto the requested output grid only after visibility has been resolved. A
+    correspondence point is visible only when that same material point wins the
+    z-buffer at its own projected center pixel; winning only a neighboring splat
+    pixel is insufficient for sampling a feature at the center coordinate.
     """
     validate_point_trajectory(payload)
     if max_objects <= 0 or max_objects > MAX_OBJECTS:
@@ -1004,9 +1007,20 @@ def rasterize_das_3d_tracks(
                 ),
             )
         )
-        visibility[output_index, visible_objects, visible_points] = True
         if not len(visible_x):
             continue
+        center_x = np.rint(
+            current_xy[visible_objects, visible_points, 0]
+        ).astype(np.int64)
+        center_y = np.rint(
+            current_xy[visible_objects, visible_points, 1]
+        ).astype(np.int64)
+        center_winners = (visible_x == center_x) & (visible_y == center_y)
+        visibility[
+            output_index,
+            visible_objects[center_winners],
+            visible_points[center_winners],
+        ] = True
         cell_x = np.floor(
             (visible_x.astype(np.float64) + 0.5) * output_width / preprocess_width
         ).astype(np.int64)

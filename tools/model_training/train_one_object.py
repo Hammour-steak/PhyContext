@@ -19,8 +19,8 @@ if str(PHYCONTEXT_TOOLS) not in sys.path:
     sys.path.insert(0, str(PHYCONTEXT_TOOLS))
 
 from cache_contract import (  # noqa: E402
+    CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     CURRENT_CACHE_SCHEMA,
-    RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     resolve_cache_dataset_root,
     validate_cache_source_manifest,
 )
@@ -99,7 +99,7 @@ def preflight(root: Path, config: dict[str, Any]) -> tuple[Path, Path]:
             )
         if (
             cache.get("schema")
-            not in RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS
+            not in CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS
         ):
             raise ValueError(
                 "Track4Gen correspondence training requires the current cache "

@@ -33,10 +33,13 @@ corner-aligned scale.
 After source-array decoding, rasterization geometry stays in float64 through
 projection, resize, and crop, and is converted to integer pixels only at the
 z-buffer; this prevents additional precision loss at a half-pixel rounding
-boundary. Cache schemas v4-v7 record this geometry contract together with
+boundary. Cache schemas v4-v8 record this geometry contract together with
 static-point camera clipping; v5 adds the canonical TI2V first-frame binding,
 v6 adds exact material-point correspondence targets, and v7 preserves each
 float64 visible raster decision when its coordinate is serialized as float32.
+Version 8 requires a correspondence point to win the shared z-buffer at its
+own projected center pixel instead of treating any visible neighboring splat
+pixel as evidence that the center coordinate is visible.
 Older point maps remain
 readable for legacy adapters but cannot train the current correspondence path.
 
@@ -65,10 +68,14 @@ normalized coordinate color is near zero. Visibility also supplies the latent
 motion envelope used by reconstruction and the coarse center guard; it is not
 a second model condition.
 
-The v7 cache writes a separate loss-only correspondence artifact with
+The v8 cache writes a separate loss-only correspondence artifact with
 `track_xy_px [97,O,2048,2]`, `track_depth_m [97,O,2048]`, and
 `track_visible [97,O,2048]`. The condition map and this artifact are emitted by
-the same projection/z-buffer pass, so their visibility semantics cannot drift.
+the same projection/z-buffer pass. The condition map keeps every winning pixel
+from each 3 x 3 splat, while correspondence visibility is true only when the
+same material point wins at its own projected center pixel. This prevents a
+point that is visible only on a neighboring splat edge from supervising a
+different feature at its center coordinate.
 Unlike the many-to-one 30 x 52 RGB condition, the loss artifact retains the
 exact object slot and material-point index. A first-frame feature query retrieves
 the same point from the global intermediate-Wan feature map for each swept
@@ -93,7 +100,7 @@ fixed shape is `[18, T_latent, H_latent, W_latent]`.
 Old caches and checkpoints are not overwritten. DaS-style caching uses:
 
 ```text
-cache/wan/physweep_training/das_3d_tracks_track4gen_v7_832x480x97/
+cache/wan/physweep_training/das_3d_tracks_track4gen_v8_center_visibility_832x480x97/
 ```
 
 The legacy cache remains under `dense_point_tracks_832x480x97/`.

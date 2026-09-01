@@ -16,9 +16,9 @@ from safetensors.torch import save_file
 
 from cache_contract import (
     CANONICAL_CONDITION_FRAME_PROTOCOL,
+    CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     CURRENT_CACHE_SCHEMA,
     GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
-    RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     SUPPORTED_CACHE_SCHEMAS,
     resolve_cache_artifact_root,
 )
@@ -578,9 +578,10 @@ def main() -> None:
         "spatial_transform": "cover_then_center_crop_to_preprocess_size",
         "preprocess_size_px": [args.width, args.height],
         "point_axis": "fixed_object_slot_and_material_point_index",
-        "visibility": "same_full_resolution_dynamic_and_static_nearest_depth_z_buffer_as_das_tracks",
+        "visibility": "projected_center_pixel_winner_in_shared_full_resolution_dynamic_and_static_nearest_depth_z_buffer",
         "coordinate_serialization": "float32_with_float64_visible_raster_pixel_preserved",
         "point_splat_radius_px": 1,
+        "visibility_query": "projected_material_point_center_pixel",
         "cached_tensors": [
             "track_xy_px",
             "track_depth_m",
@@ -636,7 +637,7 @@ def main() -> None:
                 reuse_point_tracks = True
             if (
                 reuse_cache.get("schema")
-                in RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS
+                in CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS
                 and reuse_cache.get("point_correspondence_preprocess")
                 == point_correspondence_preprocess
             ):
@@ -812,27 +813,45 @@ def main() -> None:
                     static_points_camera0_m = scene_archive[
                         "environment_xyz_camera_m"
                     ].astype(np.float32)
+            point_path = point_track_targets.get(sample_id)
+            correspondence_path = track_correspondence_targets.get(sample_id)
+            point_track_map = None
+            correspondence = None
             if args.trajectory_representation == "das_3d_tracks":
-                point_track_map, correspondence = rasterize_das_3d_tracks(
-                    point_payload,
-                    (expected_latent_shape[3], expected_latent_shape[2]),
-                    preprocess_size_px=(args.width, args.height),
-                    frame_indices=frame_indices,
-                    max_objects=3,
-                    static_points_camera0_m=static_points_camera0_m,
-                    point_radius_px=1,
-                    return_correspondence=True,
-                )
+                if point_path is not None:
+                    rendered = rasterize_das_3d_tracks(
+                        point_payload,
+                        (expected_latent_shape[3], expected_latent_shape[2]),
+                        preprocess_size_px=(args.width, args.height),
+                        frame_indices=frame_indices,
+                        max_objects=3,
+                        static_points_camera0_m=static_points_camera0_m,
+                        point_radius_px=1,
+                        return_correspondence=correspondence_path is not None,
+                    )
+                    if correspondence_path is None:
+                        point_track_map = rendered
+                    else:
+                        point_track_map, correspondence = rendered
+                elif correspondence_path is not None:
+                    correspondence = build_das_track_correspondence(
+                        point_payload,
+                        preprocess_size_px=(args.width, args.height),
+                        frame_indices=frame_indices,
+                        static_points_camera0_m=static_points_camera0_m,
+                        point_radius_px=1,
+                    )
             else:
-                point_track_map = rasterize_projected_tracks(
-                    point_payload,
-                    (expected_latent_shape[3], expected_latent_shape[2]),
-                    preprocess_size_px=(args.width, args.height),
-                    frame_indices=frame_indices,
-                    max_objects=3,
-                )
-                correspondence = (
-                    build_das_track_correspondence(
+                if point_path is not None:
+                    point_track_map = rasterize_projected_tracks(
+                        point_payload,
+                        (expected_latent_shape[3], expected_latent_shape[2]),
+                        preprocess_size_px=(args.width, args.height),
+                        frame_indices=frame_indices,
+                        max_objects=3,
+                    )
+                if correspondence_path is not None:
+                    correspondence = build_das_track_correspondence(
                         point_payload,
                         preprocess_size_px=(args.width, args.height),
                         frame_indices=trajectory_frame_indices(
@@ -844,21 +863,22 @@ def main() -> None:
                         static_points_camera0_m=static_points_camera0_m,
                         point_radius_px=1,
                     )
-                    if sample_id in track_correspondence_targets
-                    else None
-                )
-            if tuple(point_track_map.shape) != expected_point_shape:
-                raise ValueError(
-                    f"unexpected point-track shape for {record['sample_id']}: "
-                    f"{tuple(point_track_map.shape)} != {expected_point_shape}"
-                )
-            point_path = point_track_targets.get(sample_id)
             if point_path is not None:
+                if (
+                    point_track_map is None
+                    or tuple(point_track_map.shape) != expected_point_shape
+                ):
+                    actual_shape = (
+                        None if point_track_map is None else tuple(point_track_map.shape)
+                    )
+                    raise ValueError(
+                        f"unexpected point-track shape for {record['sample_id']}: "
+                        f"{actual_shape} != {expected_point_shape}"
+                    )
                 atomic_safetensors(
                     {"point_track_map": torch.from_numpy(point_track_map)},
                     point_path,
                 )
-            correspondence_path = track_correspondence_targets.get(sample_id)
             if correspondence_path is not None:
                 object_count = int(source["object_count"])
                 expected_geometry_shape = (args.frames, object_count, 2048)

@@ -11,10 +11,12 @@ from schema import iter_jsonl, validate_training_record
 from project_defaults import CACHE_MANIFEST
 from cache_contract import (
     CANONICAL_CONDITION_FRAME_PROTOCOL,
-    CURRENT_CACHE_SCHEMA,
+    CANONICAL_CONDITION_FRAME_CACHE_SCHEMAS,
+    CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     FLOAT64_GEOMETRY_CACHE_SCHEMAS,
     FULL_RATE_DAS_CACHE_SCHEMAS,
     GEOMETRY_COMPUTE_DTYPE_BY_SCHEMA,
+    RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
     SOURCE_FILE_HASH_CACHE_SCHEMAS,
     SUPPORTED_CACHE_SCHEMAS,
     TRACK_CORRESPONDENCE_CACHE_SCHEMAS,
@@ -66,7 +68,7 @@ def main() -> None:
     artifact_root = resolve_cache_artifact_root(root, cache)
     errors = []
     if (
-        cache_schema == CURRENT_CACHE_SCHEMA
+        cache_schema in CANONICAL_CONDITION_FRAME_CACHE_SCHEMAS
         and cache.get("preprocess", {}).get("condition_frame")
         != CANONICAL_CONDITION_FRAME_PROTOCOL
     ):
@@ -219,7 +221,14 @@ def main() -> None:
             "source_frame_indices",
         ],
     }
-    if cache_schema == CURRENT_CACHE_SCHEMA:
+    if cache_schema in CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
+        expected_correspondence_preprocess.update(
+            {
+                "visibility": "projected_center_pixel_winner_in_shared_full_resolution_dynamic_and_static_nearest_depth_z_buffer",
+                "visibility_query": "projected_material_point_center_pixel",
+            }
+        )
+    if cache_schema in RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
         expected_correspondence_preprocess["coordinate_serialization"] = (
             "float32_with_float64_visible_raster_pixel_preserved"
         )
@@ -287,7 +296,7 @@ def main() -> None:
                 )
             if latent.dtype != torch.bfloat16 or not torch.isfinite(latent.float()).all():
                 errors.append(f"invalid latent values: {sample_id}")
-        if cache_schema == CURRENT_CACHE_SCHEMA:
+        if cache_schema in CANONICAL_CONDITION_FRAME_CACHE_SCHEMAS:
             latent_descriptor = item.get("latent", {})
             if (
                 latent_descriptor.get("condition_frame_protocol")

@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 
 from point_trajectory import (  # noqa: E402
     _serialize_raster_consistent_track_coordinates,
+    build_das_track_correspondence,
     rasterize_das_3d_tracks,
     validate_point_trajectory,
     cover_center_crop_coordinates,
@@ -357,6 +358,38 @@ class DasPointTrajectoryTest(unittest.TestCase):
         self.assertTrue(bool(correspondence["track_visible"][:, 1, 0].all()))
         self.assertEqual(float(rendered[3].sum()), 0.0)
         self.assertGreater(float(rendered[7].sum()), 0.0)
+
+    def test_correspondence_requires_winning_the_projected_center_pixel(self) -> None:
+        payload = point_payload(object_count=2)
+        payload["initial_points_camera_m"][0, 0] = (-1.0, 0.0, 3.0)
+        payload["initial_points_camera_m"][1, 0] = (1.0, 0.0, 1.0)
+        payload["points_camera_m"][:, 0, 0] = (-1.0, 0.0, 3.0)
+        payload["points_camera_m"][:, 1, 0] = (1.0, 0.0, 1.0)
+        payload["depth_m"][:, 0, 0] = 3.0
+        payload["depth_m"][:, 1, 0] = 1.0
+        payload["valid"][:, :, 0] = True
+        payload["tracks_xy_px"][:, 0, 0] = (4.0, 4.0)
+        payload["tracks_xy_px"][:, 1, 0] = (4.0, 3.0)
+
+        rendered, correspondence = rasterize_das_3d_tracks(
+            payload,
+            (8, 8),
+            preprocess_size_px=(8, 8),
+            return_correspondence=True,
+        )
+        built = build_das_track_correspondence(
+            payload,
+            preprocess_size_px=(8, 8),
+        )
+
+        # The far point still wins peripheral pixels of its 3x3 control splat,
+        # but the near point's splat wins at the far point's projected center.
+        self.assertGreater(float(rendered[3].sum()), 0.0)
+        self.assertFalse(bool(correspondence["track_visible"][:, 0, 0].any()))
+        self.assertTrue(bool(correspondence["track_visible"][:, 1, 0].all()))
+        np.testing.assert_array_equal(
+            built["track_visible"], correspondence["track_visible"]
+        )
 
     def test_full_resolution_visibility_does_not_merge_distinct_pixels(self) -> None:
         payload = point_payload(object_count=2)
