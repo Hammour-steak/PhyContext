@@ -858,9 +858,9 @@ def build_das_track_correspondence(
     frame_indices: list[int] | None = None,
     spatial_transform: str = "cover_center_crop",
     static_points_camera0_m: np.ndarray | None = None,
-    point_radius_px: int = 1,
+    point_radius_px: int = 0,
 ) -> dict[str, np.ndarray]:
-    """Preserve point identities visible at their own projected center pixels."""
+    """Preserve point identities visible in the point-center z-buffer."""
     object_count = int(np.asarray(payload["tracks_xy_px"]).shape[1])
     _, correspondence = rasterize_das_3d_tracks(
         payload,
@@ -871,6 +871,7 @@ def build_das_track_correspondence(
         spatial_transform=spatial_transform,
         static_points_camera0_m=static_points_camera0_m,
         point_radius_px=point_radius_px,
+        correspondence_point_radius_px=point_radius_px,
         return_correspondence=True,
     )
     return correspondence
@@ -886,6 +887,7 @@ def rasterize_das_3d_tracks(
     spatial_transform: str = "cover_center_crop",
     static_points_camera0_m: np.ndarray | None = None,
     point_radius_px: int = 1,
+    correspondence_point_radius_px: int = 0,
     return_correspondence: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Render DaS-style identity-preserving 3D tracking maps for Wan.
@@ -894,10 +896,10 @@ def rasterize_das_3d_tracks(
     from the point's first-frame camera coordinate ``(x, y, 1/z)``. At every
     selected frame all objects and optional static scene points compete in a
     full-preprocess-resolution z-buffer. Visible dynamic splats are aggregated
-    onto the requested output grid only after visibility has been resolved. A
-    correspondence point is visible only when that same material point wins the
-    z-buffer at its own projected center pixel; winning only a neighboring splat
-    pixel is insufficient for sampling a feature at the center coordinate.
+    onto the requested output grid only after visibility has been resolved.
+    Loss-only correspondence uses a separate point-center z-buffer by default:
+    control-map splat dilation must neither hide an adjacent material point nor
+    mark a point visible only because one neighboring splat pixel survived.
     """
     validate_point_trajectory(payload)
     if max_objects <= 0 or max_objects > MAX_OBJECTS:
@@ -908,6 +910,8 @@ def rasterize_das_3d_tracks(
     preprocess_width, preprocess_height = [int(value) for value in preprocess_size_px]
     if min(preprocess_width, preprocess_height) <= 0:
         raise ValueError("preprocess size must be positive")
+    if correspondence_point_radius_px < 0:
+        raise ValueError("correspondence point radius must be non-negative")
     if spatial_transform not in {"cover_center_crop", "source_image"}:
         raise ValueError(
             "spatial transform must be cover_center_crop or source_image"
@@ -1007,20 +1011,47 @@ def rasterize_das_3d_tracks(
                 ),
             )
         )
+        if return_correspondence:
+            if correspondence_point_radius_px == point_radius_px:
+                correspondence_objects = visible_objects
+                correspondence_points = visible_points
+            else:
+                (
+                    _,
+                    _,
+                    correspondence_objects,
+                    correspondence_points,
+                ) = _resolve_das_visible_splats(
+                    current_xy,
+                    current_depth,
+                    current_valid,
+                    preprocess_size_px=(preprocess_width, preprocess_height),
+                    object_indices=object_indices,
+                    point_indices=point_indices,
+                    point_radius_px=correspondence_point_radius_px,
+                    static_xy=(
+                        static_tracks[frame_index]
+                        if static_tracks is not None
+                        else None
+                    ),
+                    static_depth=(
+                        static_depth[frame_index]
+                        if static_depth is not None
+                        else None
+                    ),
+                    static_valid=(
+                        static_valid[frame_index]
+                        if static_valid is not None
+                        else None
+                    ),
+                )
+            visibility[
+                output_index,
+                correspondence_objects,
+                correspondence_points,
+            ] = True
         if not len(visible_x):
             continue
-        center_x = np.rint(
-            current_xy[visible_objects, visible_points, 0]
-        ).astype(np.int64)
-        center_y = np.rint(
-            current_xy[visible_objects, visible_points, 1]
-        ).astype(np.int64)
-        center_winners = (visible_x == center_x) & (visible_y == center_y)
-        visibility[
-            output_index,
-            visible_objects[center_winners],
-            visible_points[center_winners],
-        ] = True
         cell_x = np.floor(
             (visible_x.astype(np.float64) + 0.5) * output_width / preprocess_width
         ).astype(np.int64)

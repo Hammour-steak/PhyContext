@@ -37,9 +37,10 @@ boundary. Cache schemas v4-v8 record this geometry contract together with
 static-point camera clipping; v5 adds the canonical TI2V first-frame binding,
 v6 adds exact material-point correspondence targets, and v7 preserves each
 float64 visible raster decision when its coordinate is serialized as float32.
-Version 8 requires a correspondence point to win the shared z-buffer at its
-own projected center pixel instead of treating any visible neighboring splat
-pixel as evidence that the center coordinate is visible.
+Version 8 gives loss-only correspondence a separate zero-radius point-center
+z-buffer. This avoids treating a visible neighboring splat pixel as evidence
+that the point center is visible, while also preventing 3 x 3 control-map
+dilation from falsely hiding an adjacent material point.
 Older point maps remain
 readable for legacy adapters but cannot train the current correspondence path.
 
@@ -71,11 +72,11 @@ a second model condition.
 The v8 cache writes a separate loss-only correspondence artifact with
 `track_xy_px [97,O,2048,2]`, `track_depth_m [97,O,2048]`, and
 `track_visible [97,O,2048]`. The condition map and this artifact are emitted by
-the same projection/z-buffer pass. The condition map keeps every winning pixel
-from each 3 x 3 splat, while correspondence visibility is true only when the
-same material point wins at its own projected center pixel. This prevents a
-point that is visible only on a neighboring splat edge from supervising a
-different feature at its center coordinate.
+the same float64 projection geometry. The condition map uses 3 x 3 splats for
+coverage, while correspondence uses zero-radius dynamic/static point centers.
+Thus splat dilation cannot create or suppress an exact material-point feature
+pair. Points that project to the same pixel still compete by metric depth in a
+global z-buffer across all object slots and the static scene.
 Unlike the many-to-one 30 x 52 RGB condition, the loss artifact retains the
 exact object slot and material-point index. A first-frame feature query retrieves
 the same point from the global intermediate-Wan feature map for each swept

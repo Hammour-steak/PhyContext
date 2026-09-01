@@ -62,10 +62,11 @@ The maintained objective combines flow matching, controlled-region
 reconstruction, paired physical-response separation, LPIPS, a low-weight clean
 latent object-center guard, and feature correspondence. The correspondence
 cache preserves exact object/point axes, projected pixels, metric depth, and
-center-pixel winners from the shared dynamic/static z-buffer for all 97 frames.
-Winning only a neighboring control-map splat pixel does not mark the point's
-center coordinate visible. Wan latent zero is
-the condition frame; latent `k >= 1` maps to source frames `4k-3 .. 4k`. Each
+winners from a separate dynamic/static point-center z-buffer for all 97 frames.
+The control map keeps its 3 x 3 coverage splats, but their dilation neither hides
+an adjacent material point nor makes a point visible for correspondence. Wan
+latent zero is the condition frame; latent `k >= 1` maps to source frames
+`4k-3 .. 4k`. Each
 target is therefore a visibility-weighted swept heatmap of the same material
 point over those four RGB frames. Candidate queries are balanced across slow,
 medium, and fast feature-grid displacement.

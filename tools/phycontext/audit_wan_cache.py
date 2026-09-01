@@ -224,7 +224,8 @@ def main() -> None:
     if cache_schema in CENTER_PIXEL_TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
         expected_correspondence_preprocess.update(
             {
-                "visibility": "projected_center_pixel_winner_in_shared_full_resolution_dynamic_and_static_nearest_depth_z_buffer",
+                "visibility": "projected_center_pixel_winner_in_full_resolution_dynamic_and_static_point_center_z_buffer",
+                "point_splat_radius_px": 0,
                 "visibility_query": "projected_material_point_center_pixel",
             }
         )

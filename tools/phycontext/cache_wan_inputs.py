@@ -578,9 +578,9 @@ def main() -> None:
         "spatial_transform": "cover_then_center_crop_to_preprocess_size",
         "preprocess_size_px": [args.width, args.height],
         "point_axis": "fixed_object_slot_and_material_point_index",
-        "visibility": "projected_center_pixel_winner_in_shared_full_resolution_dynamic_and_static_nearest_depth_z_buffer",
+        "visibility": "projected_center_pixel_winner_in_full_resolution_dynamic_and_static_point_center_z_buffer",
         "coordinate_serialization": "float32_with_float64_visible_raster_pixel_preserved",
-        "point_splat_radius_px": 1,
+        "point_splat_radius_px": 0,
         "visibility_query": "projected_material_point_center_pixel",
         "cached_tensors": [
             "track_xy_px",
@@ -839,7 +839,7 @@ def main() -> None:
                         preprocess_size_px=(args.width, args.height),
                         frame_indices=frame_indices,
                         static_points_camera0_m=static_points_camera0_m,
-                        point_radius_px=1,
+                        point_radius_px=0,
                     )
             else:
                 if point_path is not None:
@@ -861,7 +861,7 @@ def main() -> None:
                             expected_latent_shape[1],
                         ),
                         static_points_camera0_m=static_points_camera0_m,
-                        point_radius_px=1,
+                        point_radius_px=0,
                     )
             if point_path is not None:
                 if (

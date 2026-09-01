@@ -336,7 +336,7 @@ class DasPointTrajectoryTest(unittest.TestCase):
         self.assertEqual(float(rendered[3, :, 4, 4].sum()), 0.0)
         self.assertEqual(rendered[7, :, 4, 4].tolist(), [1.0, 1.0])
 
-    def test_condition_map_and_correspondence_share_one_zbuffer(self) -> None:
+    def test_condition_and_correspondence_agree_on_same_pixel_depth(self) -> None:
         payload = point_payload(object_count=2)
         payload["initial_points_camera_m"][0, 0] = (-1.0, 0.0, 3.0)
         payload["initial_points_camera_m"][1, 0] = (1.0, 0.0, 1.0)
@@ -359,7 +359,7 @@ class DasPointTrajectoryTest(unittest.TestCase):
         self.assertEqual(float(rendered[3].sum()), 0.0)
         self.assertGreater(float(rendered[7].sum()), 0.0)
 
-    def test_correspondence_requires_winning_the_projected_center_pixel(self) -> None:
+    def test_control_splat_does_not_hide_adjacent_correspondence(self) -> None:
         payload = point_payload(object_count=2)
         payload["initial_points_camera_m"][0, 0] = (-1.0, 0.0, 3.0)
         payload["initial_points_camera_m"][1, 0] = (1.0, 0.0, 1.0)
@@ -382,10 +382,12 @@ class DasPointTrajectoryTest(unittest.TestCase):
             preprocess_size_px=(8, 8),
         )
 
-        # The far point still wins peripheral pixels of its 3x3 control splat,
-        # but the near point's splat wins at the far point's projected center.
+        # The near point's 3x3 splat wins at the far point's adjacent center in
+        # the coverage map, but the zero-radius correspondence z-buffer keeps
+        # both material points because they occupy distinct projected pixels.
         self.assertGreater(float(rendered[3].sum()), 0.0)
-        self.assertFalse(bool(correspondence["track_visible"][:, 0, 0].any()))
+        self.assertEqual(float(rendered[3, :, 4, 4].sum()), 0.0)
+        self.assertTrue(bool(correspondence["track_visible"][:, 0, 0].all()))
         self.assertTrue(bool(correspondence["track_visible"][:, 1, 0].all()))
         np.testing.assert_array_equal(
             built["track_visible"], correspondence["track_visible"]
@@ -419,14 +421,35 @@ class DasPointTrajectoryTest(unittest.TestCase):
         payload["valid"][:, 0, 0] = True
         payload["tracks_xy_px"][:, 0, 0] = (4.0, 4.0)
 
-        rendered = rasterize_das_3d_tracks(
+        rendered, correspondence = rasterize_das_3d_tracks(
             payload,
             (8, 8),
             preprocess_size_px=(8, 8),
             static_points_camera0_m=np.asarray([[4.0, -4.0, 1.0]], np.float32),
+            return_correspondence=True,
         )
 
         self.assertEqual(float(rendered[3].sum()), 0.0)
+        self.assertFalse(bool(correspondence["track_visible"][:, 0, 0].any()))
+
+    def test_static_control_splat_does_not_hide_adjacent_correspondence(self) -> None:
+        payload = point_payload()
+        payload["initial_points_camera_m"][0, 0] = (8.0, 8.0, 2.0)
+        payload["points_camera_m"][:, 0, 0] = (8.0, 8.0, 2.0)
+        payload["depth_m"][:, 0, 0] = 2.0
+        payload["valid"][:, 0, 0] = True
+        payload["tracks_xy_px"][:, 0, 0] = (4.0, 4.0)
+
+        rendered, correspondence = rasterize_das_3d_tracks(
+            payload,
+            (8, 8),
+            preprocess_size_px=(8, 8),
+            static_points_camera0_m=np.asarray([[4.0, -3.0, 1.0]], np.float32),
+            return_correspondence=True,
+        )
+
+        self.assertEqual(float(rendered[3, :, 4, 4].sum()), 0.0)
+        self.assertTrue(bool(correspondence["track_visible"][:, 0, 0].all()))
 
     def test_static_scene_points_respect_camera_clip_range(self) -> None:
         payload = point_payload()
