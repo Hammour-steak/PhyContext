@@ -76,8 +76,10 @@ a second model condition.
 The v9 cache writes a separate loss-only correspondence artifact with
 `track_xy_px [97,O,2048,2]`, `track_depth_m [97,O,2048]`, and
 `track_visible [97,O,2048]`, plus `background_track_xy_px [97,S,2]`, depth,
-and visibility for `1 <= S <= 256`. The condition map and this artifact are emitted by
-the same float64 projection geometry. The condition map uses 3 x 3 splats for
+and visibility for `1 <= S <= 256`. `background_point_indices [S]` binds those
+trajectories back to the immutable scene-condition point cloud. The condition
+map and this artifact are emitted by the same float64 projection geometry. The
+condition map uses 3 x 3 splats for
 coverage, while correspondence uses zero-radius dynamic/static point centers.
 Thus splat dilation cannot create or suppress an exact material-point feature
 pair. Points that project to the same pixel still compete by metric depth in a

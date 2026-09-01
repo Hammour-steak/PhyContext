@@ -243,6 +243,7 @@ def main() -> None:
             "background_track_xy_px",
             "background_track_depth_m",
             "background_track_visible",
+            "background_point_indices",
         ]
     if cache_schema in RASTER_STABLE_TRACK_CORRESPONDENCE_CACHE_SCHEMAS:
         expected_correspondence_preprocess["coordinate_serialization"] = (
@@ -485,6 +486,11 @@ def main() -> None:
                             "background_visible_shape",
                             "background_visible_dtype",
                             "bool",
+                        ),
+                        "background_point_indices": (
+                            "background_point_indices_shape",
+                            "background_point_indices_dtype",
+                            "int64",
                         ),
                         "source_frame_indices": (
                             "source_frame_indices_shape",

@@ -37,6 +37,7 @@ def synthetic_correspondence() -> dict[str, torch.Tensor]:
         "background_track_xy_px": background_xy,
         "background_track_depth_m": background_depth,
         "background_track_visible": background_visible,
+        "background_point_indices": torch.arange(2),
         "source_frame_indices": torch.arange(frames),
     }
 
@@ -58,6 +59,12 @@ class TrackCorrespondenceTest(unittest.TestCase):
             validate_track_correspondence(
                 value, preprocess_size_px=(6, 4), expected_frames=9
             )
+
+    def test_contract_rejects_duplicate_background_identities(self) -> None:
+        value = synthetic_correspondence()
+        value["background_point_indices"][1] = 0
+        with self.assertRaisesRegex(ValueError, "unique"):
+            validate_track_correspondence(value)
 
     def test_contract_accepts_subpixel_centers_on_boundary_pixels(self) -> None:
         value = synthetic_correspondence()

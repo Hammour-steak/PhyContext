@@ -1172,6 +1172,9 @@ def rasterize_das_3d_tracks(
                 "background_track_visible": np.ascontiguousarray(
                     background_visibility
                 ),
+                "background_point_indices": np.ascontiguousarray(
+                    background_indices
+                ),
             }
         )
     return channels, correspondence

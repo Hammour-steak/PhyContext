@@ -608,6 +608,7 @@ def main() -> None:
             "background_track_xy_px",
             "background_track_depth_m",
             "background_track_visible",
+            "background_point_indices",
             "source_frame_indices",
         ],
     }
@@ -921,6 +922,8 @@ def main() -> None:
                     != tuple(correspondence["background_track_xy_px"].shape[:-1])
                     or tuple(correspondence["background_track_visible"].shape)
                     != tuple(correspondence["background_track_xy_px"].shape[:-1])
+                    or tuple(correspondence["background_point_indices"].shape)
+                    != (correspondence["background_track_xy_px"].shape[1],)
                 ):
                     raise ValueError(
                         f"unexpected point-correspondence shape for {sample_id}"
@@ -1119,6 +1122,7 @@ def main() -> None:
                 "background_xy_shape": background_shape,
                 "background_depth_shape": background_shape[:-1],
                 "background_visible_shape": background_shape[:-1],
+                "background_point_indices_shape": background_shape[1:2],
                 "source_frame_indices_shape": [args.frames],
                 "xy_dtype": "float32",
                 "depth_dtype": "float32",
@@ -1126,6 +1130,7 @@ def main() -> None:
                 "background_xy_dtype": "float32",
                 "background_depth_dtype": "float32",
                 "background_visible_dtype": "bool",
+                "background_point_indices_dtype": "int64",
                 "source_frame_indices_dtype": "int64",
                 "object_count": object_count,
                 "object_ids": source["object_ids"],

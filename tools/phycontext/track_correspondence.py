@@ -38,6 +38,7 @@ def validate_track_correspondence(
         "background_track_xy_px",
         "background_track_depth_m",
         "background_track_visible",
+        "background_point_indices",
     }
     if require_background:
         required.update(background_keys)
@@ -47,6 +48,7 @@ def validate_track_correspondence(
     xy = value["track_xy_px"]
     depth = value["track_depth_m"]
     visible = value["track_visible"]
+    source_frames = value["source_frame_indices"]
     present_background_keys = background_keys & set(value)
     if present_background_keys and present_background_keys != background_keys:
         raise ValueError("background track tensors are incomplete")
@@ -61,7 +63,10 @@ def validate_track_correspondence(
         "background_track_visible",
         visible.new_empty((visible.shape[0], 0)),
     )
-    source_frames = value["source_frame_indices"]
+    background_indices = value.get(
+        "background_point_indices",
+        source_frames.new_empty((0,)),
+    )
     if xy.ndim != 4 or xy.shape[-1] != 2:
         raise ValueError("track_xy_px must have shape F x O x P x 2")
     if depth.shape != xy.shape[:-1] or visible.shape != depth.shape:
@@ -80,6 +85,15 @@ def validate_track_correspondence(
         raise ValueError("track correspondence must contain 1-256 background points")
     if has_background and not bool(background_visible[0].all()):
         raise ValueError("every cached background query must be visible in frame zero")
+    if background_indices.ndim != 1 or background_indices.shape[0] != background_xy.shape[1]:
+        raise ValueError("background point indices must match the background point axis")
+    if background_indices.dtype != torch.int64:
+        raise ValueError("background point indices must be int64")
+    if has_background and (
+        bool((background_indices < 0).any())
+        or len(torch.unique(background_indices)) != len(background_indices)
+    ):
+        raise ValueError("background point indices must be unique and nonnegative")
     if xy.dtype != torch.float32 or depth.dtype != torch.float32 or background_xy.dtype != torch.float32 or background_depth.dtype != torch.float32:
         raise ValueError("track coordinates and depth must be float32")
     if visible.dtype != torch.bool or background_visible.dtype != torch.bool:
