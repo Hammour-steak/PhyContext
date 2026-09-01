@@ -927,7 +927,7 @@ def main() -> None:
                     )
                 correspondence_tensors = validate_track_correspondence(
                     {
-                        key: torch.from_numpy(correspondence[key])
+                        key: torch.from_numpy(correspondence[key]).contiguous()
                         for key in correspondence
                     },
                     preprocess_size_px=(args.width, args.height),

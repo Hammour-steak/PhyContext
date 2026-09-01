@@ -440,6 +440,9 @@ class DasPointTrajectoryTest(unittest.TestCase):
         self.assertTrue(
             bool((correspondence["background_track_depth_m"][:, 0] > 0).all())
         )
+        self.assertTrue(
+            all(value.flags.c_contiguous for value in correspondence.values())
+        )
 
     def test_static_control_splat_does_not_hide_adjacent_correspondence(self) -> None:
         payload = point_payload()

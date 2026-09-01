@@ -878,7 +878,7 @@ def _serialize_raster_consistent_track_coordinates(
     visible = np.asarray(visibility, dtype=bool)
     if coordinates.shape[:-1] != visible.shape or coordinates.shape[-1] != 2:
         raise ValueError("track coordinates and visibility shapes do not match")
-    serialized = coordinates.astype(np.float32)
+    serialized = np.ascontiguousarray(coordinates, dtype=np.float32)
     precise_pixels = np.rint(coordinates)
     serialized_pixels = np.rint(serialized.astype(np.float64))
     mismatch = visible[..., None] & (precise_pixels != serialized_pixels)
@@ -1146,9 +1146,9 @@ def rasterize_das_3d_tracks(
         "track_xy_px": _serialize_raster_consistent_track_coordinates(
             processed_tracks[selected], visibility
         ),
-        "track_depth_m": depth[selected].astype(np.float32, copy=False),
-        "track_visible": visibility,
-        "source_frame_indices": selected,
+        "track_depth_m": np.ascontiguousarray(depth[selected], dtype=np.float32),
+        "track_visible": np.ascontiguousarray(visibility),
+        "source_frame_indices": np.ascontiguousarray(selected),
     }
     if static_tracks is not None and static_visibility is not None:
         background_indices = _select_spatially_balanced_static_points(
@@ -1166,10 +1166,12 @@ def rasterize_das_3d_tracks(
                     static_tracks[selected][:, background_indices],
                     background_visibility,
                 ),
-                "background_track_depth_m": static_depth[selected][
-                    :, background_indices
-                ].astype(np.float32, copy=False),
-                "background_track_visible": background_visibility,
+                "background_track_depth_m": np.ascontiguousarray(
+                    static_depth[selected][:, background_indices], dtype=np.float32
+                ),
+                "background_track_visible": np.ascontiguousarray(
+                    background_visibility
+                ),
             }
         )
     return channels, correspondence
