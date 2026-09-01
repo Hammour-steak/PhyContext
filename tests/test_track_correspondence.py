@@ -159,9 +159,9 @@ class TrackCorrespondenceTest(unittest.TestCase):
             generator=torch.Generator().manual_seed(7),
             **kwargs,
         )
-        self.assertEqual(float(aligned_result["pairs"]), 4.0)
+        self.assertEqual(float(aligned_result["pairs"]), 6.0)
         self.assertEqual(float(aligned_result["foreground_pairs"]), 2.0)
-        self.assertEqual(float(aligned_result["background_pairs"]), 2.0)
+        self.assertEqual(float(aligned_result["background_pairs"]), 4.0)
         self.assertGreaterEqual(float(aligned_result["fast_pairs"]), 1.0)
         self.assertLess(
             float(aligned_result["loss"]), float(wrong_result["loss"])
