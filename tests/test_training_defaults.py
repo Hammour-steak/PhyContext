@@ -379,6 +379,62 @@ class TrainingDefaultTests(unittest.TestCase):
             self.assertFalse(should_build)
             self.assertEqual(target.read_bytes(), source.read_bytes())
 
+    def test_concurrent_reuse_accepts_an_existing_verified_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_root = root / "old"
+            new_root = root / "new"
+            source = old_root / "point_tracks" / "sample.safetensors"
+            target = new_root / "point_tracks" / "sample.safetensors"
+            source.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
+            source.write_bytes(b"verified-artifact")
+            target.hardlink_to(source)
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+            should_build = cache_wan_inputs.prepare_reusable_artifact(
+                target,
+                new_root,
+                old_root,
+                None,
+                {
+                    "path": "point_tracks/sample.safetensors",
+                    "sha256": digest,
+                },
+                False,
+            )
+
+            self.assertFalse(should_build)
+            self.assertTrue(target.samefile(source))
+
+    def test_concurrent_reuse_rejects_an_unrelated_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_root = root / "old"
+            new_root = root / "new"
+            source = old_root / "point_tracks" / "sample.safetensors"
+            target = new_root / "point_tracks" / "sample.safetensors"
+            source.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
+            source.write_bytes(b"verified-artifact")
+            target.write_bytes(b"untrusted-artifact")
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+            should_build = cache_wan_inputs.prepare_reusable_artifact(
+                target,
+                new_root,
+                old_root,
+                None,
+                {
+                    "path": "point_tracks/sample.safetensors",
+                    "sha256": digest,
+                },
+                False,
+            )
+
+            self.assertTrue(should_build)
+            self.assertEqual(target.read_bytes(), b"untrusted-artifact")
+
     def test_v4_migration_reuses_geometry_but_not_video_latents(self) -> None:
         current = {
             "width": 832,

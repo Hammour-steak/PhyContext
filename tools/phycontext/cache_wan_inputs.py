@@ -254,6 +254,20 @@ def prepare_reusable_artifact(
             reusable, reusable_path, reuse_artifact_root
         )
     )
+    if reusable_matches and not current_matches and target.is_file():
+        try:
+            current_matches = target.samefile(reusable_path)
+        except OSError:
+            current_matches = False
+        if not current_matches:
+            current_matches = descriptor_matches_file(
+                {
+                    "path": relative(target, artifact_root),
+                    "sha256": reusable["sha256"],
+                },
+                target,
+                artifact_root,
+            )
     if (
         reusable_matches
         and not overwrite
