@@ -67,15 +67,23 @@ def validate_track_correspondence(
         if width <= 0 or height <= 0:
             raise ValueError("preprocess size must be positive")
         visible_xy = xy[visible]
+        # DaS visibility is resolved after projecting continuous pixel-center
+        # coordinates to raster pixels with np.rint.  A center such as -0.49
+        # therefore belongs to boundary pixel 0 and must not be rejected here.
+        # Validate the same raster-space contract instead of imposing the
+        # stricter continuous interval [0, size), which disagrees at borders.
+        visible_pixels = torch.round(visible_xy)
         if visible_xy.numel() and bool(
             (
-                (visible_xy[:, 0] < 0)
-                | (visible_xy[:, 0] >= width)
-                | (visible_xy[:, 1] < 0)
-                | (visible_xy[:, 1] >= height)
+                (visible_pixels[:, 0] < 0)
+                | (visible_pixels[:, 0] >= width)
+                | (visible_pixels[:, 1] < 0)
+                | (visible_pixels[:, 1] >= height)
             ).any()
         ):
-            raise ValueError("visible correspondence lies outside the preprocessed frame")
+            raise ValueError(
+                "visible correspondence rasterizes outside the preprocessed frame"
+            )
     return value
 
 

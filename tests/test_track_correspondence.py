@@ -51,6 +51,18 @@ class TrackCorrespondenceTest(unittest.TestCase):
                 value, preprocess_size_px=(6, 4), expected_frames=9
             )
 
+    def test_contract_accepts_subpixel_centers_on_boundary_pixels(self) -> None:
+        value = synthetic_correspondence()
+        value["track_xy_px"][0, 0, 0] = torch.tensor([-0.49, 3.49])
+        validate_track_correspondence(
+            value, preprocess_size_px=(6, 4), expected_frames=9
+        )
+        value["track_xy_px"][0, 0, 0, 0] = -0.51
+        with self.assertRaisesRegex(ValueError, "rasterizes outside"):
+            validate_track_correspondence(
+                value, preprocess_size_px=(6, 4), expected_frames=9
+            )
+
     def test_zero_bridge_preserves_wan_output_and_separates_gradients(self) -> None:
         adapter = TrackCorrespondenceAdapter(
             hidden_dim=8, feature_dim=4, refiner_blocks=1
