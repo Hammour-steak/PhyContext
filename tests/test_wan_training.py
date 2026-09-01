@@ -17,6 +17,7 @@ from conditioning_model import PhyContextConditionEncoder
 from track_correspondence import inject_track_correspondence
 from train_wan_formal import (
     configure_training_stage,
+    isolated_physics_response_loss,
     learning_rate_factor,
     optimizer_groups,
     validate,
@@ -26,6 +27,7 @@ from wan_training import (
     DirectConditionModulator,
     LoRALinear,
     balanced_motion_loss_mask,
+    drop_trajectory_point_identities,
     enable_block_checkpointing,
     inject_direct_condition_modulation,
     inject_cross_attention_lora,
@@ -89,7 +91,81 @@ class DummyTrajectoryModel(DummyModel):
         return [self.patch_embedding(item.unsqueeze(0)) for item in x]
 
 
+class CapturingResponseModel(nn.Module):
+    patch_size = (1, 2, 2)
+    text_len = 16
+
+    def __init__(self):
+        super().__init__()
+        self.inputs = None
+        self.context = None
+
+    def forward(self, inputs, *, t, context, seq_len):
+        self.inputs = [item.detach().clone() for item in inputs]
+        self.context = [item.detach().clone() for item in context]
+        return [torch.zeros_like(item) for item in inputs]
+
+
 class WanTrainingTest(unittest.TestCase):
+    def test_das_identity_dropout_preserves_every_occupancy_channel(self) -> None:
+        point_map = torch.randn(12, 3, 2, 2)
+        point_map[3::4] = torch.rand_like(point_map[3::4])
+        result, count = drop_trajectory_point_identities(
+            [point_map],
+            1.0,
+            generator=torch.Generator().manual_seed(7),
+        )
+        self.assertEqual(count, 1)
+        for base in range(0, 12, 4):
+            torch.testing.assert_close(
+                result[0][base : base + 3],
+                torch.zeros_like(result[0][base : base + 3]),
+            )
+            torch.testing.assert_close(result[0][base + 3], point_map[base + 3])
+
+    def test_response_forward_holds_noise_text_and_trajectory_fixed(self) -> None:
+        model = CapturingResponseModel()
+        first = torch.randn(4, 3, 4, 4)
+        second = torch.randn(4, 3, 4, 4)
+        trajectory_a = torch.randn(12, 9, 2, 2)
+        trajectory_b = torch.randn(12, 9, 2, 2)
+        loaded = {
+            "latents": [first, second],
+            "text": [torch.randn(3, 8), torch.randn(3, 8)],
+            "controls": torch.randn(2, 3),
+            "initial_state": torch.randn(2, 9),
+            "motion_masks": [
+                torch.ones(1, 3, 4, 4),
+                torch.ones(1, 3, 4, 4),
+            ],
+        }
+        condition_tokens = torch.randn(2, 2, 8)
+        args = SimpleNamespace(
+            training_stage="joint",
+            trajectory_input=True,
+            motion_foreground_share=0.5,
+            minimum_response_energy=1.0e-3,
+        )
+        with (
+            patch("train_wan_formal.set_direct_condition", return_value=True),
+            patch("train_wan_formal.set_trajectory_condition", return_value=True) as set_track,
+            patch("train_wan_formal.consume_track_correspondence_features"),
+        ):
+            loss = isolated_physics_response_loss(
+                model,
+                condition_tokens,
+                loaded,
+                args,
+                torch.Generator().manual_seed(5),
+                [trajectory_a, trajectory_b],
+            )
+        self.assertTrue(torch.isfinite(loss))
+        torch.testing.assert_close(model.inputs[0], model.inputs[1])
+        torch.testing.assert_close(model.context[0][:3], model.context[1][:3])
+        shared = set_track.call_args.args[1]
+        self.assertIs(shared[0], trajectory_a)
+        self.assertIs(shared[1], trajectory_a)
+
     def test_trajectory_warmup_freezes_every_physics_specific_module(self) -> None:
         model = DummyModel()
         inject_direct_condition_modulation(
@@ -411,6 +487,7 @@ class WanTrainingTest(unittest.TestCase):
             direct_learning_rate=5.0e-5,
             trajectory_learning_rate=1.0e-4,
             track_correspondence_learning_rate=1.0e-4,
+            track_correspondence_feedback_learning_rate=1.0e-5,
             trajectory_input=True,
             training_stage="joint",
         )
@@ -431,6 +508,9 @@ class WanTrainingTest(unittest.TestCase):
         self.assertEqual(
             len(grouped), len({id(parameter) for parameter in grouped})
         )
+        rates = {group["name"]: group["lr"] for group in groups}
+        self.assertEqual(rates["track_correspondence_features"], 1.0e-4)
+        self.assertEqual(rates["track_correspondence_feedback"], 1.0e-5)
 
         model.register_parameter(
             "untracked_trainable", nn.Parameter(torch.ones(1))
@@ -721,6 +801,12 @@ class WanTrainingTest(unittest.TestCase):
                 "track_correspondence_pairs": torch.tensor(3.0),
                 "track_correspondence_fast_pairs": torch.tensor(1.0),
                 "track_correspondence_mean_displacement_tokens": one,
+                "track_correspondence_kl": one,
+                "track_correspondence_epe_tokens": one,
+                "track_correspondence_pck_1": one,
+                "track_correspondence_fast_epe_tokens": one,
+                "track_correspondence_fast_pck_1": one,
+                "trajectory_identity_dropout_fraction": torch.tensor(0.0),
                 "lpips": one,
             }
 

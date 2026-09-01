@@ -407,6 +407,41 @@ def motion_mask_from_point_track_map(
     return current.gt(0).unsqueeze(0).to(dtype=point_track_map.dtype)
 
 
+def drop_trajectory_point_identities(
+    point_maps: list[torch.Tensor],
+    probability: float,
+    *,
+    generator: torch.Generator,
+) -> tuple[list[torch.Tensor], int]:
+    """Drop only DaS RGB point IDs while preserving per-object occupancy.
+
+    A small training-only dropout prevents the correspondence head from solving
+    every example by copying the supplied RGB identity code. Occupancy and the
+    complete trajectory remain available, so this is not a no-trajectory sample.
+    """
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("trajectory identity dropout must be between zero and one")
+    if not point_maps:
+        raise ValueError("trajectory identity dropout requires a non-empty batch")
+    result = []
+    dropped = 0
+    for point_map in point_maps:
+        if point_map.ndim != 4 or point_map.shape[0] % 4:
+            raise ValueError("DaS point maps must have four channels per object")
+        should_drop = probability > 0.0 and bool(
+            torch.rand((), device=point_map.device, generator=generator) < probability
+        )
+        if not should_drop:
+            result.append(point_map)
+            continue
+        masked = point_map.clone()
+        for base in range(0, masked.shape[0], 4):
+            masked[base : base + 3].zero_()
+        result.append(masked)
+        dropped += 1
+    return result, dropped
+
+
 class TrajectoryPatchConditioner(nn.Module):
     """Project DaS-inspired fixed-slot trajectories into Wan patch features."""
 

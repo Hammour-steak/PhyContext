@@ -204,10 +204,20 @@ def inject_track_correspondence(
     return adapter
 
 
-def track_correspondence_parameters(model: nn.Module):
+def track_correspondence_feature_parameters(model: nn.Module):
+    """Parameters trained by exact material-point feature correspondence."""
     adapter = getattr(model, "phycontext_track_correspondence", None)
     if adapter is not None:
-        yield from adapter.parameters()
+        yield from adapter.input_norm.parameters()
+        yield from adapter.input_projection.parameters()
+        yield from adapter.refiner.parameters()
+
+
+def track_correspondence_feedback_parameters(model: nn.Module):
+    """Zero bridge trained only by generation-side objectives."""
+    adapter = getattr(model, "phycontext_track_correspondence", None)
+    if adapter is not None:
+        yield from adapter.feedback.parameters()
 
 
 def consume_track_correspondence_features(model: nn.Module) -> list[torch.Tensor]:
@@ -373,10 +383,16 @@ def track4gen_correspondence_loss(
         raise ValueError("Track4Gen sampling and temperature values must be positive")
     if coordinate_weight < 0:
         raise ValueError("Track4Gen coordinate weight must be nonnegative")
-    total_loss = feature_maps[0].sum() * 0.0
+    zero = feature_maps[0].sum() * 0.0
+    sample_losses = []
     total_pairs = 0
-    total_displacement = total_loss.detach()
+    total_displacement = zero.detach()
+    total_kl = zero.detach()
+    total_epe = zero.detach()
+    pck_1_hits = 0
     fast_pairs = 0
+    fast_epe = zero.detach()
+    fast_pck_1_hits = 0
     for features, correspondence in zip(feature_maps, correspondences):
         if features.ndim != 4:
             raise ValueError("refined feature map must have shape D x F x H x W")
@@ -386,6 +402,16 @@ def track4gen_correspondence_loss(
             preprocess_size_px=preprocess_size_px,
             expected_frames=4 * (latent_frames - 1) + 1,
         )
+        source_frames = correspondence["source_frame_indices"]
+        expected_source_frames = torch.arange(
+            source_frames.shape[0],
+            dtype=source_frames.dtype,
+            device=source_frames.device,
+        )
+        if not torch.equal(source_frames, expected_source_frames):
+            raise ValueError(
+                "Track4Gen requires consecutive source frames starting at zero"
+            )
         xy = correspondence["track_xy_px"].to(features.device)
         visible = correspondence["track_visible"].to(features.device)
         target_frames, objects, points, displacement = (
@@ -400,7 +426,9 @@ def track4gen_correspondence_loss(
             )
         )
         if not len(target_frames):
-            continue
+            raise ValueError(
+                "each Track4Gen video must have first-frame-visible correspondences"
+            )
         anchor_feature_xy = _pixel_to_feature(
             xy[0, objects, points],
             preprocess_size_px=preprocess_size_px,
@@ -457,6 +485,9 @@ def track4gen_correspondence_loss(
                 target = target / target.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
                 log_probability = F.log_softmax(logits, dim=-1)
                 classification = -(target * log_probability).sum(dim=-1)
+                target_entropy = -(
+                    target * target.clamp_min(1.0e-12).log()
+                ).sum(dim=-1)
                 probability = log_probability.exp()
                 predicted_coordinate = probability @ normalized_grid
                 target_coordinate = target @ normalized_grid
@@ -469,20 +500,52 @@ def track4gen_correspondence_loss(
                 sample_loss = sample_loss + (
                     classification + coordinate_weight * coordinate
                 ).sum()
+                predicted_feature_coordinate = probability @ feature_grid
+                target_feature_coordinate = target @ feature_grid
+                endpoint_error = torch.linalg.vector_norm(
+                    predicted_feature_coordinate - target_feature_coordinate,
+                    dim=-1,
+                )
+                fast = displacement[selection].ge(3.0)
+                total_kl = total_kl + (
+                    classification - target_entropy
+                ).clamp_min(0.0).sum().detach()
+                total_epe = total_epe + endpoint_error.sum().detach()
+                pck_1_hits += int(endpoint_error.le(1.0).sum().item())
+                if bool(fast.any()):
+                    fast_epe = fast_epe + endpoint_error[fast].sum().detach()
+                    fast_pck_1_hits += int(
+                        endpoint_error[fast].le(1.0).sum().item()
+                    )
                 sample_pairs += len(selection)
-            total_loss = total_loss + sample_loss
+            sample_losses.append(sample_loss / sample_pairs)
             total_pairs += sample_pairs
             total_displacement = total_displacement + displacement.sum().detach()
             fast_pairs += int(displacement.ge(3.0).sum().item())
-    if total_pairs:
-        loss = total_loss / total_pairs
-        mean_displacement = total_displacement / total_pairs
+    if len(sample_losses) != len(feature_maps) or total_pairs <= 0:
+        raise RuntimeError("Track4Gen did not produce one loss for every video")
+    # Every video contributes equally. With a fixed local batch size, DDP's
+    # rank average is therefore exactly the global per-video objective instead
+    # of being biased by the number of visible points on each rank.
+    loss = torch.stack(sample_losses).mean()
+    mean_displacement = total_displacement / total_pairs
+    mean_kl = total_kl / total_pairs
+    mean_epe = total_epe / total_pairs
+    pck_1 = loss.new_tensor(float(pck_1_hits) / total_pairs)
+    if fast_pairs:
+        mean_fast_epe = fast_epe / fast_pairs
+        fast_pck_1 = loss.new_tensor(float(fast_pck_1_hits) / fast_pairs)
     else:
-        loss = total_loss
-        mean_displacement = total_displacement
+        mean_fast_epe = loss.new_zeros(())
+        fast_pck_1 = loss.new_zeros(())
     return {
         "loss": loss,
         "pairs": loss.new_tensor(float(total_pairs)),
         "fast_pairs": loss.new_tensor(float(fast_pairs)),
         "mean_displacement_tokens": mean_displacement.to(loss.device),
+        "kl": mean_kl.to(loss.device),
+        "epe_tokens": mean_epe.to(loss.device),
+        "pck_1": pck_1,
+        "fast_epe_tokens": mean_fast_epe.to(loss.device),
+        "fast_pck_1": fast_pck_1,
     }

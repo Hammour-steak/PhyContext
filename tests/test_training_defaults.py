@@ -472,6 +472,12 @@ class TrainingDefaultTests(unittest.TestCase):
         self.assertGreater(args.track_correspondence_temperature, 0.0)
         self.assertGreater(args.track_correspondence_pairs, 0)
         self.assertEqual(args.track_correspondence_block_index, 12)
+        self.assertLess(
+            args.track_correspondence_feedback_learning_rate,
+            args.track_correspondence_learning_rate,
+        )
+        self.assertGreater(args.trajectory_identity_dropout, 0.0)
+        self.assertLess(args.trajectory_identity_dropout, 1.0)
         self.assertEqual(
             formal_config["track_correspondence_loss_weight"],
             args.track_correspondence_loss_weight,
@@ -487,6 +493,14 @@ class TrainingDefaultTests(unittest.TestCase):
         self.assertEqual(
             formal_config["track_correspondence_block_index"],
             args.track_correspondence_block_index,
+        )
+        self.assertEqual(
+            formal_config["track_correspondence_feedback_learning_rate"],
+            args.track_correspondence_feedback_learning_rate,
+        )
+        self.assertEqual(
+            formal_config["trajectory_identity_dropout"],
+            args.trajectory_identity_dropout,
         )
         self.assertEqual(
             (VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FRAMES), (832, 480, 97)

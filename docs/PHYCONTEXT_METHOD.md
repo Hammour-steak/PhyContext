@@ -70,9 +70,26 @@ medium, and fast feature-grid displacement.
 
 The feature objective uses soft-target cross entropy over the global target
 feature map plus a small expected-coordinate Huber term. It directly trains the
-refiner and upstream LoRA features. The diffusion objective trains the
-zero-initialized feedback bridge, while stop-gradient prevents that bridge from
-turning the refiner into an unconstrained shortcut. Decoded RGB optical-flow,
+refiner and upstream LoRA features. Videos, rather than visible point counts,
+receive equal loss weight across DDP ranks. The diffusion objective trains the
+zero-initialized feedback bridge at one tenth of the refiner learning rate,
+while stop-gradient prevents that bridge from turning the refiner into an
+unconstrained shortcut. On 10% of training samples only the DaS RGB identities
+are removed while every per-object occupancy trajectory remains; this forces
+the feature objective to retain visual evidence without changing the model's
+trajectory-conditioned task. Monitoring reports KL above soft-target entropy,
+expected-coordinate EPE, PCK@1, and the fast-motion EPE/PCK@1 subset rather than
+interpreting raw cross entropy alone.
+
+Paired physical response uses a separate sigma-1 counterfactual forward. The
+future noise, first-frame latent, text, and trajectory are identical for the
+low/high endpoints; only structured physics tokens and direct physics
+modulation differ. The response loss therefore cannot be satisfied by reading
+two different target trajectories. LPIPS is evaluated on ordinary updates only;
+response updates reserve memory for the counterfactual forward and keep the
+same reconstruction, center, and exact-correspondence supervision.
+
+Decoded RGB optical-flow,
 trajectory-distribution, and adjacent-latent velocity losses are not part of the
 formal path; they were removed because they duplicate or conflict with exact
 material correspondence, especially at occlusion and high speed.

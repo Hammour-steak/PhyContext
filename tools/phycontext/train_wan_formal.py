@@ -48,6 +48,7 @@ from wan_training import (
     LoRALinear,
     balanced_motion_loss_mask,
     direct_modulation_parameters,
+    drop_trajectory_point_identities,
     enable_block_checkpointing,
     inject_cross_attention_lora,
     inject_direct_condition_modulation,
@@ -79,7 +80,8 @@ from track_correspondence import (
     consume_track_correspondence_features,
     inject_track_correspondence,
     track4gen_correspondence_loss,
-    track_correspondence_parameters,
+    track_correspondence_feature_parameters,
+    track_correspondence_feedback_parameters,
     validate_track_correspondence,
 )
 
@@ -165,6 +167,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--track-correspondence-learning-rate", type=float, default=1e-4
     )
+    parser.add_argument(
+        "--track-correspondence-feedback-learning-rate",
+        type=float,
+        default=1e-5,
+        help=(
+            "generation-side zero-bridge rate; kept below the correspondence "
+            "feature/refiner rate to protect pretrained Wan features"
+        ),
+    )
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--minimum-learning-rate-ratio", type=float, default=0.1)
     parser.add_argument("--encoder-weight-decay", type=float, default=0.01)
@@ -200,6 +211,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--track-correspondence-temperature", type=float, default=0.07)
     parser.add_argument("--track-correspondence-gaussian-sigma", type=float, default=0.75)
     parser.add_argument("--track-correspondence-coordinate-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--trajectory-identity-dropout",
+        type=float,
+        default=0.1,
+        help=(
+            "training-only probability of removing DaS RGB point IDs while "
+            "retaining every per-object occupancy trajectory"
+        ),
+    )
     parser.add_argument("--trajectory-temperature", type=float, default=0.03)
     parser.add_argument("--trajectory-beta", type=float, default=0.05)
     parser.add_argument(
@@ -513,10 +533,10 @@ def optimizer_groups(
         )
     candidates.append(
         {
-            "name": "track_correspondence",
+            "name": "track_correspondence_features",
             "params": [
                 parameter
-                for parameter in track_correspondence_parameters(model)
+                for parameter in track_correspondence_feature_parameters(model)
                 if parameter.requires_grad
             ],
             "lr": args.track_correspondence_learning_rate,
@@ -524,9 +544,26 @@ def optimizer_groups(
             "weight_decay": 0.0,
         }
     )
+    candidates.append(
+        {
+            "name": "track_correspondence_feedback",
+            "params": [
+                parameter
+                for parameter in track_correspondence_feedback_parameters(model)
+                if parameter.requires_grad
+            ],
+            "lr": args.track_correspondence_feedback_learning_rate,
+            "initial_lr": args.track_correspondence_feedback_learning_rate,
+            "weight_decay": 0.0,
+        }
+    )
     groups = [group for group in candidates if group["params"]]
     names = {group["name"] for group in groups}
-    required = {"wan_lora", "track_correspondence"}
+    required = {
+        "wan_lora",
+        "track_correspondence_features",
+        "track_correspondence_feedback",
+    }
     if args.trajectory_input:
         required.add("trajectory_conditioning")
     if args.training_stage == "joint":
@@ -793,6 +830,81 @@ def clean_latent_lpips_loss(
     return torch.stack(losses).mean()
 
 
+def isolated_physics_response_loss(
+    model,
+    condition_tokens: torch.Tensor,
+    loaded: dict,
+    args: argparse.Namespace,
+    generator: torch.Generator,
+    trajectory_point_maps: list[torch.Tensor],
+) -> torch.Tensor:
+    """Measure low/high physics response with every non-physics input fixed.
+
+    The future diffusion input is common pure noise (sigma=1), text is shared,
+    and both endpoints receive the same trajectory map. Only the structured
+    physics tokens/direct modulation differ, so the loss cannot be solved by
+    reading the target-specific DaS trajectory.
+    """
+    if len(loaded["latents"]) != 2 or condition_tokens.shape[0] != 2:
+        raise ValueError("isolated response requires exactly one low/high pair")
+    raw_model = unwrap(model)
+    reference_first = loaded["latents"][0][:, :1]
+    response_latents = [
+        torch.cat((reference_first, latent[:, 1:]), dim=1)
+        for latent in loaded["latents"]
+    ]
+    sigmas = torch.ones(2, device=reference_first.device)
+    flow = make_ti2v_flow_batch(
+        response_latents,
+        sigmas,
+        patch_size=tuple(raw_model.patch_size),
+        generator=generator,
+        shared_noise=True,
+    )
+    context = compose_wan_context(
+        [loaded["text"][0], loaded["text"][0]],
+        condition_tokens.to(loaded["text"][0].dtype),
+        max_tokens=raw_model.text_len,
+    )
+    if not set_direct_condition(
+        raw_model,
+        loaded["controls"],
+        loaded["initial_state"],
+        enabled=args.training_stage == "joint",
+    ):
+        raise RuntimeError("isolated response requires direct condition modulation")
+    if args.trajectory_input:
+        shared_trajectory = [trajectory_point_maps[0], trajectory_point_maps[0]]
+        if not set_trajectory_condition(raw_model, shared_trajectory):
+            raise RuntimeError("isolated response requires trajectory conditioning")
+    predictions = model(
+        flow["noisy_latents"],
+        t=flow["timesteps"],
+        context=context,
+        seq_len=flow["seq_len"],
+    )
+    # The adapter records features on every forward. This response-only pass
+    # intentionally has no correspondence objective, so clear the transient
+    # state rather than letting it leak into the next microbatch.
+    consume_track_correspondence_features(raw_model)
+    response_region = torch.maximum(
+        source_target_motion_envelope(loaded["motion_masks"][0]),
+        source_target_motion_envelope(loaded["motion_masks"][1]),
+    )
+    response_mask = balanced_motion_loss_mask(
+        flow["loss_masks"][0] * flow["loss_masks"][1],
+        response_region,
+        args.motion_foreground_share,
+    )
+    return masked_flow_response_loss(
+        predictions,
+        flow["targets"],
+        flow["loss_masks"],
+        minimum_target_energy=args.minimum_response_energy,
+        response_mask=response_mask,
+    )
+
+
 def forward_losses(
     model,
     condition_encoder,
@@ -804,6 +916,7 @@ def forward_losses(
     vae=None,
     perceptual_model=None,
     fixed_sigma: float | None = None,
+    apply_identity_dropout: bool = False,
 ) -> dict[str, torch.Tensor]:
     raw_model = unwrap(model)
     condition_tokens = condition_encoder(
@@ -830,9 +943,19 @@ def forward_losses(
     ):
         raise RuntimeError("formal training requires direct condition modulation")
     canonical_trajectory_representation(args.trajectory_representation)
+    trajectory_point_maps = loaded["trajectory_point_maps"]
+    identity_dropout_count = 0
+    if args.trajectory_input and apply_identity_dropout:
+        trajectory_point_maps, identity_dropout_count = (
+            drop_trajectory_point_identities(
+                trajectory_point_maps,
+                args.trajectory_identity_dropout,
+                generator=generator,
+            )
+        )
     if args.trajectory_input and not set_trajectory_condition(
         raw_model,
-        loaded["trajectory_point_maps"],
+        trajectory_point_maps,
     ):
         raise RuntimeError("trajectory conditioning was requested but not injected")
     if fixed_sigma is None:
@@ -879,21 +1002,13 @@ def forward_losses(
         )
         response = reconstruction.new_zeros(())
         if response_enabled:
-            response_region = torch.maximum(
-                source_target_motion_envelope(loaded["motion_masks"][0]),
-                source_target_motion_envelope(loaded["motion_masks"][1]),
-            )
-            response_mask = balanced_motion_loss_mask(
-                flow["loss_masks"][0] * flow["loss_masks"][1],
-                response_region,
-                args.motion_foreground_share,
-            )
-            response = masked_flow_response_loss(
-                predictions,
-                flow["targets"],
-                flow["loss_masks"],
-                minimum_target_energy=args.minimum_response_energy,
-                response_mask=response_mask,
+            response = isolated_physics_response_loss(
+                model,
+                condition_tokens,
+                loaded,
+                args,
+                generator,
+                trajectory_point_maps,
             )
         predicted_clean = recover_clean_latents(
             flow["noisy_latents"], predictions, sigmas
@@ -920,7 +1035,7 @@ def forward_losses(
                 "Track4Gen batch has no first-frame-visible material correspondences"
             )
         lpips_loss = reconstruction.new_zeros(())
-        if args.lpips_loss_weight > 0:
+        if args.lpips_loss_weight > 0 and not response_enabled:
             if vae is None or perceptual_model is None:
                 raise RuntimeError("LPIPS is enabled but its models are missing")
             with torch.autocast(device_type="cuda", enabled=False):
@@ -951,6 +1066,16 @@ def forward_losses(
         "track_correspondence_mean_displacement_tokens": correspondence[
             "mean_displacement_tokens"
         ],
+        "track_correspondence_kl": correspondence["kl"],
+        "track_correspondence_epe_tokens": correspondence["epe_tokens"],
+        "track_correspondence_pck_1": correspondence["pck_1"],
+        "track_correspondence_fast_epe_tokens": correspondence[
+            "fast_epe_tokens"
+        ],
+        "track_correspondence_fast_pck_1": correspondence["fast_pck_1"],
+        "trajectory_identity_dropout_fraction": reconstruction.new_tensor(
+            float(identity_dropout_count) / len(trajectory_point_maps)
+        ),
         "lpips": lpips_loss,
         "sigma": sigmas[0],
     }
@@ -973,6 +1098,47 @@ def reduce_metrics(
         denominator = float(tensor[index * 2 + 1].cpu())
         result[key] = numerator / max(denominator, 1.0)
     return result
+
+
+PAIR_WEIGHTED_TRACK_METRICS = {
+    "track_correspondence_kl",
+    "track_correspondence_epe_tokens",
+    "track_correspondence_pck_1",
+    "track_correspondence_mean_displacement_tokens",
+}
+FAST_PAIR_WEIGHTED_TRACK_METRICS = {
+    "track_correspondence_fast_epe_tokens",
+    "track_correspondence_fast_pck_1",
+}
+
+
+def accumulate_loss_metrics(
+    totals: dict[str, float],
+    counts: dict[str, float],
+    losses: dict[str, torch.Tensor],
+    *,
+    response_enabled: bool,
+) -> None:
+    """Accumulate exact global denominators for DDP-reduced diagnostics."""
+    pair_count = float(losses["track_correspondence_pairs"].detach().cpu())
+    fast_pair_count = float(
+        losses["track_correspondence_fast_pairs"].detach().cpu()
+    )
+    for key in totals:
+        if key == "response" and not response_enabled:
+            continue
+        if key == "lpips" and response_enabled:
+            continue
+        if key in PAIR_WEIGHTED_TRACK_METRICS:
+            weight = pair_count
+        elif key in FAST_PAIR_WEIGHTED_TRACK_METRICS:
+            weight = fast_pair_count
+        else:
+            weight = 1.0
+        if weight <= 0:
+            continue
+        totals[key] += float(losses[key].detach().cpu()) * weight
+        counts[key] += weight
 
 
 @torch.no_grad()
@@ -1007,6 +1173,12 @@ def validate(
             "track_correspondence_pairs",
             "track_correspondence_fast_pairs",
             "track_correspondence_mean_displacement_tokens",
+            "track_correspondence_kl",
+            "track_correspondence_epe_tokens",
+            "track_correspondence_pck_1",
+            "track_correspondence_fast_epe_tokens",
+            "track_correspondence_fast_pck_1",
+            "trajectory_identity_dropout_fraction",
             "lpips",
         )
     }
@@ -1058,11 +1230,12 @@ def validate(
             fixed_sigma=0.7,
         )
         mode_counts[mode] += 1.0
-        for key in totals:
-            if key == "response" and not response_enabled:
-                continue
-            totals[key] += float(losses[key].detach().cpu())
-            counts[key] += 1.0
+        accumulate_loss_metrics(
+            totals,
+            counts,
+            losses,
+            response_enabled=response_enabled,
+        )
     metrics = reduce_metrics(totals, counts, device, world_size)
     mode_tensor = torch.tensor(
         [mode_counts["ordinary"], mode_counts["response"]],
@@ -1181,6 +1354,9 @@ def adapter_metadata(
             "track_correspondence_learning_rate": (
                 args.track_correspondence_learning_rate
             ),
+            "track_correspondence_feedback_learning_rate": (
+                args.track_correspondence_feedback_learning_rate
+            ),
             "encoder_weight_decay": args.encoder_weight_decay,
             "warmup_ratio": args.warmup_ratio,
             "minimum_learning_rate_ratio": args.minimum_learning_rate_ratio,
@@ -1203,7 +1379,10 @@ def adapter_metadata(
             "response_pair": (
                 None
                 if args.ordinary_only
-                else "same_base_same_axis_low_high_common_noise_sigma"
+                else (
+                    "same_base_same_axis_low_high;_response_forward_holds_"
+                    "noise_text_and_trajectory_fixed_at_sigma1"
+                )
             ),
         },
         "validation": {
@@ -1216,6 +1395,7 @@ def adapter_metadata(
             "diffusion_sigma": 0.7,
             "clean_condition_frame_in_lpips": False,
             "lpips_decode_protocol": "local_generated_windows_fresh_causal_cache",
+            "lpips_training_modes": ["ordinary"],
         },
         "motion_supervision": {
             "enabled": True,
@@ -1255,6 +1435,17 @@ def adapter_metadata(
             "visibility": "cached_global_dynamic_static_z_buffer",
             "sampling": "equal_slow_medium_fast_feature_displacement_bins",
             "feedback": "zero_initialized_linear_of_stop_gradient_refined_features",
+            "feature_objective_normalization": "equal_video_weight_then_ddp_rank_mean",
+            "identity_shortcut_mitigation": (
+                "training_only_rgb_identity_dropout_with_occupancy_preserved"
+            ),
+            "identity_dropout_probability": args.trajectory_identity_dropout,
+            "diagnostics": [
+                "kl_above_soft_target_entropy",
+                "expected_coordinate_epe_tokens",
+                "pck_at_1_token",
+                "fast_subset_epe_and_pck_at_1_token",
+            ],
         },
         "trajectory_conditioning": {
             "enabled": args.trajectory_input,
@@ -1309,6 +1500,20 @@ def adapter_metadata(
             ),
         },
         "response_loss_weight": args.response_loss_weight,
+        "response_supervision": {
+            "protocol": "isolated_structured_physics_counterfactual_v1",
+            "sigma": 1.0,
+            "shared_inputs": [
+                "future_noise",
+                "first_frame_latent",
+                "text_context",
+                "trajectory_point_map",
+            ],
+            "varying_inputs": [
+                "structured_physics_tokens",
+                "direct_physics_modulation",
+            ],
+        },
         "reconstruction_loss_weight": args.reconstruction_loss_weight,
         "lpips_loss_weight": args.lpips_loss_weight,
         "lpips_frame_count": args.lpips_frame_count,
@@ -1340,6 +1545,24 @@ def adapter_metadata(
         "track_correspondence_mean_displacement_tokens": [
             item["track_correspondence_mean_displacement_tokens"]
             for item in history
+        ],
+        "track_correspondence_kl": [
+            item["track_correspondence_kl"] for item in history
+        ],
+        "track_correspondence_epe_tokens": [
+            item["track_correspondence_epe_tokens"] for item in history
+        ],
+        "track_correspondence_pck_1": [
+            item["track_correspondence_pck_1"] for item in history
+        ],
+        "track_correspondence_fast_epe_tokens": [
+            item["track_correspondence_fast_epe_tokens"] for item in history
+        ],
+        "track_correspondence_fast_pck_1": [
+            item["track_correspondence_fast_pck_1"] for item in history
+        ],
+        "trajectory_identity_dropout_fractions": [
+            item["trajectory_identity_dropout_fraction"] for item in history
         ],
         "peak_cuda_memory_gib": peak_memory,
         "seed": args.seed,
@@ -1476,6 +1699,7 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "direct_learning_rate",
     "trajectory_learning_rate",
     "track_correspondence_learning_rate",
+    "track_correspondence_feedback_learning_rate",
     "warmup_ratio",
     "minimum_learning_rate_ratio",
     "encoder_weight_decay",
@@ -1499,6 +1723,7 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "track_correspondence_temperature",
     "track_correspondence_gaussian_sigma",
     "track_correspondence_coordinate_weight",
+    "trajectory_identity_dropout",
     "trajectory_temperature",
     "trajectory_beta",
     "trajectory_input",
@@ -1643,11 +1868,19 @@ def main() -> None:
         args.direct_learning_rate,
         args.trajectory_learning_rate,
         args.track_correspondence_learning_rate,
+        args.track_correspondence_feedback_learning_rate,
         args.trajectory_temperature,
         args.trajectory_beta,
         float(args.trajectory_condition_rank),
     ) <= 0:
         raise ValueError("formal optimization settings must be positive")
+    if not 0.0 <= args.trajectory_identity_dropout <= 1.0:
+        raise ValueError("trajectory identity dropout must be between zero and one")
+    if (
+        args.trajectory_identity_dropout > 0
+        and args.trajectory_representation != "das_3d_tracks"
+    ):
+        raise ValueError("trajectory identity dropout is only defined for DaS tracks")
     if args.trajectory_center_loss_weight <= 0:
         raise ValueError("trajectory center weight must be positive")
 
@@ -1976,6 +2209,12 @@ def main() -> None:
                     "track_correspondence_pairs",
                     "track_correspondence_fast_pairs",
                     "track_correspondence_mean_displacement_tokens",
+                    "track_correspondence_kl",
+                    "track_correspondence_epe_tokens",
+                    "track_correspondence_pck_1",
+                    "track_correspondence_fast_epe_tokens",
+                    "track_correspondence_fast_pck_1",
+                    "trajectory_identity_dropout_fraction",
                     "lpips",
                     "sigma",
                 )
@@ -2039,13 +2278,17 @@ def main() -> None:
                         response_enabled=mode == "response",
                         vae=vae,
                         perceptual_model=perceptual_model,
+                        apply_identity_dropout=True,
                     )
                     if not torch.isfinite(losses["total"]):
                         raise RuntimeError("formal training loss is non-finite")
                     (losses["total"] / args.gradient_accumulation).backward()
-                for key in local_sums:
-                    local_sums[key] += float(losses[key].detach().cpu())
-                    local_counts[key] += float(key != "response" or mode == "response")
+                accumulate_loss_metrics(
+                    local_sums,
+                    local_counts,
+                    losses,
+                    response_enabled=mode == "response",
+                )
 
             raw_model = unwrap(model)
             raw_condition = unwrap(condition_encoder)

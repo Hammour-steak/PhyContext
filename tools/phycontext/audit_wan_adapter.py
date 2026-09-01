@@ -323,6 +323,23 @@ def main() -> None:
         for field, expected in expected_track_semantics.items():
             if track_config.get(field) != expected:
                 errors.append(f"track correspondence {field} semantics are invalid")
+        if (
+            track_config.get("feature_objective_normalization")
+            != "equal_video_weight_then_ddp_rank_mean"
+        ):
+            errors.append("track correspondence per-video normalization is invalid")
+        if (
+            track_config.get("identity_shortcut_mitigation")
+            != "training_only_rgb_identity_dropout_with_occupancy_preserved"
+        ):
+            errors.append("track correspondence identity-shortcut mitigation is invalid")
+        identity_dropout = track_config.get("identity_dropout_probability")
+        if (
+            identity_dropout is None
+            or not math.isfinite(float(identity_dropout))
+            or not 0.0 < float(identity_dropout) < 1.0
+        ):
+            errors.append("track correspondence identity dropout is invalid")
         positive_track_fields = (
             "feature_dim",
             "refiner_blocks",
@@ -381,14 +398,52 @@ def main() -> None:
                 "track_correspondence_mean_displacement_tokens", []
             )
         ]
+        track_kl = [
+            float(value) for value in metadata.get("track_correspondence_kl", [])
+        ]
+        track_epe = [
+            float(value)
+            for value in metadata.get("track_correspondence_epe_tokens", [])
+        ]
+        track_pck = [
+            float(value)
+            for value in metadata.get("track_correspondence_pck_1", [])
+        ]
+        track_fast_epe = [
+            float(value)
+            for value in metadata.get("track_correspondence_fast_epe_tokens", [])
+        ]
+        track_fast_pck = [
+            float(value)
+            for value in metadata.get("track_correspondence_fast_pck_1", [])
+        ]
         for label, values in (
             ("loss", track_losses),
             ("displacement", track_displacements),
+            ("kl", track_kl),
+            ("epe", track_epe),
+            ("pck@1", track_pck),
+            ("fast epe", track_fast_epe),
+            ("fast pck@1", track_fast_pck),
         ):
             if len(values) != int(metadata["steps"]):
                 errors.append(f"track correspondence {label} history length mismatch")
             elif not all(math.isfinite(value) and value >= 0 for value in values):
                 errors.append(f"track correspondence {label} history is invalid")
+        if (track_pck and not all(value <= 1.0 for value in track_pck)) or (
+            track_fast_pck
+            and not all(value <= 1.0 for value in track_fast_pck)
+        ):
+            errors.append("track correspondence pck@1 history is outside [0, 1]")
+        dropout_history = [
+            float(value)
+            for value in metadata.get("trajectory_identity_dropout_fractions", [])
+        ]
+        if len(dropout_history) != int(metadata["steps"]) or not all(
+            math.isfinite(value) and 0.0 <= value <= 1.0
+            for value in dropout_history
+        ):
+            errors.append("trajectory identity dropout history is invalid")
         for step in metadata.get("history", []):
             for key in (
                 "track_correspondence_pairs",
@@ -412,7 +467,29 @@ def main() -> None:
             "mean_displacement_tokens": (
                 track_displacements[-1] if track_displacements else None
             ),
+            "final_kl": track_kl[-1] if track_kl else None,
+            "final_epe_tokens": track_epe[-1] if track_epe else None,
+            "final_pck_1": track_pck[-1] if track_pck else None,
         }
+        optimizer = metadata.get("optimizer", {})
+        feature_lr = optimizer.get("track_correspondence_learning_rate")
+        feedback_lr = optimizer.get("track_correspondence_feedback_learning_rate")
+        if (
+            feature_lr is None
+            or feedback_lr is None
+            or not 0.0 < float(feedback_lr) < float(feature_lr)
+        ):
+            errors.append("track feedback learning rate is not safely separated")
+        response = metadata.get("response_supervision", {})
+        response_sigma = response.get("sigma")
+        if (
+            response.get("protocol")
+            != "isolated_structured_physics_counterfactual_v1"
+            or response_sigma is None
+            or not math.isfinite(float(response_sigma))
+            or float(response_sigma) != 1.0
+        ):
+            errors.append("physics response supervision is not causally isolated")
     if decoded_temporal_config is not None and schema != "phycontext.wan_condition_adapter.v4":
         decoded_temporal_enabled = bool(
             decoded_temporal_config.get("enabled")

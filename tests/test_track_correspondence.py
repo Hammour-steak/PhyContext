@@ -63,6 +63,22 @@ class TrackCorrespondenceTest(unittest.TestCase):
                 value, preprocess_size_px=(6, 4), expected_frames=9
             )
 
+    def test_training_rejects_nonconsecutive_source_frames(self) -> None:
+        features = torch.randn(8, 3, 4, 6)
+        correspondence = synthetic_correspondence()
+        correspondence["source_frame_indices"] += 1
+        with self.assertRaisesRegex(ValueError, "consecutive source frames"):
+            track4gen_correspondence_loss(
+                [features],
+                [correspondence],
+                preprocess_size_px=(6, 4),
+                maximum_pairs=16,
+                temperature=0.05,
+                gaussian_sigma=0.2,
+                coordinate_weight=0.1,
+                generator=torch.Generator().manual_seed(7),
+            )
+
     def test_zero_bridge_preserves_wan_output_and_separates_gradients(self) -> None:
         adapter = TrackCorrespondenceAdapter(
             hidden_dim=8, feature_dim=4, refiner_blocks=1
@@ -134,8 +150,53 @@ class TrackCorrespondenceTest(unittest.TestCase):
         self.assertLess(
             float(aligned_result["loss"]), float(wrong_result["loss"])
         )
+        self.assertLess(float(aligned_result["kl"]), float(wrong_result["kl"]))
+        self.assertLess(
+            float(aligned_result["epe_tokens"]),
+            float(wrong_result["epe_tokens"]),
+        )
+        self.assertGreater(
+            float(aligned_result["pck_1"]), float(wrong_result["pck_1"])
+        )
         aligned_result["loss"].backward()
         self.assertGreater(float(aligned.grad.abs().sum()), 0.0)
+
+    def test_training_objective_weights_videos_not_visible_pair_counts(self) -> None:
+        first_features = torch.randn(8, 3, 4, 6)
+        second_features = torch.randn(8, 3, 4, 6)
+        first = synthetic_correspondence()
+        second = synthetic_correspondence()
+        # Give the second video four times as many independently visible points.
+        for point in range(4):
+            second["track_xy_px"][:, 0, point] = second["track_xy_px"][:, 0, 0]
+            second["track_xy_px"][:, 0, point, 1] = float(point)
+            second["track_visible"][:, 0, point] = True
+        kwargs = {
+            "preprocess_size_px": (6, 4),
+            "maximum_pairs": 64,
+            "temperature": 0.05,
+            "gaussian_sigma": 0.2,
+            "coordinate_weight": 0.1,
+        }
+        first_loss = track4gen_correspondence_loss(
+            [first_features],
+            [first],
+            generator=torch.Generator().manual_seed(11),
+            **kwargs,
+        )["loss"]
+        second_loss = track4gen_correspondence_loss(
+            [second_features],
+            [second],
+            generator=torch.Generator().manual_seed(11),
+            **kwargs,
+        )["loss"]
+        batch_loss = track4gen_correspondence_loss(
+            [first_features, second_features],
+            [first, second],
+            generator=torch.Generator().manual_seed(11),
+            **kwargs,
+        )["loss"]
+        torch.testing.assert_close(batch_loss, (first_loss + second_loss) / 2)
 
 
 if __name__ == "__main__":

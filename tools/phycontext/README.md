@@ -35,9 +35,14 @@ correctly aligned video tensors and reports first-frame reconstruction error.
 `track_correspondence.py` implements the formal Track4Gen-style feature
 objective. It supervises exact first-frame-visible simulator material points
 against their swept, z-buffer-visible positions in every four-RGB-frame Wan
-latent window. `audit_wan_adapter.py` fails closed on the selected block,
-refiner and feedback tensors, objective settings, per-step loss history, and
-pair counts. Decoded RGB flow, trajectory-distribution, and velocity objectives
+latent window. The trainer averages correspondence per video, uses a lower
+learning rate for the generation feedback bridge, and drops only RGB point IDs
+on 10% of samples while preserving occupancy trajectories. It reports KL, EPE,
+PCK@1 and fast-motion EPE/PCK@1. Paired response uses a separate sigma-1
+forward with common noise, text, first frame, and trajectory so only structured
+physics conditions vary. `audit_wan_adapter.py` fails closed on the selected
+block, refiner and feedback tensors, objective settings, per-step loss history,
+and pair counts. Decoded RGB flow, trajectory-distribution, and velocity objectives
 are legacy checkpoint metadata only and are not part of the maintained trainer.
 
 ## PhysSweep release adapter
