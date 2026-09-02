@@ -118,6 +118,7 @@ def main() -> None:
         "phycontext.wan_condition_adapter.v4",
         "phycontext.wan_condition_adapter.v5",
         "phycontext.wan_condition_adapter.v6",
+        "phycontext.wan_condition_adapter.v7",
     }:
         errors.append("adapter conditioning schema mismatch")
     lora_keys = sorted(key for key in tensors if key.startswith("wan_lora."))
@@ -363,7 +364,7 @@ def main() -> None:
                 parsed_weights
             ):
                 errors.append("trajectory weights are all zero")
-    else:
+    elif schema != "phycontext.wan_condition_adapter.v7":
         if schema in CENTER_GUARD_SCHEMAS:
             trajectory_histories = {
                 "center": [
@@ -647,6 +648,46 @@ def main() -> None:
             or not 0.0 < float(feedback_lr) < float(feature_lr)
         ):
             errors.append("track feedback learning rate is not safely separated")
+        response = metadata.get("response_supervision", {})
+        response_sigma = response.get("sigma")
+        if (
+            response.get("protocol")
+            != "isolated_structured_physics_counterfactual_v1"
+            or response_sigma is None
+            or not math.isfinite(float(response_sigma))
+            or float(response_sigma) != 1.0
+        ):
+            errors.append("physics response supervision is not causally isolated")
+    if schema == "phycontext.wan_condition_adapter.v7":
+        if trajectory_config:
+            errors.append("v7 adapter unexpectedly declares an auxiliary trajectory loss")
+        if self_lora_config or self_lora_keys:
+            errors.append("v7 adapter unexpectedly contains self-attention LoRA")
+        if track_config or track_correspondence_keys:
+            errors.append("v7 adapter unexpectedly contains track correspondence")
+        removed_fields = (
+            "trajectory_center_losses",
+            "trajectory_distribution_losses",
+            "trajectory_velocity_losses",
+            "flow_temporal_losses",
+            "flow_object_diagnostics",
+            "flow_background_diagnostics",
+            "object_temporal_losses",
+            "background_temporal_losses",
+            "decoded_temporal_supervision",
+            "track_correspondence_losses",
+            "track_correspondence_mean_displacement_tokens",
+            "track_correspondence_kl",
+            "track_correspondence_epe_tokens",
+            "track_correspondence_pck_1",
+            "track_correspondence_fast_epe_tokens",
+            "track_correspondence_fast_pck_1",
+            "track_correspondence_foreground_pck_1",
+            "track_correspondence_background_pck_1",
+        )
+        for field in removed_fields:
+            if field in metadata:
+                errors.append(f"v7 adapter contains removed objective metadata: {field}")
         response = metadata.get("response_supervision", {})
         response_sigma = response.get("sigma")
         if (

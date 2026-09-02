@@ -17,11 +17,12 @@ from conditioning_model import PhyContextConditionEncoder
 from track_correspondence import inject_track_correspondence
 from train_wan_formal import (
     configure_training_stage,
-    forward_correspondence_losses,
     isolated_physics_response_loss,
     learning_rate_factor,
     optimizer_groups,
     validate,
+    validate_clean_formal_model,
+    validate_clean_formal_source,
     training_condition_mode,
 )
 from wan_training import (
@@ -107,64 +108,6 @@ class CapturingResponseModel(nn.Module):
 
 
 class WanTrainingTest(unittest.TestCase):
-    def test_correspondence_forward_disables_all_structured_target_cues(self) -> None:
-        model = CapturingResponseModel()
-        loaded = {
-            "latents": [torch.randn(4, 3, 4, 4)],
-            "text": [torch.randn(5, 8)],
-            "controls": torch.randn(1, 3),
-            "initial_state": torch.randn(1, 9),
-            "trajectory_point_maps": [torch.randn(12, 9, 2, 2)],
-            "track_correspondence": [{}],
-            "scene_size_px": (64, 64),
-        }
-        args = SimpleNamespace(
-            trajectory_input=True,
-            track_correspondence_sigma=0.2,
-            track_correspondence_pairs=8,
-            track_correspondence_temperature=0.07,
-            track_correspondence_gaussian_sigma=0.75,
-        )
-        one = torch.tensor(1.0)
-        correspondence = {
-            "loss": one,
-            "pairs": one,
-            "fast_pairs": one,
-            "foreground_pairs": one,
-            "background_pairs": one,
-            "mean_displacement_tokens": one,
-            "kl": one,
-            "epe_tokens": one,
-            "pck_1": one,
-            "foreground_pck_1": one,
-            "background_pck_1": one,
-            "fast_epe_tokens": one,
-            "fast_pck_1": one,
-        }
-        with patch(
-            "train_wan_formal.set_direct_condition", return_value=True
-        ) as direct, patch(
-            "train_wan_formal.set_trajectory_condition", return_value=True
-        ) as trajectory, patch(
-            "train_wan_formal.consume_track_correspondence_features",
-            return_value=[torch.randn(4, 3, 4, 4)],
-        ), patch(
-            "train_wan_formal.track4gen_correspondence_loss",
-            return_value=correspondence,
-        ):
-            result = forward_correspondence_losses(
-                model,
-                loaded,
-                args,
-                torch.device("cpu"),
-                torch.Generator().manual_seed(7),
-            )
-        self.assertEqual(float(result["track_correspondence"]), 1.0)
-        self.assertFalse(direct.call_args.kwargs["enabled"])
-        self.assertFalse(trajectory.call_args.kwargs["enabled"])
-        self.assertEqual(len(model.context), 1)
-        self.assertEqual(tuple(model.context[0].shape), (5, 8))
-
     def test_response_forward_holds_noise_text_and_trajectory_fixed(self) -> None:
         model = CapturingResponseModel()
         first = torch.randn(4, 3, 4, 4)
@@ -191,7 +134,6 @@ class WanTrainingTest(unittest.TestCase):
         with (
             patch("train_wan_formal.set_direct_condition", return_value=True),
             patch("train_wan_formal.set_trajectory_condition", return_value=True) as set_track,
-            patch("train_wan_formal.consume_track_correspondence_features"),
         ):
             loss = isolated_physics_response_loss(
                 model,
@@ -538,15 +480,11 @@ class WanTrainingTest(unittest.TestCase):
     def test_optimizer_covers_every_trainable_parameter_exactly_once(self) -> None:
         model = DummyTrajectoryModel().requires_grad_(False)
         inject_cross_attention_lora(model, rank=2, alpha=2.0)
-        inject_self_attention_lora(model, rank=2, alpha=2.0)
         inject_direct_condition_modulation(
             model, rank=2, alpha=2.0, input_dim=36, object_slots=3
         )
         inject_trajectory_conditioning(
             model, rank=2, representation="das_3d_tracks"
-        )
-        inject_track_correspondence(
-            model, block_index=1, feature_dim=4, refiner_blocks=1
         )
         encoder = PhyContextConditionEncoder(
             hidden_dim=16,
@@ -561,8 +499,6 @@ class WanTrainingTest(unittest.TestCase):
             lora_learning_rate=5.0e-5,
             direct_learning_rate=5.0e-5,
             trajectory_learning_rate=1.0e-4,
-            track_correspondence_learning_rate=1.0e-4,
-            track_correspondence_feedback_learning_rate=1.0e-5,
             trajectory_input=True,
             training_stage="joint",
         )
@@ -583,15 +519,44 @@ class WanTrainingTest(unittest.TestCase):
         self.assertEqual(
             len(grouped), len({id(parameter) for parameter in grouped})
         )
-        rates = {group["name"]: group["lr"] for group in groups}
-        self.assertEqual(rates["track_correspondence_features"], 1.0e-4)
-        self.assertEqual(rates["track_correspondence_feedback"], 1.0e-5)
+        self.assertEqual(
+            {group["name"] for group in groups},
+            {
+                "condition_decay",
+                "condition_no_decay",
+                "wan_lora",
+                "direct_adaln",
+                "trajectory_conditioning",
+            },
+        )
 
         model.register_parameter(
             "untracked_trainable", nn.Parameter(torch.ones(1))
         )
         with self.assertRaisesRegex(ValueError, "missing from the optimizer"):
             optimizer_groups(encoder, model, args)
+
+    def test_clean_formal_path_rejects_legacy_track_modules(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot initialize"):
+            validate_clean_formal_source(
+                {"track_correspondence": {"enabled": True}}
+            )
+        with self.assertRaisesRegex(ValueError, "cannot initialize"):
+            validate_clean_formal_source(
+                {"self_attention_lora": {"enabled": True}}
+            )
+
+        model = DummyModel()
+        inject_self_attention_lora(model, rank=2, alpha=2.0)
+        with self.assertRaisesRegex(ValueError, "forbids self-attention"):
+            validate_clean_formal_model(model)
+
+        model = DummyModel()
+        inject_track_correspondence(
+            model, block_index=1, feature_dim=4, refiner_blocks=1
+        )
+        with self.assertRaisesRegex(ValueError, "forbids self-attention"):
+            validate_clean_formal_model(model)
 
     def test_direct_modulation_starts_as_exact_identity_delta(self) -> None:
         model = DummyModel()
@@ -871,19 +836,6 @@ class WanTrainingTest(unittest.TestCase):
                 "total": one,
                 "reconstruction": one,
                 "response": torch.tensor(2.0 if response_enabled else 100.0),
-                "track_correspondence": one,
-                "track_correspondence_pairs": torch.tensor(3.0),
-                "track_correspondence_fast_pairs": torch.tensor(1.0),
-                "track_correspondence_foreground_pairs": torch.tensor(2.0),
-                "track_correspondence_background_pairs": torch.tensor(1.0),
-                "track_correspondence_mean_displacement_tokens": one,
-                "track_correspondence_kl": one,
-                "track_correspondence_epe_tokens": one,
-                "track_correspondence_pck_1": one,
-                "track_correspondence_foreground_pck_1": one,
-                "track_correspondence_background_pck_1": one,
-                "track_correspondence_fast_epe_tokens": one,
-                "track_correspondence_fast_pck_1": one,
                 "lpips": one,
             }
 

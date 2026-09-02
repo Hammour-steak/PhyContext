@@ -14,9 +14,15 @@ _DATASET_ROOT_VALUE = os.environ.get("PHYCONTEXT_DATASET_ROOT")
 DATASET_ROOT = Path(_DATASET_ROOT_VALUE).expanduser() if _DATASET_ROOT_VALUE else None
 DATASET_MANIFEST = Path("datasets/physweep_training/manifest.jsonl")
 CACHE_ROOT = Path(
-    "cache/wan/physweep_training/das_3d_tracks_track4gen_v9_bg_balanced_832x480x97"
+    "cache/wan/physweep_training/das_3d_tracks_canonical_v5_832x480x97"
 )
 CACHE_MANIFEST = CACHE_ROOT / "manifest.json"
+# The cache builder still supports material-correspondence artifacts for old
+# v6-v9 ablations. Keep its default destination separate from the clean v5
+# formal-training cache so a rebuild can never relabel or overwrite that cache.
+CACHE_BUILD_ROOT = Path(
+    "cache/wan/physweep_training/das_3d_tracks_track4gen_v9_bg_balanced_832x480x97"
+)
 POINT_TRAJECTORY_MANIFEST = Path(
     "datasets/physweep_training/point_trajectories/manifest.json"
 )

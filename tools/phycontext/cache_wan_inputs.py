@@ -32,7 +32,7 @@ from point_trajectory import (
     rasterize_projected_tracks,
 )
 from project_defaults import (
-    CACHE_ROOT,
+    CACHE_BUILD_ROOT,
     DATASET_MANIFEST,
     DATASET_ROOT,
     POINT_TRAJECTORY_MANIFEST,
@@ -49,7 +49,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CACHE_SCHEMA = CURRENT_CACHE_SCHEMA
 REUSABLE_CACHE_SCHEMAS = set(SUPPORTED_CACHE_SCHEMAS)
 DEFAULT_DATASET = DATASET_ROOT
-DEFAULT_CACHE = CACHE_ROOT
+DEFAULT_CACHE = CACHE_BUILD_ROOT
 DEFAULT_WAN_REPO = Path(os.environ.get("PHYCONTEXT_WAN_REPO", "external/Wan2.2"))
 DEFAULT_CHECKPOINT = Path(
     os.environ.get("PHYCONTEXT_WAN_CHECKPOINT", "checkpoints/Wan2.2-TI2V-5B")

@@ -49,14 +49,11 @@ separate ablations and must disable trajectory input explicitly.
 - Temporal alignment: frame zero plus learned causal four-frame windows,
   matching Wan's 97-to-25 temporal layout
 - Trajectory source: `target`
-- Adapter feature feedback: Track4Gen-style 128-D refiner at zero-based Wan
-  block 12, followed by a learned zero-initialized bridge. Correspondence
-  targets are training-only and are not required as an inference input.
 
 ## Adapter Identity
 
 The next formal output is `outputs/training/formal/final`. Training writes the
 optimization contract to `outputs/training/formal/run_contract.json` and embeds
-a v6 `input_contract.json` in every new checkpoint. Legacy v5 contracts remain
+a v7 `input_contract.json` in every new checkpoint. Legacy contracts remain
 loadable only with their matching hash-bound legacy adapter and cache; inference
-must never mix v5 and v6 artifacts.
+must never mix artifacts from different contracts.

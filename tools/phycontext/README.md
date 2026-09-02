@@ -7,7 +7,7 @@ entry point or environment variables:
 
 ```text
 dataset       datasets/physweep_training
-cache         cache/wan/physweep_training/das_3d_tracks_track4gen_v9_bg_balanced_832x480x97
+cache         cache/wan/physweep_training/das_3d_tracks_canonical_v5_832x480x97
 resolution    832 x 480 x 97 frames
 scene tokens  128
 ```
@@ -28,26 +28,17 @@ simulation, rendering, and publication belong to the separate dataset project.
 `audit_wan_cache.py` verifies the complete merged cache and all hash bindings.
 `audit_wan_cache_samples.py` then independently rerasterizes and re-encodes a
 stratified sample (40 by default), requiring tensor-exact point maps, exact
-material-point correspondence artifacts, and latent reconstruction under the
+trajectory maps, and latent reconstruction under the
 canonical first-frame protocol. The complementary
 `audit_vae_temporal_decode.py` verifies that cached latents decode to finite,
 correctly aligned video tensors and reports first-frame reconstruction error.
-`track_correspondence.py` implements the formal Track4Gen-style feature
-objective. It supervises exact first-frame-visible simulator material points
-against their swept, z-buffer-visible positions in every four-RGB-frame Wan
-latent window, balanced equally with static-background correspondences. The
-correspondence forward runs at fixed low noise with trajectory, scene/physics
-tokens, and direct physics modulation disabled; labels cannot leak through the
-DaS control map. A 2x-resolution 256-channel, four-block refiner uses the
-soft-argmax coordinate Huber objective, while all Wan self-attention blocks gain
-LoRA capacity. The trainer averages correspondence per video and uses a lower
-learning rate for the generation feedback bridge. It reports KL, EPE, foreground
-and background PCK@1, plus fast-motion EPE/PCK@1. Paired response uses a separate sigma-1
-forward with common noise, text, first frame, and trajectory so only structured
-physics conditions vary. `audit_wan_adapter.py` fails closed on the selected
-block, refiner and feedback tensors, objective settings, per-step loss history,
-and pair counts. Decoded RGB flow, trajectory-distribution, and velocity objectives
-are legacy checkpoint metadata only and are not part of the maintained trainer.
+Paired response uses a separate sigma-1 forward with common noise, text, first
+frame, and trajectory so only structured physics conditions vary.
+`audit_wan_adapter.py` rejects new formal checkpoints containing auxiliary
+trajectory/temporal/feature losses or Track/self-attention adapter tensors.
+Decoded RGB flow, trajectory-distribution, velocity, center, and feature-
+correspondence objectives are legacy checkpoint metadata only and are not part
+of the maintained trainer.
 
 ## PhysSweep release adapter
 

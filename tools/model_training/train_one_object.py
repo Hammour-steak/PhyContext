@@ -19,7 +19,7 @@ if str(PHYCONTEXT_TOOLS) not in sys.path:
     sys.path.insert(0, str(PHYCONTEXT_TOOLS))
 
 from cache_contract import (  # noqa: E402
-    CURRENT_CACHE_SCHEMA,
+    FULL_RATE_DAS_CACHE_SCHEMAS,
     resolve_cache_dataset_root,
     validate_cache_source_manifest,
 )
@@ -96,10 +96,9 @@ def preflight(root: Path, config: dict[str, Any]) -> tuple[Path, Path]:
             raise ValueError(
                 "Wan cache trajectory representation differs from training config"
             )
-        if cache.get("schema") != CURRENT_CACHE_SCHEMA:
+        if cache.get("schema") not in FULL_RATE_DAS_CACHE_SCHEMAS:
             raise ValueError(
-                "Track4Gen correspondence training requires the current cache "
-                f"schema {CURRENT_CACHE_SCHEMA}"
+                "formal DAS training requires a full-rate point-track cache"
             )
     cache_dataset_root = resolve_cache_dataset_root(root, cache)
     if cache_dataset_root != dataset_root:

@@ -153,6 +153,7 @@ def load_and_validate_input_contract(
     if contract.get("schema") not in {
         "phycontext.inference_input_contract.v5",
         "phycontext.inference_input_contract.v6",
+        "phycontext.inference_input_contract.v7",
     }:
         raise ValueError("adapter input contract schema is unsupported")
     contract_trajectory = contract.get("trajectory", {})

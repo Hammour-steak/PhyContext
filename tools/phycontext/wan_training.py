@@ -986,6 +986,7 @@ def load_condition_checkpoint(
         "phycontext.wan_condition_adapter.v4",
         "phycontext.wan_condition_adapter.v5",
         "phycontext.wan_condition_adapter.v6",
+        "phycontext.wan_condition_adapter.v7",
     }:
         raise ValueError("adapter uses an unsupported conditioning schema")
     lora = metadata["lora"]

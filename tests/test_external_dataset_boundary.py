@@ -229,7 +229,9 @@ class ExternalDatasetBoundaryTests(unittest.TestCase):
             "representation": "das_3d_tracks"
         }
         cache_path.write_text(json.dumps(self.cache), encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "requires the current cache"):
+        with self.assertRaisesRegex(
+            ValueError, "requires a full-rate point-track cache"
+        ):
             entry.preflight(self.method_root, config)
 
 
