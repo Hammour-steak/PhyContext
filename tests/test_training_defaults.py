@@ -517,6 +517,9 @@ class TrainingDefaultTests(unittest.TestCase):
             "flow_temporal_loss_weight",
             "trajectory_distribution_loss_weight",
             "trajectory_velocity_loss_weight",
+            "trajectory_center_loss_weight",
+            "trajectory_temperature",
+            "trajectory_beta",
         ):
             self.assertFalse(hasattr(args, removed))
             self.assertNotIn(removed, formal_config)

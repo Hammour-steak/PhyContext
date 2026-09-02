@@ -35,8 +35,6 @@ from wan_training import (
     inject_trajectory_conditioning,
     index_nominal_trajectory_records,
     load_condition_checkpoint,
-    latent_correspondence_trajectory,
-    latent_object_center_loss,
     lora_parameters,
     make_ti2v_flow_batch,
     make_formal_training_batch,
@@ -494,7 +492,7 @@ class WanTrainingTest(unittest.TestCase):
         with torch.no_grad():
             source_model.blocks[1].self_attn.v.up.weight.fill_(0.375)
         metadata = {
-            "schema": "phycontext.wan_condition_adapter.v5",
+            "schema": "phycontext.wan_condition_adapter.v6",
             "lora": {"rank": 2, "alpha": 2.0, "module_count": 8},
             "self_attention_lora": {
                 "enabled": True,
@@ -873,7 +871,6 @@ class WanTrainingTest(unittest.TestCase):
                 "total": one,
                 "reconstruction": one,
                 "response": torch.tensor(2.0 if response_enabled else 100.0),
-                "trajectory_center": one,
                 "track_correspondence": one,
                 "track_correspondence_pairs": torch.tensor(3.0),
                 "track_correspondence_fast_pairs": torch.tensor(1.0),
@@ -987,34 +984,6 @@ class WanTrainingTest(unittest.TestCase):
         torch.testing.assert_close(recovered[:, 0], noisy[:, 0])
         self.assertEqual(float(prediction.grad[:, 0].abs().sum()), 0.0)
         self.assertGreater(float(prediction.grad[:, 1:].abs().sum()), 0.0)
-
-    def test_latent_trajectory_matches_moving_object_and_has_gradients(self) -> None:
-        target = torch.zeros(3, 4, 5, 6)
-        motion = torch.zeros(1, 4, 5, 6, dtype=torch.uint8)
-        positions = [(1, 1), (1, 2), (2, 3), (3, 4)]
-        for frame, (y, x) in enumerate(positions):
-            target[:, frame, y, x] = torch.tensor([3.0, -2.0, 1.0])
-            motion[:, frame, y, x] = 1
-        exact = target.clone().requires_grad_(True)
-        predicted_centers, target_centers, valid = latent_correspondence_trajectory(
-            exact, target, motion, temperature=0.03
-        )
-        torch.testing.assert_close(
-            predicted_centers[valid], target_centers[valid], atol=1e-4, rtol=1e-4
-        )
-        exact_loss = latent_object_center_loss(
-            [exact], [target], [motion], temperature=0.03
-        )
-        exact_loss.backward()
-        self.assertIsNotNone(exact.grad)
-
-        shifted = torch.roll(target, shifts=1, dims=-1).requires_grad_(True)
-        shifted_loss = latent_object_center_loss(
-            [shifted], [target], [motion], temperature=0.03
-        )
-        self.assertGreater(
-            float(shifted_loss.detach()), float(exact_loss.detach()) + 0.01
-        )
 
     def test_masked_loss_ignores_condition_frame(self) -> None:
         target = torch.zeros(2, 3, 2, 2)

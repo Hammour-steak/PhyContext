@@ -53,7 +53,6 @@ from wan_training import (
     inject_direct_condition_modulation,
     inject_trajectory_conditioning,
     index_nominal_trajectory_records,
-    latent_object_center_loss,
     load_condition_checkpoint,
     lora_parameters,
     make_formal_training_batch,
@@ -198,7 +197,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--response-loss-weight", type=float, default=0.5)
     parser.add_argument("--motion-foreground-share", type=float, default=0.5)
     parser.add_argument("--minimum-response-energy", type=float, default=1e-3)
-    parser.add_argument("--trajectory-center-loss-weight", type=float, default=0.2)
     parser.add_argument("--track-correspondence-loss-weight", type=float, default=0.1)
     parser.add_argument(
         "--track-correspondence-block-index",
@@ -217,8 +215,6 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="fixed low-noise sigma for the trajectory-disabled correspondence pass",
     )
-    parser.add_argument("--trajectory-temperature", type=float, default=0.03)
-    parser.add_argument("--trajectory-beta", type=float, default=0.05)
     parser.add_argument(
         "--trajectory-input",
         action=argparse.BooleanOptionalAction,
@@ -1008,20 +1004,13 @@ def forward_generation_losses(
                 generator,
                 trajectory_point_maps,
             )
-        predicted_clean = recover_clean_latents(
-            flow["noisy_latents"], predictions, sigmas
-        )
-        center = latent_object_center_loss(
-            predicted_clean,
-            loaded["latents"],
-            loaded["motion_masks"],
-            temperature=args.trajectory_temperature,
-            beta=args.trajectory_beta,
-        )
         lpips_loss = reconstruction.new_zeros(())
         if args.lpips_loss_weight > 0 and not response_enabled:
             if vae is None or perceptual_model is None:
                 raise RuntimeError("LPIPS is enabled but its models are missing")
+            predicted_clean = recover_clean_latents(
+                flow["noisy_latents"], predictions, sigmas
+            )
             with torch.autocast(device_type="cuda", enabled=False):
                 lpips_loss = clean_latent_lpips_loss(
                     predicted_clean,
@@ -1036,14 +1025,12 @@ def forward_generation_losses(
             args.reconstruction_loss_weight * reconstruction
             + args.lpips_loss_weight * lpips_loss
             + args.response_loss_weight * response
-            + args.trajectory_center_loss_weight * center
             + correspondence_sync_zero
         )
     return {
         "total": total,
         "reconstruction": reconstruction,
         "response": response,
-        "trajectory_center": center,
         "lpips": lpips_loss,
         "sigma": sigmas[0],
     }
@@ -1280,7 +1267,6 @@ def validate(
             "total",
             "reconstruction",
             "response",
-            "trajectory_center",
             "track_correspondence",
             "track_correspondence_pairs",
             "track_correspondence_fast_pairs",
@@ -1384,7 +1370,7 @@ def adapter_metadata(
     direct_object_slots: int,
 ) -> dict:
     return {
-        "schema": "phycontext.wan_condition_adapter.v5",
+        "schema": "phycontext.wan_condition_adapter.v6",
         "base_model": str(checkpoint),
         "base_model_index_sha256": sha256(
             checkpoint / "diffusion_pytorch_model.safetensors.index.json"
@@ -1542,17 +1528,6 @@ def adapter_metadata(
             "reconstruction_region": "source_plus_per_frame_target_transport_envelope",
             "pair_region": "low_high_source_target_transport_union",
         },
-        "trajectory_supervision": {
-            "enabled": True,
-            "provided_as_model_input": args.trajectory_input,
-            "type": "clean_latent_object_center_guard",
-            "weight": args.trajectory_center_loss_weight,
-            "objective": "normalized_image_xy_smooth_l1",
-            "temperature": args.trajectory_temperature,
-            "beta": args.trajectory_beta,
-            "coordinate_frame": "normalized_image_xy",
-            "identity_reference": "current_target_frame_features",
-        },
         "track_correspondence": {
             "enabled": True,
             "architecture": TRACK_CORRESPONDENCE_ARCHITECTURE,
@@ -1674,9 +1649,6 @@ def adapter_metadata(
         "reconstruction_losses": [item["reconstruction"] for item in history],
         "response_losses": [item["response"] for item in history],
         "lpips_losses": [item["lpips"] for item in history],
-        "trajectory_center_losses": [
-            item["trajectory_center"] for item in history
-        ],
         "track_correspondence_losses": [
             item["track_correspondence"] for item in history
         ],
@@ -1857,7 +1829,6 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "response_loss_weight",
     "motion_foreground_share",
     "minimum_response_energy",
-    "trajectory_center_loss_weight",
     "track_correspondence_loss_weight",
     "track_correspondence_block_index",
     "track_correspondence_feature_dim",
@@ -1866,8 +1837,6 @@ RESUME_IMMUTABLE_ARGUMENTS = (
     "track_correspondence_temperature",
     "track_correspondence_gaussian_sigma",
     "track_correspondence_sigma",
-    "trajectory_temperature",
-    "trajectory_beta",
     "trajectory_input",
     "trajectory_input_source",
     "trajectory_condition_rank",
@@ -2016,14 +1985,9 @@ def main() -> None:
         args.trajectory_learning_rate,
         args.track_correspondence_learning_rate,
         args.track_correspondence_feedback_learning_rate,
-        args.trajectory_temperature,
-        args.trajectory_beta,
         float(args.trajectory_condition_rank),
     ) <= 0:
         raise ValueError("formal optimization settings must be positive")
-    if args.trajectory_center_loss_weight <= 0:
-        raise ValueError("trajectory center weight must be positive")
-
     rank, local_rank, world_size, device = setup_distributed()
     root = args.project_root.resolve()
     cache_path = (root / args.cache_manifest).resolve()
@@ -2383,7 +2347,6 @@ def main() -> None:
                     "total",
                     "reconstruction",
                     "response",
-                    "trajectory_center",
                     "track_correspondence",
                     "track_correspondence_pairs",
                     "track_correspondence_fast_pairs",

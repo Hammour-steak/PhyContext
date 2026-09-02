@@ -425,6 +425,7 @@ def main() -> None:
             in {
                 "phycontext.wan_condition_adapter.v4",
                 "phycontext.wan_condition_adapter.v5",
+                "phycontext.wan_condition_adapter.v6",
             }
             and cache.get("schema") != CURRENT_CACHE_SCHEMA
         ):

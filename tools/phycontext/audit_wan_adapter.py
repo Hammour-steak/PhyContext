@@ -14,6 +14,14 @@ DEFAULT_ADAPTER = Path("outputs/training/formal/final")
 TRAJECTORY_COMPONENTS = ("center", "distribution", "velocity")
 DECODED_TEMPORAL_COMPONENTS = ("object", "background")
 TRACK_CORRESPONDENCE_ARCHITECTURE = "track4gen_swept_latent_v2"
+TRACK_CORRESPONDENCE_V2_SCHEMAS = {
+    "phycontext.wan_condition_adapter.v5",
+    "phycontext.wan_condition_adapter.v6",
+}
+CENTER_GUARD_SCHEMAS = {
+    "phycontext.wan_condition_adapter.v4",
+    "phycontext.wan_condition_adapter.v5",
+}
 TRAJECTORY_REPRESENTATION_CONTRACTS = {
     "dense_point_tracks": {
         "input_channels": 18,
@@ -109,6 +117,7 @@ def main() -> None:
         "phycontext.wan_condition_adapter.v3",
         "phycontext.wan_condition_adapter.v4",
         "phycontext.wan_condition_adapter.v5",
+        "phycontext.wan_condition_adapter.v6",
     }:
         errors.append("adapter conditioning schema mismatch")
     lora_keys = sorted(key for key in tensors if key.startswith("wan_lora."))
@@ -147,10 +156,10 @@ def main() -> None:
     self_lora_config = metadata.get("self_attention_lora", {})
     expected_self_modules = 0
     self_lora_rank = int(self_lora_config.get("rank", 0))
-    if schema == "phycontext.wan_condition_adapter.v5":
+    if schema in TRACK_CORRESPONDENCE_V2_SCHEMAS:
         expected_self_modules = int(self_lora_config.get("module_count", 0))
         if not self_lora_config.get("enabled", False) or expected_self_modules <= 0:
-            errors.append("v5 self-attention LoRA is disabled or invalid")
+            errors.append("current self-attention LoRA is disabled or invalid")
         if len(self_lora_keys) != expected_self_modules * 2:
             errors.append("self-attention LoRA tensor count does not match metadata")
         if self_lora_config.get("target") != "wan.blocks.*.self_attn.{q,k,v,o}":
@@ -355,35 +364,45 @@ def main() -> None:
             ):
                 errors.append("trajectory weights are all zero")
     else:
-        trajectory_histories = {
-            "center": [
-                float(value)
-                for value in metadata.get("trajectory_center_losses", [])
-            ]
-        }
-        if trajectory_config.get("type") != "clean_latent_object_center_guard":
-            errors.append("v4 trajectory supervision must be the center guard")
-        if bool(trajectory_config.get("provided_as_model_input")) != (
-            trajectory_conditioning_enabled
-        ):
-            errors.append(
-                "v4 trajectory supervision/input declarations are inconsistent"
-            )
-        center_weight = trajectory_config.get("weight")
-        if (
-            not trajectory_config.get("enabled")
-            or center_weight is None
-            or not math.isfinite(float(center_weight))
-            or float(center_weight) <= 0
-        ):
-            errors.append("v4 trajectory center weight is invalid")
-        center_history = trajectory_histories["center"]
-        if len(center_history) != int(metadata["steps"]):
-            errors.append("trajectory center history length mismatch")
-        elif not all(
-            math.isfinite(value) and value >= 0 for value in center_history
-        ):
-            errors.append("trajectory center history is invalid")
+        if schema in CENTER_GUARD_SCHEMAS:
+            trajectory_histories = {
+                "center": [
+                    float(value)
+                    for value in metadata.get("trajectory_center_losses", [])
+                ]
+            }
+            if trajectory_config.get("type") != "clean_latent_object_center_guard":
+                errors.append("legacy trajectory supervision must be the center guard")
+            if bool(trajectory_config.get("provided_as_model_input")) != (
+                trajectory_conditioning_enabled
+            ):
+                errors.append(
+                    "legacy trajectory supervision/input declarations are inconsistent"
+                )
+            center_weight = trajectory_config.get("weight")
+            if (
+                not trajectory_config.get("enabled")
+                or center_weight is None
+                or not math.isfinite(float(center_weight))
+                or float(center_weight) <= 0
+            ):
+                errors.append("legacy trajectory center weight is invalid")
+            center_history = trajectory_histories["center"]
+            if len(center_history) != int(metadata["steps"]):
+                errors.append("trajectory center history length mismatch")
+            elif not all(
+                math.isfinite(value) and value >= 0 for value in center_history
+            ):
+                errors.append("trajectory center history is invalid")
+        else:
+            if trajectory_config:
+                errors.append(
+                    "v6 adapter unexpectedly declares trajectory center supervision"
+                )
+            if "trajectory_center_losses" in metadata:
+                errors.append(
+                    "v6 adapter unexpectedly contains trajectory center history"
+                )
         removed_fields = (
             "trajectory_distribution_losses",
             "trajectory_velocity_losses",
@@ -396,12 +415,12 @@ def main() -> None:
         )
         for field in removed_fields:
             if field in metadata:
-                errors.append(f"v4 adapter contains removed objective metadata: {field}")
+                errors.append(f"adapter contains removed objective metadata: {field}")
         if not track_config.get("enabled"):
-            errors.append("v4 track correspondence is disabled")
+            errors.append("track correspondence is disabled")
         expected_track_architecture = (
             TRACK_CORRESPONDENCE_ARCHITECTURE
-            if schema == "phycontext.wan_condition_adapter.v5"
+            if schema in TRACK_CORRESPONDENCE_V2_SCHEMAS
             else "track4gen_swept_latent_v1"
         )
         if track_config.get("architecture") != expected_track_architecture:
@@ -420,7 +439,7 @@ def main() -> None:
                     "sampling": "equal_foreground_background_then_equal_slow_medium_fast_bins",
                     "conditioning_during_correspondence": "text_only_no_scene_physics_or_trajectory",
                 }
-                if schema == "phycontext.wan_condition_adapter.v5"
+                if schema in TRACK_CORRESPONDENCE_V2_SCHEMAS
                 else {
                     "objective": "soft_target_cross_entropy_plus_expected_coordinate_huber",
                     "sampling": "equal_slow_medium_fast_feature_displacement_bins",
@@ -437,23 +456,23 @@ def main() -> None:
             errors.append("track correspondence per-video normalization is invalid")
         expected_shortcut_mitigation = (
             "trajectory_branch_fully_disabled"
-            if schema == "phycontext.wan_condition_adapter.v5"
+            if schema in TRACK_CORRESPONDENCE_V2_SCHEMAS
             else "training_only_rgb_identity_dropout_with_occupancy_preserved"
         )
         if track_config.get("identity_shortcut_mitigation") != expected_shortcut_mitigation:
             errors.append("track correspondence identity-shortcut mitigation is invalid")
         identity_dropout = track_config.get("identity_dropout_probability")
-        if schema != "phycontext.wan_condition_adapter.v5" and (
+        if schema not in TRACK_CORRESPONDENCE_V2_SCHEMAS and (
             identity_dropout is None
             or not math.isfinite(float(identity_dropout))
             or not 0.0 < float(identity_dropout) < 1.0
         ):
             errors.append("track correspondence identity dropout is invalid")
-        if schema == "phycontext.wan_condition_adapter.v5" and (
+        if schema in TRACK_CORRESPONDENCE_V2_SCHEMAS and (
             "identity_dropout_probability" in track_config
             or "trajectory_identity_dropout_fractions" in metadata
         ):
-            errors.append("v5 adapter contains obsolete trajectory identity dropout")
+            errors.append("current adapter contains obsolete trajectory identity dropout")
         positive_track_fields = (
             "feature_dim",
             "refiner_blocks",
@@ -473,12 +492,12 @@ def main() -> None:
         block_index = track_config.get("block_index")
         if block_index is None or int(block_index) < 0:
             errors.append("track correspondence block index is invalid")
-        if schema == "phycontext.wan_condition_adapter.v5":
+        if schema in TRACK_CORRESPONDENCE_V2_SCHEMAS:
             if int(track_config.get("feature_grid_upsample_factor", 0)) != 2:
-                errors.append("v5 track feature upsample factor is invalid")
+                errors.append("current track feature upsample factor is invalid")
             sigma = track_config.get("correspondence_sigma")
             if sigma is None or not 0 < float(sigma) < 1:
-                errors.append("v5 correspondence sigma is invalid")
+                errors.append("current correspondence sigma is invalid")
         else:
             coordinate_weight = track_config.get("coordinate_weight")
             if (
@@ -561,7 +580,7 @@ def main() -> None:
             *((
                 ("foreground pck@1", track_foreground_pck),
                 ("background pck@1", track_background_pck),
-            ) if schema == "phycontext.wan_condition_adapter.v5" else ()),
+            ) if schema in TRACK_CORRESPONDENCE_V2_SCHEMAS else ()),
         ):
             if len(values) != int(metadata["steps"]):
                 errors.append(f"track correspondence {label} history length mismatch")
@@ -572,7 +591,7 @@ def main() -> None:
             and not all(value <= 1.0 for value in track_fast_pck)
         ):
             errors.append("track correspondence pck@1 history is outside [0, 1]")
-        if schema != "phycontext.wan_condition_adapter.v5":
+        if schema not in TRACK_CORRESPONDENCE_V2_SCHEMAS:
             dropout_history = [
                 float(value)
                 for value in metadata.get(
@@ -593,7 +612,7 @@ def main() -> None:
                         "track_correspondence_foreground_pairs",
                         "track_correspondence_background_pairs",
                     )
-                    if schema == "phycontext.wan_condition_adapter.v5"
+                    if schema in TRACK_CORRESPONDENCE_V2_SCHEMAS
                     else ()
                 ),
             ):

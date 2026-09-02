@@ -11,7 +11,6 @@ sys.path.insert(0, str(ROOT / "tools" / "phycontext"))
 from conditioning_model import PhyContextConditionEncoder  # noqa: E402
 from wan_training import (  # noqa: E402
     TrajectoryPatchConditioner,
-    latent_correspondence_motion,
     motion_mask_from_point_track_map,
     source_target_motion_envelope,
     validate_point_track_object_slots,
@@ -150,16 +149,6 @@ class MultiObjectConditioningTest(unittest.TestCase):
         envelope = source_target_motion_envelope(mask)
         self.assertEqual(float(envelope[0, 1, 1, 2]), 1.0)
         self.assertEqual(float(envelope.sum()), 3.0)
-
-        _, target_centers, _, _, valid = latent_correspondence_motion(
-            torch.zeros(2, 2, 3, 4),
-            torch.zeros(2, 2, 3, 4),
-            mask,
-        )
-        self.assertTrue(bool(valid[1]))
-        self.assertTrue(
-            torch.allclose(target_centers[1], torch.tensor([1.0, 1.0]))
-        )
 
     def test_das_condition_rejects_nonbinary_visibility_and_background_rgb(self):
         nonbinary = torch.zeros(12, 5, 3, 4)
