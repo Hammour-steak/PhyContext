@@ -20,6 +20,7 @@ from train_wan_formal import (
     isolated_physics_response_loss,
     learning_rate_factor,
     optimizer_groups,
+    response_updates_enabled,
     validate,
     validate_clean_formal_model,
     validate_clean_formal_source,
@@ -819,6 +820,8 @@ class WanTrainingTest(unittest.TestCase):
             trajectory_input=False,
             trajectory_input_source="target",
             trajectory_representation="das_3d_tracks",
+            ordinary_only=False,
+            response_loss_weight=0.5,
         )
         response_flags = []
         validation_axes = []
@@ -871,6 +874,58 @@ class WanTrainingTest(unittest.TestCase):
         self.assertEqual(metrics["ordinary_batches"], 15.0)
         self.assertTrue(model.training)
         self.assertTrue(condition_encoder.training)
+
+    def test_zero_response_weight_makes_validation_fully_ordinary(self) -> None:
+        records = [
+            {"sample_id": f"record-{index}", "base_scene_id": f"base-{index}"}
+            for index in range(8)
+        ]
+        args = SimpleNamespace(
+            validation_batches=5,
+            seed=13,
+            trajectory_input=False,
+            trajectory_input_source="target",
+            trajectory_representation="das_3d_tracks",
+            ordinary_only=False,
+            response_loss_weight=0.0,
+        )
+        response_flags = []
+
+        def fake_forward_losses(*unused_args, response_enabled, **unused_kwargs):
+            response_flags.append(response_enabled)
+            one = torch.tensor(1.0)
+            return {
+                "total": one,
+                "reconstruction": one,
+                "response": torch.tensor(100.0),
+                "lpips": torch.tensor(2.0),
+            }
+
+        model = nn.Linear(1, 1)
+        condition_encoder = nn.Linear(1, 1)
+        with patch("train_wan_formal.load_microbatch", return_value={}), patch(
+            "train_wan_formal.forward_losses", side_effect=fake_forward_losses
+        ):
+            metrics = validate(
+                model,
+                condition_encoder,
+                Path("."),
+                Path("."),
+                records,
+                [],
+                {},
+                args,
+                torch.device("cpu"),
+                rank=0,
+                world_size=1,
+                scene_size_px=(832, 480),
+            )
+        self.assertFalse(response_updates_enabled(args))
+        self.assertEqual(response_flags, [False] * args.validation_batches)
+        self.assertEqual(metrics["ordinary_batches"], 5.0)
+        self.assertEqual(metrics["response_batches"], 0.0)
+        self.assertEqual(metrics["response"], 0.0)
+        self.assertEqual(metrics["lpips"], 2.0)
 
     def test_formal_schedule_can_disable_response_updates(self) -> None:
         records = [{"sample_id": "single", "base_scene_id": "base"}]

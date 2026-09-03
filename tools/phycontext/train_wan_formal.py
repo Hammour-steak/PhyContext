@@ -211,6 +211,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def response_updates_enabled(args: argparse.Namespace) -> bool:
+    """Return whether counterfactual low/high response batches are active."""
+    return not args.ordinary_only and args.response_loss_weight > 0.0
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -964,9 +969,10 @@ def validate(
     vae=None,
     perceptual_model=None,
 ) -> dict[str, float]:
-    """Evaluate the training 60/40 mixture and 2:2:1 response-axis cycle."""
+    """Evaluate the same ordinary/response schedule used for training."""
     model.eval()
     condition_encoder.eval()
+    use_response_updates = response_updates_enabled(args)
     totals = {
         key: 0.0
         for key in (
@@ -988,7 +994,7 @@ def validate(
             rank=rank,
             world_size=world_size,
             seed=args.seed + 9_000_000,
-            response_updates=True,
+            response_updates=use_response_updates,
         )
         trajectory_batch = (
             select_trajectory_input_records(
@@ -1057,6 +1063,7 @@ def adapter_metadata(
     peak_memory: float,
     direct_object_slots: int,
 ) -> dict:
+    use_response_updates = response_updates_enabled(args)
     return {
         "schema": "phycontext.wan_condition_adapter.v7",
         "base_model": str(checkpoint),
@@ -1074,9 +1081,17 @@ def adapter_metadata(
                 "trajectory_warmup_scene_plus_target_trajectory"
                 if args.training_stage == "trajectory_warmup"
                 else (
-                    "formal_mixed_trajectory_plus_physics"
+                    (
+                        "formal_mixed_trajectory_plus_physics"
+                        if use_response_updates
+                        else "formal_ordinary_trajectory_plus_physics"
+                    )
                     if args.trajectory_input
-                    else "formal_mixed_no_trajectory_input"
+                    else (
+                        "formal_mixed_no_trajectory_input"
+                        if use_response_updates
+                        else "formal_ordinary_no_trajectory_input"
+                    )
                 )
             )
         ),
@@ -1155,34 +1170,40 @@ def adapter_metadata(
             "max_grad_norm": args.max_grad_norm,
         },
         "sampling": {
-            "response_updates_enabled": not args.ordinary_only,
-            "ordinary_share": 1.0 if args.ordinary_only else 0.6,
-            "response_share": 0.0 if args.ordinary_only else 0.4,
+            "response_updates_enabled": use_response_updates,
+            "ordinary_share": 0.6 if use_response_updates else 1.0,
+            "response_share": 0.4 if use_response_updates else 0.0,
             "response_axis_weights": (
-                {}
-                if args.ordinary_only
-                else {
+                {
                     "contact_friction": 0.4,
                     "contact_restitution": 0.4,
                     "mass_kg": 0.2,
                 }
+                if use_response_updates
+                else {}
             ),
             "response_pair": (
-                None
-                if args.ordinary_only
-                else (
+                (
                     "same_base_same_axis_low_high;_response_forward_holds_"
                     "noise_text_and_trajectory_fixed_at_sigma1"
                 )
+                if use_response_updates
+                else None
             ),
         },
         "validation": {
             "enabled": not args.ordinary_only,
             "batches_per_rank": 0 if args.ordinary_only else args.validation_batches,
-            "selection": "deterministic_formal_training_schedule",
-            "ordinary_share": 1.0 if args.ordinary_only else 0.6,
-            "response_share": 0.0 if args.ordinary_only else 0.4,
-            "response_metric_scope": "response_batches_only",
+            "selection": (
+                "deterministic_formal_training_schedule"
+                if use_response_updates
+                else "deterministic_ordinary_schedule"
+            ),
+            "ordinary_share": 0.6 if use_response_updates else 1.0,
+            "response_share": 0.4 if use_response_updates else 0.0,
+            "response_metric_scope": (
+                "response_batches_only" if use_response_updates else None
+            ),
             "diffusion_sigma": 0.7,
             "clean_condition_frame_in_lpips": False,
             "lpips_decode_protocol": "local_generated_windows_fresh_causal_cache",
@@ -1193,7 +1214,11 @@ def adapter_metadata(
             "mask_source": "trajectory_visibility_derived_current_occupancy",
             "foreground_share": args.motion_foreground_share,
             "reconstruction_region": "source_plus_per_frame_target_transport_envelope",
-            "pair_region": "low_high_source_target_transport_union",
+            "pair_region": (
+                "low_high_source_target_transport_union"
+                if use_response_updates
+                else None
+            ),
         },
         "trajectory_conditioning": {
             "enabled": args.trajectory_input,
@@ -1249,18 +1274,31 @@ def adapter_metadata(
         },
         "response_loss_weight": args.response_loss_weight,
         "response_supervision": {
-            "protocol": "isolated_structured_physics_counterfactual_v1",
-            "sigma": 1.0,
-            "shared_inputs": [
-                "future_noise",
-                "first_frame_latent",
-                "text_context",
-                "trajectory_point_map",
-            ],
-            "varying_inputs": [
-                "structured_physics_tokens",
-                "direct_physics_modulation",
-            ],
+            "enabled": use_response_updates,
+            "protocol": (
+                "isolated_structured_physics_counterfactual_v1"
+                if use_response_updates
+                else None
+            ),
+            "sigma": 1.0 if use_response_updates else None,
+            "shared_inputs": (
+                [
+                    "future_noise",
+                    "first_frame_latent",
+                    "text_context",
+                    "trajectory_point_map",
+                ]
+                if use_response_updates
+                else []
+            ),
+            "varying_inputs": (
+                [
+                    "structured_physics_tokens",
+                    "direct_physics_modulation",
+                ]
+                if use_response_updates
+                else []
+            ),
         },
         "reconstruction_loss_weight": args.reconstruction_loss_weight,
         "lpips_loss_weight": args.lpips_loss_weight,
@@ -1562,7 +1600,8 @@ def main() -> None:
         or args.save_every <= 0
     ):
         raise ValueError("validation and save intervals must be positive")
-    if not args.ordinary_only and (
+    use_response_updates = response_updates_enabled(args)
+    if use_response_updates and (
         args.validation_batches < 25 or args.validation_batches % 25 != 0
     ):
         raise ValueError(
@@ -1664,18 +1703,19 @@ def main() -> None:
         direct_object_slots = 3
         train_base_count = len({item["base_scene_id"] for item in train_records})
         train_pairs = (
-            []
-            if args.ordinary_only
-            else select_sweep_endpoint_pairs(train_records, train_base_count)
+            select_sweep_endpoint_pairs(train_records, train_base_count)
+            if use_response_updates
+            else []
         )
         train_nominal_records = index_nominal_trajectory_records(train_records)
         validation_pairs = []
         validation_nominal_records = {}
         if validation_records and not args.ordinary_only:
-            validation_pairs = select_sweep_endpoint_pairs(
-                validation_records,
-                len({item["base_scene_id"] for item in validation_records}),
-            )
+            if use_response_updates:
+                validation_pairs = select_sweep_endpoint_pairs(
+                    validation_records,
+                    len({item["base_scene_id"] for item in validation_records}),
+                )
             validation_nominal_records = index_nominal_trajectory_records(
                 validation_records
             )
@@ -1907,7 +1947,7 @@ def main() -> None:
                     rank,
                     world_size,
                     args.seed,
-                    response_updates=not args.ordinary_only,
+                    response_updates=use_response_updates,
                 )
                 step_mode = mode
                 step_axis = axis
